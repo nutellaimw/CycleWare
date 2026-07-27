@@ -1,15 +1,30 @@
 local _cfg = getgenv().CW_CONFIG or {}
-local CURSOR_FILE               = _cfg.CURSOR_FILE               or "CycleWare/Assets/cursor.png"
-local HITMARKER_FILE            = _cfg.HITMARKER_FILE            or "CycleWare/Assets/hitmarker.png"
-local SOUND_FILE                = _cfg.SOUND_FILE                or "CycleWare/Assets/sound.mp3"
-local HITMARKER_SIZE            = _cfg.HITMARKER_SIZE            or 50
-local SOUND_VOLUME              = _cfg.SOUND_VOLUME              or 1
-local CURSOR_TARGET_SIZE        = _cfg.CURSOR_TARGET_SIZE        or 82
-local HITMARKER_RANDOM_ROTATION = _cfg.HITMARKER_RANDOM_ROTATION
-local HITMARKER_FOLLOW_MOUSE    = _cfg.HITMARKER_FOLLOW_MOUSE
-local HITMARKER_VISIBLE_DURATION = _cfg.HITMARKER_VISIBLE_DURATION or 0.05
-local HITMARKER_FADEOUT          = _cfg.HITMARKER_FADEOUT
-local HITMARKER_FADEOUT_DURATION = _cfg.HITMARKER_FADEOUT_DURATION or 0.15
+
+local function boolOr(v, default)
+    if v == nil then return default end
+    return v
+end
+
+local function numOr(v, default, minValue)
+    v = tonumber(v)
+    if v == nil then v = default end
+    if minValue and v < minValue then v = minValue end
+    return v
+end
+
+local CURSOR_FILE    = _cfg.CURSOR_FILE    or "CycleWare/Assets/cursor.png"
+local HITMARKER_FILE = _cfg.HITMARKER_FILE or "CycleWare/Assets/hitmarker.png"
+local SOUND_FILE     = _cfg.SOUND_FILE     or "CycleWare/Assets/sound.mp3"
+
+local HITMARKER_SIZE             = numOr(_cfg.HITMARKER_SIZE, 50, 1)
+local SOUND_VOLUME               = numOr(_cfg.SOUND_VOLUME, 1, 0)
+local CURSOR_TARGET_SIZE         = numOr(_cfg.CURSOR_TARGET_SIZE, 82, 1)
+local HITMARKER_VISIBLE_DURATION = numOr(_cfg.HITMARKER_VISIBLE_DURATION, 0.05, 0)
+local HITMARKER_FADEOUT_DURATION = numOr(_cfg.HITMARKER_FADEOUT_DURATION, 0.15, 0)
+
+local HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, true)
+local HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, true)
+local HITMARKER_FADEOUT         = boolOr(_cfg.HITMARKER_FADEOUT, true)
 
 local Players           = game:GetService("Players")
 local SoundService      = game:GetService("SoundService")
@@ -22,7 +37,6 @@ local TweenService      = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
 local Mouse       = LocalPlayer:GetMouse()
-local ShootEvent  = ReplicatedStorage:WaitForChild("GunRemotes"):WaitForChild("ShootEvent")
 
 local CW = getgenv().__CW_CORE_STATE
 local isFirstRun = false
@@ -43,6 +57,12 @@ if not CW then
         },
     }
     getgenv().__CW_CORE_STATE = CW
+end
+
+local ShootEvent = CW.ShootEvent
+if not ShootEvent then
+    ShootEvent = ReplicatedStorage:WaitForChild("GunRemotes"):WaitForChild("ShootEvent")
+    CW.ShootEvent = ShootEvent
 end
 
 CW.Settings.SOUND_VOLUME               = SOUND_VOLUME
@@ -92,7 +112,6 @@ local tunpack = table.unpack
 local band    = bit32.band
 local bxor    = bit32.bxor
 local rshift  = bit32.rshift
-local bnot    = bit32.bnot
 
 local CURSOR_ROOT            = "CycleWare"
 local CURSOR_FOLDER          = "CycleWare/Assets"
@@ -126,16 +145,19 @@ local function readSigFile(path)
     return nil
 end
 
-local function computeFileSignature(path, prefix, extra)
-    extra = extra or ""
-    if not isfile(path) then
-        return prefix..":none"..extra, nil
+local function pruneOldFiles(folder, prefix, keepHash, label)
+    local ok, files = pcall(listfiles, folder)
+    if not ok or not files then return end
+    local deleted = 0
+    for _, path in ipairs(files) do
+        local name = path:match("([^/\\]+)$")
+        if name and name:sub(1, #prefix) == prefix and not name:find(keepHash, 1, true) then
+            if pcall(delfile, path) then deleted = deleted + 1 end
+        end
     end
-    local ok, data = pcall(readfile, path)
-    if not ok or not data then
-        return prefix..":readfail"..extra, nil
+    if deleted > 0 then
+        print(sformat("[CW] Pruned %d stale %s file(s)", deleted, label))
     end
-    return prefix..":"..crc32Placeholder..extra, data
 end
 
 if not CW._crcT then
@@ -161,7 +183,7 @@ local function crc32(s)
     return bxor(c, 0xFFFFFFFF)
 end
 
-computeFileSignature = function(path, prefix, extra)
+local function computeFileSignature(path, prefix, extra)
     extra = extra or ""
     if not isfile(path) then
         return prefix..":none"..extra, nil
@@ -171,21 +193,6 @@ computeFileSignature = function(path, prefix, extra)
         return prefix..":readfail"..extra, nil
     end
     return prefix..":"..crc32(data)..extra, data
-end
-
-local function pruneOldFiles(folder, prefix, keepHash, label)
-    local ok, files = pcall(listfiles, folder)
-    if not ok or not files then return end
-    local deleted = 0
-    for _, path in ipairs(files) do
-        local name = path:match("([^/\\]+)$")
-        if name and name:sub(1, #prefix) == prefix and not name:find(keepHash, 1, true) then
-            if pcall(delfile, path) then deleted = deleted + 1 end
-        end
-    end
-    if deleted > 0 then
-        print(sformat("[CW] Pruned %d stale %s file(s)", deleted, label))
-    end
 end
 
 local function adler32(s)
@@ -203,27 +210,59 @@ local function u32be(n)
         band(rshift(n,8),0xFF), band(n,0xFF))
 end
 
-local function u16le(n)
-    return schar(band(n,0xFF), band(rshift(n,8),0xFF))
-end
-
 local function pngChunk(t, data)
     local p = t..data
     return u32be(#data)..p..u32be(crc32(p))
 end
 
-local function deflateStore(raw)
-    local out, pos, len = {}, 1, #raw
-    while pos <= len do
-        local blk  = raw:sub(pos, pos + 65534)
-        local blen = #blk
-        out[#out+1] = schar(pos + blen - 1 >= len and 1 or 0)
-        out[#out+1] = u16le(blen)
-        out[#out+1] = u16le(band(bnot(blen), 0xFFFF))
-        out[#out+1] = blk
-        pos = pos + 65535
+local function literalCode(n)
+    if n <= 143 then
+        return 0x30 + n, 8
+    else
+        return 0x190 + (n - 144), 9
     end
-    return tconcat(out)
+end
+
+local function deflateFixedHuffman(raw)
+    local outBytes = {}
+    local bitbuf, bitcnt = 0, 0
+
+    local function pushBit(bit)
+        bitbuf = bitbuf + bit * (2 ^ bitcnt)
+        bitcnt = bitcnt + 1
+        if bitcnt == 8 then
+            outBytes[#outBytes + 1] = schar(bitbuf)
+            bitbuf, bitcnt = 0, 0
+        end
+    end
+
+    local function writeBitsLSB(value, n)
+        for i = 0, n - 1 do
+            pushBit(band(rshift(value, i), 1))
+        end
+    end
+
+    local function writeHuffman(code, len)
+        for i = len - 1, 0, -1 do
+            pushBit(band(rshift(code, i), 1))
+        end
+    end
+
+    writeBitsLSB(1, 1)
+    writeBitsLSB(1, 2)
+
+    for i = 1, #raw do
+        local code, len = literalCode(sbyte(raw, i))
+        writeHuffman(code, len)
+    end
+
+    writeHuffman(0, 7)
+
+    if bitcnt > 0 then
+        outBytes[#outBytes + 1] = schar(bitbuf)
+    end
+
+    return tconcat(outBytes)
 end
 
 local function encodePNG(px, w, h)
@@ -239,7 +278,7 @@ local function encodePNG(px, w, h)
     local raw = tconcat(rows)
     return "\137\80\78\71\13\10\26\10"
         .. pngChunk("IHDR", u32be(w)..u32be(h).."\8\6\0\0\0")
-        .. pngChunk("IDAT", "\120\1"..deflateStore(raw)..u32be(adler32(raw)))
+        .. pngChunk("IDAT", "\120\1"..deflateFixedHuffman(raw)..u32be(adler32(raw)))
         .. pngChunk("IEND", "")
 end
 
@@ -469,7 +508,12 @@ local TINT_VARIANTS = {
 }
 
 local function computeCursorSourceSignature()
-    return computeFileSignature(CURSOR_FILE, "cur", "|size:"..tostring(CURSOR_TARGET_SIZE))
+
+    local tintSig = ""
+    for _, v in ipairs(TINT_VARIANTS) do
+        tintSig = tintSig.."|"..v.key..":"..v.tR..","..v.tG..","..v.tB
+    end
+    return computeFileSignature(CURSOR_FILE, "cur", "|size:"..tostring(CW.Settings.CURSOR_TARGET_SIZE)..tintSig)
 end
 
 local function buildCursorFiles(sigHash)
@@ -538,8 +582,9 @@ local function reloadCursorFromSource(sigHash, data)
     end
     print(sformat("[CW] Loaded new cursor.png (%d×%d)", w, h))
 
-    if CURSOR_TARGET_SIZE then
-        px, w, h = resizePixels(px, w, h, CURSOR_TARGET_SIZE, CURSOR_TARGET_SIZE)
+    local targetSize = CW.Settings.CURSOR_TARGET_SIZE
+    if targetSize then
+        px, w, h = resizePixels(px, w, h, targetSize, targetSize)
     end
 
     local files = buildCursorFiles(sigHash)
@@ -602,7 +647,7 @@ if isFirstRun then
     CW.HMTemplate.Image                  = ""
 end
 
-CW.HMTemplate.Size = UDim2.new(0, HITMARKER_SIZE, 0, HITMARKER_SIZE)
+CW.HMTemplate.Size = UDim2.new(0, CW.Settings.HITMARKER_SIZE, 0, CW.Settings.HITMARKER_SIZE)
 
 local function buildHitmarkerFile(sigHash)
     return HITMARKER_CACHE_FOLDER.."/hm_"..sigHash..".png"
@@ -699,10 +744,24 @@ reloadSound()
 
 local function playHitSound()
     if not CW.Settings.SOUND_ID then return end
-    local s = Instance.new("Sound")
-    s.SoundId = CW.Settings.SOUND_ID
-    s.Volume  = CW.Settings.SOUND_VOLUME
-    SoundService:PlayLocalSound(s)
+
+    local ok, s = pcall(function()
+        local snd = Instance.new("Sound")
+        snd.SoundId = CW.Settings.SOUND_ID
+        snd.Volume  = CW.Settings.SOUND_VOLUME
+        SoundService:PlayLocalSound(snd)
+        return snd
+    end)
+    if not ok or not s then return end
+
+    local cleaned = false
+    local function cleanup()
+        if cleaned then return end
+        cleaned = true
+        pcall(function() s:Destroy() end)
+    end
+
+    s.Ended:Connect(cleanup)
     Debris:AddItem(s, 10)
 end
 
@@ -750,17 +809,20 @@ if isFirstRun then
                     0, baseSize.Y.Offset * 1.35
                 )
 
-                local tween = TweenService:Create(
-                    Clone,
-                    TweenInfo.new(
-                        CW.Settings.HITMARKER_FADEOUT_DURATION,
-                        Enum.EasingStyle.Quad,
-                        Enum.EasingDirection.Out
-                    ),
-                    { ImageTransparency = 1, Size = growSize }
-                )
-                tween.Completed:Connect(finishClone)
-                tween:Play()
+                local ok = pcall(function()
+                    local tween = TweenService:Create(
+                        Clone,
+                        TweenInfo.new(
+                            CW.Settings.HITMARKER_FADEOUT_DURATION,
+                            Enum.EasingStyle.Quad,
+                            Enum.EasingDirection.Out
+                        ),
+                        { ImageTransparency = 1, Size = growSize }
+                    )
+                    tween.Completed:Connect(finishClone)
+                    tween:Play()
+                end)
+                if not ok then finishClone() end
             else
                 finishClone()
             end
