@@ -1,9 +1,3 @@
--- ══════════════════════════════════════════════════════════════════════
---  CycleWare.lua · Entry point
---  Reads getgenv().CW_CONFIG, builds the persistent CW state table,
---  then loads every module in dependency order.
--- ══════════════════════════════════════════════════════════════════════
-
 local REPO_BASE = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/"
 
 local function loadModule(path)
@@ -19,7 +13,6 @@ local function loadModule(path)
 	end
 end
 
--- ── Config helpers ───────────────────────────────────────────────────
 local _cfg = getgenv().CW_CONFIG or {}
 
 local function boolOr(v, default)
@@ -34,7 +27,6 @@ local function numOr(v, default, minValue)
 	return v
 end
 
--- ── Services ─────────────────────────────────────────────────────────
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService  = game:GetService("UserInputService")
@@ -43,7 +35,6 @@ local GuiService        = game:GetService("GuiService")
 local LocalPlayer = Players.LocalPlayer
 local Mouse       = LocalPlayer:GetMouse()
 
--- ── Persistent state (survives across re-executions in this session) ──
 local CW = getgenv().__CW_CORE_STATE
 local isFirstRun = false
 if not CW then
@@ -71,7 +62,6 @@ CW.IsFirstRun  = isFirstRun
 CW.LocalPlayer = LocalPlayer
 CW.Mouse       = Mouse
 
--- ── Debug logging (defaults ON) ──────────────────────────────────────
 if CW.Debug == nil then CW.Debug = true end
 CW.Debug = boolOr(_cfg.DEBUG, CW.Debug)
 
@@ -85,7 +75,6 @@ end
 
 CW.Log(isFirstRun and "First run — initializing." or "Re-run detected — updating settings only.")
 
--- ── Paths ────────────────────────────────────────────────────────────
 CW.Paths.CURSOR_FILE    = _cfg.CURSOR_FILE    or "CycleWare/Assets/cursor.png"
 CW.Paths.HITMARKER_FILE = _cfg.HITMARKER_FILE or "CycleWare/Assets/hitmarker.png"
 CW.Paths.SOUND_FILE     = _cfg.SOUND_FILE     or "CycleWare/Assets/sound.mp3"
@@ -101,7 +90,6 @@ CW.Paths.CURSOR_SIG_FILE    = CW.Paths.CACHE_FOLDER.."/cursor.sig"
 CW.Paths.HITMARKER_SIG_FILE = CW.Paths.CACHE_FOLDER.."/hitmarker.sig"
 CW.Paths.SOUND_SIG_FILE     = CW.Paths.CACHE_FOLDER.."/sound.sig"
 
--- ── Settings ─────────────────────────────────────────────────────────
 CW.Settings.HITMARKER_SIZE             = numOr(_cfg.HITMARKER_SIZE, 50, 1)
 CW.Settings.SOUND_VOLUME               = numOr(_cfg.SOUND_VOLUME, 1, 0)
 CW.Settings.CURSOR_TARGET_SIZE         = numOr(_cfg.CURSOR_TARGET_SIZE, 82, 1)
@@ -112,12 +100,10 @@ CW.Settings.HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, t
 CW.Settings.HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, true)
 CW.Settings.HITMARKER_FADEOUT         = boolOr(_cfg.HITMARKER_FADEOUT, true)
 
--- ── ShootEvent (cached once, reused across re-executions) ─────────────
 if not CW.ShootEvent then
 	CW.ShootEvent = ReplicatedStorage:WaitForChild("GunRemotes"):WaitForChild("ShootEvent")
 end
 
--- ── Mouse position + team color tracking ─────────────────────────────
 do
 	local loc = UserInputService:GetMouseLocation()
 	CW.State.mouseX, CW.State.mouseY = loc.X, loc.Y
@@ -134,7 +120,6 @@ if isFirstRun then
 		CW.State.mouseX = input.Position.X + inset.X
 		CW.State.mouseY = input.Position.Y + inset.Y
 
-		-- Keep any "follow mouse" hitmarkers glued to the cursor.
 		for clone in pairs(CW.ActiveFollowClones) do
 			local ok = pcall(function()
 				clone.Position = UDim2.fromOffset(CW.State.mouseX, CW.State.mouseY)
@@ -144,7 +129,6 @@ if isFirstRun then
 	end)
 end
 
--- ── Load modules in dependency order ─────────────────────────────────
 loadModule("Cache.lua")
 loadModule("PNG.lua")
 loadModule("Cursor.lua")
