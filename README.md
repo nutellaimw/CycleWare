@@ -42,9 +42,12 @@ getnamecallmethod.
 To setup, first run the script once. After that, open your executor workspace folder. There will be created a folder named CycleWare. Open it.
 Inside, open Assets, and paste the files you would like as your cursor, hitmaker and hit sound, named exactly like this respectably:
 
+
+```text
 cursor.png
 hitmarker.png
 sound.mp3
+```
 
 (currently no other file format is supported)
 
