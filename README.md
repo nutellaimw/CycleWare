@@ -1,7 +1,6 @@
+## Cycle-Ware
+
 A prison life enhancer (vibe coded, but fully works, and developed by someone who at least knows what is he doing)
-
-Integrated with custom settings.
-
 
 ## Loader
 
@@ -24,6 +23,8 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/nutellaimw/CycleWare/
 ```
 
 
+## Requirements
+
 You executor must support these functions:
 
 full File API.
@@ -34,3 +35,22 @@ hookmetamethod
 newcclosure
 checkcaller
 getnamecallmethod
+
+
+## How to use
+
+To setup, first run the script once. After that, open your executor workspace folder. There will be created a folder named CycleWare. Open it.
+Inside, open Assets, and paste the files you would like as your cursor, hitmaker and hit sound, named exactly like this respectably:
+
+cursor.png
+hitmarker.png
+sound.mp3
+
+(currently no other file format is supported)
+
+Re-run the script and it will be all applied. You can change settings/assets in real time, not needing to rejoin the game.
+Everything else is edited directly on the script.
+
+If you still need help, there's a video guide in our discord, and also a bunch of assets posted by me that you can use!
+
+https://discord.gg/7qFKCqpAnc
