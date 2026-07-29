@@ -54,3 +54,7 @@ Everything else is edited directly on the script.
 If you still need help, there's a video guide in our discord, and also a bunch of assets posted by me that you can use!
 
 https://discord.gg/7qFKCqpAnc
+
+This script was a try at recreating an old prison life script with the same idea behind it. But since prison life got updated and the original script was never updated, I decided to step in and remake it. 
+
+The original script is also available for anyone to see: https://raw.githubusercontent.com/VapingCat/IA-Battlegrounds-Hitmarkers-Cursor/main/script.lua
