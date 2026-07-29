@@ -27,14 +27,14 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/nutellaimw/CycleWare/
 
 You executor must support these functions:
 
-full File API.
-getcustomasset
-getgenv
-gethui
-hookmetamethod
-newcclosure
-checkcaller
-getnamecallmethod
+full File API,
+getcustomasset,
+getgenv,
+gethui,
+hookmetamethod,
+newcclosure,
+checkcaller,
+getnamecallmethod.
 
 
 ## How to use
