@@ -1,10 +1,3 @@
--- ══════════════════════════════════════════════════════════════════════
---  Cursor.lua · OS cursor generation/reload + team-color cursor tinting.
---  Fully self-contained: owns setOSCursor, the enforcer, cursor
---  generation, AND the TeamChecker PreRender loop (since that loop's
---  only job is picking which tinted cursor to show).
--- ══════════════════════════════════════════════════════════════════════
-
 local CW = getgenv().__CW_CORE_STATE
 
 local Players          = game:GetService("Players")
@@ -21,7 +14,6 @@ local TINT_VARIANTS = {
 	{key="green", tR=56,  tG=255, tB=56},
 }
 
--- ── Signature / file naming ──────────────────────────────────────────
 local function computeCursorSourceSignature()
 	local tintSig = ""
 	for _, v in ipairs(TINT_VARIANTS) do
@@ -41,7 +33,6 @@ local function buildCursorFiles(sigHash)
 	}
 end
 
--- ── OS cursor application ────────────────────────────────────────────
 local function setOSCursor(key)
 	if CW.State.currentCursorKey == key then return end
 	CW.State.currentCursorKey = key
@@ -83,7 +74,6 @@ local function activateCursors()
 	connectEnforcer()
 end
 
--- ── Generation ──────────────────────────────────────────────────────
 local function loadCachedCursorAssets(files)
 	CW.Assets.white = getcustomasset(files.white)
 	CW.Assets.red   = getcustomasset(files.red)
@@ -152,7 +142,6 @@ end
 
 task.spawn(generateCursors)
 
--- ── Team checker (decides which tinted cursor to display) ────────────
 if CW.IsFirstRun then
 	RunService.PreRender:Connect(function()
 		if not CW.State.cursorsReady then return end
