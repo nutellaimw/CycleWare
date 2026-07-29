@@ -9,17 +9,21 @@ if CW.IsFirstRun then
 	CW.Bindable = Instance.new("BindableEvent")
 
 	CW.Bindable.Event:Connect(function(bullets)
-		local ShotHit = false
-		for _, bullet in pairs(bullets) do
-			local Hit = bullet[3]
-			if not Hit or not Hit.Parent then continue end
+	local ShotHit = false
+	for _, bullet in pairs(bullets) do
+		local Hit = bullet[3]
+		if not Hit or not Hit.Parent then continue end
+		local ok, isHit = pcall(function()
 			local Player = Players:GetPlayerFromCharacter(Hit.Parent)
 				or (Hit.Parent.Parent and Players:GetPlayerFromCharacter(Hit.Parent.Parent))
-			if Player and Player ~= LocalPlayer and Player.TeamColor ~= CW.State.cachedTeamColor then
-				ShotHit = true; break
-			end
+			return Player and Player ~= LocalPlayer and Player.TeamColor ~= CW.State.cachedTeamColor
+		end)
+		if ok and isHit then
+			ShotHit = true
+			break
 		end
-		if not ShotHit then return end
+	end
+	if not ShotHit then return end
 		CW.playHitSound()
 
 		local Clone = CW.HMTemplate:Clone()
