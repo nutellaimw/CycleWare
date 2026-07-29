@@ -27,7 +27,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/nutellaimw/CycleWare/
 
 You executor must support these functions:
 
-full File API,
+Full File API,
 getcustomasset,
 getgenv,
 gethui,
