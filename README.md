@@ -22,6 +22,9 @@ getgenv().CW_CONFIG = {
 loadstring(game:HttpGet("https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CycleWare.lua"))()
 ```
 
+Differently of other scripts, CycleWare does not use imagelabels as the cursor. Instead, we use the MouseIcon, which offers 0 delay on mouse.
+The only thing in usage as imagelabel is the hitmarker. But we plan to change that in the future.
+
 
 ## Requirements
 
