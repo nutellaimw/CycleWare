@@ -4,10 +4,9 @@
      alt="Cycle-Ware Logo"
      width="247">
 
+<h1>Cycle-Ware</h1>
+
 </div>
-
-
-#                                                   Cycle-Ware
 
 A prison life enhancer (vibe coded, but fully works, and developed by someone who at least knows what is he doing)
 
