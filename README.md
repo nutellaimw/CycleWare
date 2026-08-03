@@ -1,3 +1,6 @@
+<img width="247" height="237" alt="LogoCW" src="https://github.com/user-attachments/assets/53b2a29a-ff7a-4e18-b3dc-41610dbe630d" />
+
+
 ## Cycle-Ware
 
 A prison life enhancer (vibe coded, but fully works, and developed by someone who at least knows what is he doing)
