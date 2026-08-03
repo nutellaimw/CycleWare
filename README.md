@@ -17,12 +17,12 @@ getgenv().CW_CONFIG = {
     HITMARKER_VISIBLE_DURATION = 0.05,
     HITMARKER_FADEOUT          = true,
     HITMARKER_FADEOUT_DURATION = 0.15,
-    customBulletTracers = false,
-    tracerColor          = Color3.fromRGB(170, 0, 255),
-    glowColor             = Color3.fromRGB(200, 100, 255),
-    tracerWidth           = 0.05,
-    tracerLifetime         = 0.05,
-    applyToOthers          = false,
+    customBulletTracers        = false,
+    tracerColor                = Color3.fromRGB(170, 0, 255),
+    glowColor                  = Color3.fromRGB(200, 100, 255),
+    tracerWidth                = 0.05,
+    tracerLifetime             = 0.05,
+    applyToOthers              = false,
 }
 }
 
