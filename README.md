@@ -24,7 +24,6 @@ getgenv().CW_CONFIG = {
     tracerLifetime             = 0.05,
     applyToOthers              = false,
 }
-}
 
 loadstring(game:HttpGet("https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CycleWare.lua"))()
 ```
