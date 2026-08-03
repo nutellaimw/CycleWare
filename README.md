@@ -1,5 +1,10 @@
-<img width="247" height="237" alt="LogoCW" src="https://github.com/user-attachments/assets/53b2a29a-ff7a-4e18-b3dc-41610dbe630d" />
+<div align="center">
 
+<img src="https://github.com/user-attachments/assets/53b2a29a-ff7a-4e18-b3dc-41610dbe630d"
+     alt="Cycle-Ware Logo"
+     width="247">
+
+</div>
 
 ## Cycle-Ware
 
