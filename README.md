@@ -8,7 +8,7 @@
 
 </div>
 
-A prison life enhancer (vibe coded, but fully works, and developed by someone who at least knows what is he doing)
+A Prison Life enhancer (vibe coded, but fully works, and developed by someone who actually knows what they're doing). Customizable, and open source.
 
 ## Loader
 
