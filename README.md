@@ -64,7 +64,7 @@ Inside, open Assets, and paste the files you would like as your cursor, hitmarke
 cursor.png
 hitmarker.png
 sound.mp3
-texture.png
+texture.png or texture_<gunname>.png to apply a texture to a specific weapon.
 ```
 
 (currently no other file format is supported)
