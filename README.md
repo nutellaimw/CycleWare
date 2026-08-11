@@ -72,9 +72,9 @@ texture.png or texture_<gunname>.png to apply a texture to a specific weapon.
 Re-run the script and it will be all applied. You can change settings/assets in real time, not needing to rejoin the game.
 Everything else is edited directly on the script.
 
-If you still need help, there's a video guide in our discord, and also a bunch of assets posted by me that you can use!
+If you still need help, feel free to dm me on discord: nutella_i
 
-https://discord.gg/7qFKCqpAnc
+if you want to see a showcase, there is a small edit i made in my YouTube channel: https://www.youtube.com/@nutella_i
 
 This script was a try at recreating an old prison life script with the same idea behind it. But since prison life got updated and the original script was never updated, I decided to step in and remake it. 
 
