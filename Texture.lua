@@ -13,7 +13,6 @@ if not isfolder(CW.Paths.TEXTURE_CACHE_FOLDER) then
 	pcall(makefolder, CW.Paths.TEXTURE_CACHE_FOLDER)
 end
 
--- Weapons with a native MeshPart already in the tool — just look it up.
 local WEAPON_MESHES = _cfg.WEAPON_MESHES or {
 	["M9"]            = "Meshes/M9_3",
 	["M4A1"]          = "Meshes/m4_7",
@@ -23,9 +22,6 @@ local WEAPON_MESHES = _cfg.WEAPON_MESHES or {
 	["AK-47"]         = "Meshes/AK47_7",
 }
 
--- Weapons with NO native MeshPart — we build one ourselves, but ONLY
--- once we know a texture is actually available to put on it. If no
--- texture is loaded for these, the tool is left completely untouched.
 local CUSTOM_MESH_WEAPONS = _cfg.CUSTOM_MESH_WEAPONS or {
 	["FAL"] = {
 		meshId      = "rbxassetid://90772329772088",
@@ -128,7 +124,6 @@ for weaponName in pairs(CW.Assets.weaponTextures) do
 	end
 end
 
--- ── Custom mesh builder (only ever called once we KNOW a texture exists) ──
 local function buildCustomMesh(tool, cfg)
 	for _, desc in ipairs(tool:GetDescendants()) do
 		if cfg.removeNames[desc.Name] then
@@ -168,15 +163,13 @@ local function buildCustomMesh(tool, cfg)
 	return mesh
 end
 
--- ── Main apply logic ──────────────────────────────────────────────────
 local function applyTexture(tool)
 	local textureId = CW.Assets.weaponTextures[tool.Name] or CW.Assets.weaponTexture
-	if not textureId then return end -- nothing to apply for ANY weapon type
+	if not textureId then return end
 
 	local customCfg = CUSTOM_MESH_WEAPONS[tool.Name]
 	if customCfg then
-		-- Rebuild fresh every time a texture is confirmed available —
-		-- keeps geometry in sync if this fires again after a re-equip.
+
 		local mesh = buildCustomMesh(tool, customCfg)
 		mesh.TextureID = textureId
 		return
