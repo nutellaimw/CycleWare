@@ -1,5 +1,8 @@
 local CW = getgenv().__CW_CORE_STATE
 
+CW.reloadSoundAsset = reloadSound
+reloadSound()
+
 local SoundService = game:GetService("SoundService")
 local Debris       = game:GetService("Debris")
 
