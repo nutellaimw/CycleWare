@@ -1,5 +1,8 @@
 local CW = getgenv().__CW_CORE_STATE
 
+CW.reloadHitmarkerAsset = reloadHitmarker
+reloadHitmarker()
+
 if CW.IsFirstRun then
 	CW.IAPortable = Instance.new("ScreenGui")
 	CW.IAPortable.Name           = "CW_SA"
