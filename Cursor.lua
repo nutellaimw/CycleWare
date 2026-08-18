@@ -140,6 +140,7 @@ local function generateCursors()
 	end
 end
 
+CW.reloadCursor = generateCursors
 task.spawn(generateCursors)
 
 if CW.IsFirstRun then
