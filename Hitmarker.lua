@@ -1,8 +1,5 @@
 local CW = getgenv().__CW_CORE_STATE
 
-CW.reloadHitmarkerAsset = reloadHitmarker
-reloadHitmarker()
-
 if CW.IsFirstRun then
 	CW.IAPortable = Instance.new("ScreenGui")
 	CW.IAPortable.Name           = "CW_SA"
@@ -20,17 +17,20 @@ end
 
 CW.HMTemplate.Size = UDim2.new(0, CW.Settings.HITMARKER_SIZE, 0, CW.Settings.HITMARKER_SIZE)
 
-local asset = CW.loadCachedAsset({
-	file        = CW.Paths.HITMARKER_FILE,
-	sigFile     = CW.Paths.HITMARKER_SIG_FILE,
-	cacheFolder = CW.Paths.HITMARKER_CACHE_FOLDER,
-	prefix      = "hm",
-	ext         = ".png",
-	label       = "hitmarker.png",
-
-	isUnchanged = function() return CW.HMTemplate.Image ~= "" end,
-})
-
-if asset then
-	CW.HMTemplate.Image = asset
+local function reloadHitmarker()
+	local asset = CW.loadCachedAsset({
+		file        = CW.Paths.HITMARKER_FILE,
+		sigFile     = CW.Paths.HITMARKER_SIG_FILE,
+		cacheFolder = CW.Paths.HITMARKER_CACHE_FOLDER,
+		prefix      = "hm",
+		ext         = ".png",
+		label       = "hitmarker.png",
+		isUnchanged = function() return CW.HMTemplate.Image ~= "" end,
+	})
+	if asset then
+		CW.HMTemplate.Image = asset
+	end
 end
+
+CW.reloadHitmarkerAsset = reloadHitmarker
+reloadHitmarker()
