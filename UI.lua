@@ -92,12 +92,22 @@ VisualsTab:Textbox({
 	end,
 })
 
+local cursorSizeDebounceThread = nil
+
 VisualsTab:Slider({
 	Title = "Cursor Size", Min = 16, Max = 256, Default = CW.Settings.CURSOR_TARGET_SIZE,
 	Suffix = "px", Flag = "Cursor_Size",
 	Callback = function(v)
 		CW.Settings.CURSOR_TARGET_SIZE = v
-		if CW.reloadCursor then CW.reloadCursor() end
+
+		if cursorSizeDebounceThread then
+			task.cancel(cursorSizeDebounceThread)
+		end
+
+		cursorSizeDebounceThread = task.delay(2, function()
+			cursorSizeDebounceThread = nil
+			if CW.reloadCursor then CW.reloadCursor() end
+		end)
 	end,
 })
 
