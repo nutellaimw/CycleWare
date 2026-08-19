@@ -19,10 +19,6 @@ Elastic:SetWindowKeybind(Enum.KeyCode.RightShift)
 
 local Window = Elastic:Window()
 
-local Watermark = Window:Watermark("CycleWare")
-Watermark:SetPosition("TopLeft")
-Watermark:SetVisible(true)
-
 local CombatTab = Window:Tab({ Title = "Hitmarker", Icon = Icons.Combat })
 
 CombatTab:Textbox({
@@ -199,11 +195,6 @@ TracersTab:Toggle({
 })
 
 local SettingsTab = Window.ConfigTab
-
-SettingsTab:Toggle({
-	Title = "Show Watermark", Default = true, Flag = "Config_Watermark",
-	Callback = function(s) Watermark:SetVisible(s) end,
-})
 
 do
 	local Theme = Elastic:GetTheme()
