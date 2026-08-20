@@ -18,6 +18,33 @@ local Icons = {
 Elastic:SetWindowKeybind(Enum.KeyCode.RightShift)
 local Window = Elastic:Window()
 
+local StarterGui = game:GetService("StarterGui")
+
+local function notify(title, content, duration)
+	duration = duration or 3
+
+	local attempts = {
+		function() Elastic:Notify({ Title = title, Content = content, Duration = duration }) end,
+		function() Window:Notify({ Title = title, Content = content, Duration = duration }) end,
+		function() Elastic.Notify(Elastic, { Title = title, Content = content, Duration = duration }) end,
+		function() Elastic:Notification({ Title = title, Content = content, Duration = duration }) end,
+	}
+
+	for _, attempt in ipairs(attempts) do
+		local ok = pcall(attempt)
+		if ok then return end
+	end
+
+	pcall(function()
+		StarterGui:SetCore("SendNotification", {
+			Title = title,
+			Text  = content,
+			Duration = duration,
+		})
+	end)
+end
+
+
 local CombatTab = Window:Tab({ Title = "Hitmarker", Icon = Icons.Combat })
 
 local function applyHitmarkerFile(value)
