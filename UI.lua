@@ -2,6 +2,7 @@ local CW = getgenv().__CW_CORE_STATE
 assert(CW, "CycleWare must be loaded before UI.lua")
 
 local HttpService = game:GetService("HttpService")
+local StarterGui  = game:GetService("StarterGui")
 
 local Elastic = loadstring(game:HttpGet(
 	"https://raw.githubusercontent.com/53845052/roblox-uis/refs/heads/main/ElasticLib.lua"
@@ -17,6 +18,40 @@ local Icons = {
 
 Elastic:SetWindowKeybind(Enum.KeyCode.RightShift)
 local Window = Elastic:Window()
+
+local function notify(title, content, duration)
+	duration = duration or 3
+
+	local attempts = {
+		{ name = "Elastic:Notify",      fn = function() Elastic:Notify({ Title = title, Content = content, Duration = duration }) end },
+		{ name = "Window:Notify",       fn = function() Window:Notify({ Title = title, Content = content, Duration = duration }) end },
+		{ name = "Elastic.Notify",      fn = function() Elastic.Notify(Elastic, { Title = title, Content = content, Duration = duration }) end },
+		{ name = "Elastic:Notification",fn = function() Elastic:Notification({ Title = title, Content = content, Duration = duration }) end },
+	}
+
+	for _, attempt in ipairs(attempts) do
+		local ok, err = pcall(attempt.fn)
+		if ok then
+			return
+		else
+			warn("[CW UI] notify attempt '"..attempt.name.."' failed: "..tostring(err))
+		end
+	end
+
+	pcall(function()
+		StarterGui:SetCore("SendNotification", {
+			Title = title,
+			Text  = content,
+			Duration = duration,
+		})
+	end)
+end
+
+if CW.IsFirstRun then
+	task.delay(1, function()
+		notify("CycleWare", "Press RIGHT SHIFT to show/hide the UI.", 6)
+	end)
+end
 
 local CombatTab = Window:Tab({ Title = "Hitmarker", Icon = Icons.Combat })
 
@@ -81,7 +116,7 @@ CombatTab:Button({
 	Title = "Reload Hitmarker", Action = "Reload",
 	Callback = function()
 		if CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
-		Elastic:Notify({ Title = "CycleWare", Content = "Hitmarker reloaded.", Duration = 3 })
+		notify("CycleWare", "Hitmarker reloaded.", 3)
 	end,
 })
 
@@ -127,7 +162,7 @@ VisualsTab:Button({
 	Title = "Reload Cursor", Action = "Reload",
 	Callback = function()
 		if CW.reloadCursor then CW.reloadCursor() end
-		Elastic:Notify({ Title = "CycleWare", Content = "Cursor reloaded.", Duration = 3 })
+		notify("CycleWare", "Cursor reloaded.", 3)
 	end,
 })
 
@@ -147,7 +182,7 @@ WeaponsTab:Button({
 	Title = "Reload Textures", Action = "Reload",
 	Callback = function()
 		if CW.reloadTextures then CW.reloadTextures() end
-		Elastic:Notify({ Title = "CycleWare", Content = "Textures reloaded and reapplied.", Duration = 3 })
+		notify("CycleWare", "Texture applied successfully.", 3)
 	end,
 })
 
@@ -175,7 +210,7 @@ SoundsTab:Button({
 	Title = "Reload Sound", Action = "Reload",
 	Callback = function()
 		if CW.reloadSoundAsset then CW.reloadSoundAsset() end
-		Elastic:Notify({ Title = "CycleWare", Content = "Hit sound reloaded.", Duration = 3 })
+		notify("CycleWare", "Hit sound reloaded.", 3)
 	end,
 })
 
@@ -324,13 +359,9 @@ SettingsTab:Button({
 		local ok, encoded = pcall(HttpService.JSONEncode, HttpService, out)
 		if ok then
 			writefile(CONFIG_FILE, encoded)
-			Elastic:Notify({
-				Title = "CycleWare",
-				Content = "Configuration saved ("..savedCount.." settings).",
-				Duration = 3,
-			})
+			notify("CycleWare", "Config saved ("..savedCount.." settings).", 3)
 		else
-			Elastic:Notify({ Title = "CycleWare", Content = "Failed to save configuration.", Duration = 3 })
+			notify("CycleWare", "Failed to save configuration.", 5)
 		end
 	end,
 })
@@ -339,19 +370,19 @@ SettingsTab:Button({
 	Title = "Load Config", Action = "Load",
 	Callback = function()
 		if not isfile(CONFIG_FILE) then
-			Elastic:Notify({ Title = "CycleWare", Content = "No saved configuration found.", Duration = 3 })
+			notify("CycleWare", "No saved configuration found.", 3)
 			return
 		end
 
 		local ok, raw = pcall(readfile, CONFIG_FILE)
 		if not ok then
-			Elastic:Notify({ Title = "CycleWare", Content = "Failed to read configuration.", Duration = 3 })
+			notify("CycleWare", "Failed to read configuration.", 5)
 			return
 		end
 
 		local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
 		if not ok2 or type(data) ~= "table" then
-			Elastic:Notify({ Title = "CycleWare", Content = "Configuration file is corrupted.", Duration = 3 })
+			notify("CycleWare", "Configuration file is corrupted.", 5)
 			return
 		end
 
@@ -399,11 +430,11 @@ SettingsTab:Button({
 		if touchedPaths.Sound_FilePath and CW.reloadSoundAsset then CW.reloadSoundAsset() end
 		if touchedPaths.Texture_FilePath and CW.reloadTextures then CW.reloadTextures() end
 
-		local message = "Configuration loaded ("..restoredCount.." settings)."
+		local message = "Config loaded ("..restoredCount.." settings)."
 		if failedCount > 0 then
-			message = message.." "..failedCount.." failed to restore."
+			message = message.." "..failedCount.." failed."
 		end
-		Elastic:Notify({ Title = "CycleWare", Content = message, Duration = 4 })
+		notify("CycleWare", message, 4)
 	end,
 })
 
