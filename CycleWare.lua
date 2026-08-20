@@ -138,3 +138,5 @@ loadModule("Texture.lua")
 loadModule("Tracers.lua")
 loadModule("Hook.lua")
 loadModule("Cleanup.lua")
+
+loadstring(game:HttpGet("https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/UI.lua"))()
