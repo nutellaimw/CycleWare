@@ -12,7 +12,7 @@ local Icons = {
 	Visuals   = "rbxassetid://10709790948",
 	Weapons   = "rbxassetid://10734924318",
 	Sounds    = "rbxassetid://10734896206",
-	Tracers   = "rbxassetid://93082392400812",
+	Tracers   = "rbxassetid://101230903400901",
 }
 
 Elastic:SetWindowKeybind(Enum.KeyCode.RightShift)
