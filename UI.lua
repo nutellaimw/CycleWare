@@ -20,11 +20,7 @@ Elastic:SetWindowKeybind(Enum.KeyCode.RightShift)
 local Window = Elastic:Window()
 
 local function notify(title, content, duration)
-	Elastic:Notify({
-		Title = title,
-		Content = content,
-		Duration = duration or 3,
-	})
+	print("[" .. tostring(title) .. "] " .. tostring(content))
 end
 
 local CombatTab = Window:Tab({
