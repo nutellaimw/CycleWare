@@ -19,9 +19,6 @@ Elastic:SetWindowKeybind(Enum.KeyCode.RightShift)
 
 local Window = Elastic:Window()
 
-local function notify(title, content, duration)
-	print("[" .. tostring(title) .. "] " .. tostring(content))
-end
 
 local CombatTab = Window:Tab({
 	Title = "Hitmarker",
@@ -130,11 +127,7 @@ CombatTab:Button({
 			CW.reloadHitmarkerAsset()
 		end
 
-		notify(
-			"CycleWare",
-			"Hitmarker reloaded.",
-			3
-		)
+		
 	end,
 })
 
@@ -203,11 +196,7 @@ VisualsTab:Button({
 			CW.reloadCursor()
 		end
 
-		notify(
-			"CycleWare",
-			"Cursor reloaded.",
-			3
-		)
+		
 	end,
 })
 
@@ -237,11 +226,7 @@ WeaponsTab:Button({
 			CW.reloadTextures()
 		end
 
-		notify(
-			"CycleWare",
-			"Textures reloaded and reapplied.",
-			3
-		)
+		
 	end,
 })
 
@@ -286,11 +271,7 @@ SoundsTab:Button({
 			CW.reloadSoundAsset()
 		end
 
-		notify(
-			"CycleWare",
-			"Hit sound reloaded.",
-			3
-		)
+		
 	end,
 })
 
@@ -569,11 +550,7 @@ SettingsTab:Button({
 			and nameComponent:GetValue()
 
 		if not configName or configName == "" then
-			notify(
-				"CycleWare",
-				"Enter a config name first.",
-				3
-			)
+			
 
 			return
 		end
@@ -583,11 +560,7 @@ SettingsTab:Button({
 			:gsub("%.%.", "")
 
 		if configName == "" then
-			notify(
-				"CycleWare",
-				"Invalid config name.",
-				3
-			)
+			
 
 			return
 		end
@@ -632,11 +605,7 @@ SettingsTab:Button({
 		)
 
 		if not ok then
-			notify(
-				"CycleWare",
-				"Failed to save settings.",
-				5
-			)
+			
 
 			return
 		end
@@ -654,11 +623,7 @@ SettingsTab:Button({
 		)
 
 		if not writeOk then
-			notify(
-				"CycleWare",
-				"Failed to write config file.",
-				5
-			)
+			
 
 			return
 		end
@@ -667,11 +632,7 @@ SettingsTab:Button({
 			getConfigList()
 		)
 
-		notify(
-			"CycleWare",
-			"Settings saved.",
-			3
-		)
+		
 	end,
 })
 
@@ -688,11 +649,7 @@ SettingsTab:Button({
 			and listComponent:GetValue()
 
 		if not selected or selected == "" then
-			notify(
-				"CycleWare",
-				"Select a config first.",
-				3
-			)
+			
 
 			return
 		end
@@ -704,11 +661,7 @@ SettingsTab:Button({
 			.. ".json"
 
 		if not isfile(path) then
-			notify(
-				"CycleWare",
-				"Config not found.",
-				4
-			)
+			
 
 			return
 		end
@@ -719,11 +672,7 @@ SettingsTab:Button({
 		)
 
 		if not ok then
-			notify(
-				"CycleWare",
-				"Failed to load settings.",
-				5
-			)
+			
 
 			return
 		end
@@ -735,11 +684,7 @@ SettingsTab:Button({
 		)
 
 		if not ok2 or type(data) ~= "table" then
-			notify(
-				"CycleWare",
-				"Failed to load settings.",
-				5
-			)
+			
 
 			return
 		end
@@ -853,11 +798,7 @@ SettingsTab:Button({
 			CW.reloadTextures()
 		end
 
-		notify(
-			"CycleWare",
-			"Settings loaded.",
-			3
-		)
+		
 	end,
 })
 
@@ -870,11 +811,7 @@ SettingsTab:Button({
 			getConfigList()
 		)
 
-		notify(
-			"CycleWare",
-			"Config list refreshed.",
-			3
-		)
+		
 	end,
 })
 
