@@ -10,7 +10,7 @@ local Elastic = loadstring(game:HttpGet(
 local Icons = {
 	Combat  = "rbxassetid://10734950020",
 	Visuals = "rbxassetid://10709790948",
-	Weapons = "rbxassetid://10734924318",
+	Weapons = "rbxassetid://9094483852",
 	Sounds  = "rbxassetid://10734896206",
 	Tracers = "rbxassetid://94654949230438",
 }
