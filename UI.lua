@@ -362,9 +362,7 @@ do
 
 		Callback = function(color)
 			local currentTheme = Elastic:GetTheme()
-
 			currentTheme.Accent = color
-
 			Elastic:SetTheme(currentTheme)
 		end,
 	})
@@ -378,7 +376,6 @@ local function serializeValue(componentType, value, component)
 				Name = value.Name,
 			}
 		end
-
 		return nil
 	end
 
@@ -400,419 +397,153 @@ end
 
 local function deserializeValue(componentType, saved)
 	if componentType == "Keybind" then
-		if type(saved) == "table"
-			and saved.EnumType
-			and saved.Name
-		then
+		if type(saved) == "table" and saved.EnumType and saved.Name then
 			local enumType = Enum[saved.EnumType]
-
 			if enumType then
 				local ok, item = pcall(function()
 					return enumType[saved.Name]
 				end)
-
-				if ok then
-					return item
-				end
+				if ok then return item end
 			end
 		end
-
 		return nil
 	end
 
 	if componentType == "Colorpicker" then
-		if type(saved) ~= "table" then
-			return nil
-		end
-
-		return Color3.new(
-			saved.R,
-			saved.G,
-			saved.B
-		), saved.Transparency
+		if type(saved) ~= "table" then return nil end
+		return Color3.new(saved.R, saved.G, saved.B), saved.Transparency
 	end
 
 	return saved
 end
 
 local ApplyFunctions = {
-	Hitmarker_FilePath =
-		applyHitmarkerFile,
+	Hitmarker_FilePath        = applyHitmarkerFile,
+	Hitmarker_Size            = applyHitmarkerSize,
+	Hitmarker_RandomRotation  = applyHitmarkerRandomRotation,
+	Hitmarker_FollowMouse     = applyHitmarkerFollowMouse,
+	Hitmarker_VisibleDuration = applyHitmarkerVisibleDuration,
+	Hitmarker_Fadeout         = applyHitmarkerFadeout,
+	Hitmarker_FadeoutDuration = applyHitmarkerFadeoutDuration,
 
-	Hitmarker_Size =
-		applyHitmarkerSize,
+	Cursor_FilePath = applyCursorFile,
+	Cursor_Size     = function(v) applyCursorSize(v, true) end,
 
-	Hitmarker_RandomRotation =
-		applyHitmarkerRandomRotation,
+	Texture_FilePath = applyTextureFile,
 
-	Hitmarker_FollowMouse =
-		applyHitmarkerFollowMouse,
+	Sound_FilePath = applySoundFile,
+	Sound_Volume   = applySoundVolume,
 
-	Hitmarker_VisibleDuration =
-		applyHitmarkerVisibleDuration,
-
-	Hitmarker_Fadeout =
-		applyHitmarkerFadeout,
-
-	Hitmarker_FadeoutDuration =
-		applyHitmarkerFadeoutDuration,
-
-	Cursor_FilePath =
-		applyCursorFile,
-
-	Cursor_Size =
-		function(v)
-			applyCursorSize(v, true)
-		end,
-
-	Texture_FilePath =
-		applyTextureFile,
-
-	Sound_FilePath =
-		applySoundFile,
-
-	Sound_Volume =
-		applySoundVolume,
-
-	Tracer_Enabled =
-		applyTracerEnabled,
-
-	Tracer_Color =
-		applyTracerColor,
-
-	Tracer_GlowColor =
-		applyTracerGlowColor,
-
-	Tracer_Width =
-		applyTracerWidth,
-
-	Tracer_Lifetime =
-		applyTracerLifetime,
-
-	Tracer_ApplyToOthers =
-		applyTracerApplyToOthers,
+	Tracer_Enabled       = applyTracerEnabled,
+	Tracer_Color         = applyTracerColor,
+	Tracer_GlowColor     = applyTracerGlowColor,
+	Tracer_Width         = applyTracerWidth,
+	Tracer_Lifetime      = applyTracerLifetime,
+	Tracer_ApplyToOthers = applyTracerApplyToOthers,
 }
 
-local CONFIG_FOLDER = "elastic"
+local SETTINGS_FILE = CW.Paths.CACHE_FOLDER.."/ui_settings.json"
 
-if not isfolder(CONFIG_FOLDER) then
-	makefolder(CONFIG_FOLDER)
-end
+local function saveSettings()
+	local out = {}
 
-local function getConfigList()
-	local list = {}
+	for flag, component in pairs(Elastic.Flags) do
+		if not flag:find("^Config_") then
+			local ok, componentType = pcall(function()
+				return component:GetComponentType()
+			end)
 
-	local ok, files = pcall(
-		listfiles,
-		CONFIG_FOLDER
-	)
+			if ok and componentType then
+				local ok2, value = pcall(function()
+					return component:GetValue()
+				end)
 
-	if ok and files then
-		for _, path in ipairs(files) do
-			local name = path:match(
-				"([^/\\]+)%.json$"
-			)
-
-			if name then
-				table.insert(list, name)
+				if ok2 and value ~= nil then
+					local serialized = serializeValue(componentType, value, component)
+					if serialized ~= nil then
+						out[flag] = { componentType, serialized }
+					end
+				end
 			end
 		end
 	end
 
-	table.sort(list)
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, out)
+	if not ok then
+		warn("[CW] Failed to encode settings")
+		return
+	end
 
-	return list
+	pcall(writefile, SETTINGS_FILE, encoded)
 end
 
-SettingsTab:Textbox({
-	Title = "Config Name",
-	Placeholder = "myconfig",
-	Flag = "Config_ConfigName",
-})
+local function loadSettings()
+	if not isfile(SETTINGS_FILE) then return end
 
-local ConfigDropdown = SettingsTab:Dropdown({
-	Title = "Configs",
-	Default = nil,
-	Options = getConfigList(),
-	Flag = "Config_ConfigList",
-})
+	local ok, raw = pcall(readfile, SETTINGS_FILE)
+	if not ok then return end
+
+	local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
+	if not ok2 or type(data) ~= "table" then return end
+
+	local touchedPaths = {}
+
+	for flag, entry in pairs(data) do
+		local component = Elastic.Flags[flag]
+
+		if component and type(entry) == "table" and entry[1] then
+			local componentType, saved = entry[1], entry[2]
+
+			local ok3, currentType = pcall(function()
+				return component:GetComponentType()
+			end)
+
+			if ok3 and currentType == componentType then
+				local applyFn = ApplyFunctions[flag]
+				local restored = false
+
+				local ok4 = pcall(function()
+					if componentType == "Colorpicker" then
+						local color, transparency = deserializeValue(componentType, saved)
+						if color then
+							component:SetValue(color)
+							if transparency ~= nil and component.SetTransparency then
+								component:SetTransparency(transparency)
+							end
+							if applyFn then applyFn(color) end
+							restored = true
+						end
+					else
+						local value = deserializeValue(componentType, saved)
+						if value ~= nil then
+							component:SetValue(value)
+							if applyFn then applyFn(value) end
+							restored = true
+						end
+					end
+				end)
+
+				if ok4 and restored and flag:find("_FilePath$") then
+					touchedPaths[flag] = true
+				end
+			end
+		end
+	end
+
+	if touchedPaths.Cursor_FilePath and CW.reloadCursor then CW.reloadCursor() end
+	if touchedPaths.Hitmarker_FilePath and CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
+	if touchedPaths.Sound_FilePath and CW.reloadSoundAsset then CW.reloadSoundAsset() end
+	if touchedPaths.Texture_FilePath and CW.reloadTextures then CW.reloadTextures() end
+end
 
 SettingsTab:Button({
 	Title = "Save Settings",
 	Action = "Save",
-
 	Callback = function()
-		local nameComponent =
-			Elastic.Flags["Config_ConfigName"]
-
-		local configName =
-			nameComponent
-			and nameComponent:GetValue()
-
-		if not configName or configName == "" then
-			
-
-			return
-		end
-
-		configName = tostring(configName)
-			:gsub("[/\\:*?\"<>|]", "")
-			:gsub("%.%.", "")
-
-		if configName == "" then
-			
-
-			return
-		end
-
-		local out = {}
-
-		for flag, component in pairs(Elastic.Flags) do
-
-			if not flag:find("^Config_") then
-				local ok, componentType = pcall(function()
-					return component:GetComponentType()
-				end)
-
-				if ok and componentType then
-					local ok2, value = pcall(function()
-						return component:GetValue()
-					end)
-
-					if ok2 and value ~= nil then
-						local serialized =
-							serializeValue(
-								componentType,
-								value,
-								component
-							)
-
-						if serialized ~= nil then
-							out[flag] = {
-								componentType,
-								serialized
-							}
-						end
-					end
-				end
-			end
-		end
-
-		local ok, encoded = pcall(
-			HttpService.JSONEncode,
-			HttpService,
-			out
-		)
-
-		if not ok then
-			
-
-			return
-		end
-
-		local path =
-			CONFIG_FOLDER
-			.. "/"
-			.. configName
-			.. ".json"
-
-		local writeOk = pcall(
-			writefile,
-			path,
-			encoded
-		)
-
-		if not writeOk then
-			
-
-			return
-		end
-
-		ConfigDropdown:SetOptions(
-			getConfigList()
-		)
-
-		
+		saveSettings()
 	end,
 })
 
-SettingsTab:Button({
-	Title = "Load Settings",
-	Action = "Load",
-
-	Callback = function()
-		local listComponent =
-			Elastic.Flags["Config_ConfigList"]
-
-		local selected =
-			listComponent
-			and listComponent:GetValue()
-
-		if not selected or selected == "" then
-			
-
-			return
-		end
-
-		local path =
-			CONFIG_FOLDER
-			.. "/"
-			.. tostring(selected)
-			.. ".json"
-
-		if not isfile(path) then
-			
-
-			return
-		end
-
-		local ok, raw = pcall(
-			readfile,
-			path
-		)
-
-		if not ok then
-			
-
-			return
-		end
-
-		local ok2, data = pcall(
-			HttpService.JSONDecode,
-			HttpService,
-			raw
-		)
-
-		if not ok2 or type(data) ~= "table" then
-			
-
-			return
-		end
-
-		local touchedPaths = {}
-
-		for flag, entry in pairs(data) do
-			local component =
-				Elastic.Flags[flag]
-
-			if component
-				and type(entry) == "table"
-				and entry[1]
-			then
-				local componentType =
-					entry[1]
-
-				local saved =
-					entry[2]
-
-				local ok3, currentType =
-					pcall(function()
-						return component:GetComponentType()
-					end)
-
-				if ok3
-					and currentType == componentType
-				then
-					local applyFn =
-						ApplyFunctions[flag]
-
-					local restored = false
-
-					local ok4 = pcall(function()
-						if componentType == "Colorpicker" then
-							local color, transparency =
-								deserializeValue(
-									componentType,
-									saved
-								)
-
-							if color then
-								component:SetValue(color)
-
-								if transparency ~= nil
-									and component.SetTransparency
-								then
-									component:SetTransparency(
-										transparency
-									)
-								end
-
-								if applyFn then
-									applyFn(color)
-								end
-
-								restored = true
-							end
-						else
-							local value =
-								deserializeValue(
-									componentType,
-									saved
-								)
-
-							if value ~= nil then
-								component:SetValue(
-									value
-								)
-
-								if applyFn then
-									applyFn(value)
-								end
-
-								restored = true
-							end
-						end
-					end)
-
-					if ok4
-						and restored
-						and flag:find("_FilePath$")
-					then
-						touchedPaths[flag] = true
-					end
-				end
-			end
-		end
-
-		if touchedPaths.Cursor_FilePath
-			and CW.reloadCursor
-		then
-			CW.reloadCursor()
-		end
-
-		if touchedPaths.Hitmarker_FilePath
-			and CW.reloadHitmarkerAsset
-		then
-			CW.reloadHitmarkerAsset()
-		end
-
-		if touchedPaths.Sound_FilePath
-			and CW.reloadSoundAsset
-		then
-			CW.reloadSoundAsset()
-		end
-
-		if touchedPaths.Texture_FilePath
-			and CW.reloadTextures
-		then
-			CW.reloadTextures()
-		end
-
-		
-	end,
-})
-
-SettingsTab:Button({
-	Title = "Refresh Config List",
-	Action = "Refresh",
-
-	Callback = function()
-		ConfigDropdown:SetOptions(
-			getConfigList()
-		)
-
-		
-	end,
-})
+loadSettings()
 
 print("[CW] UI loaded.")
