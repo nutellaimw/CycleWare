@@ -10,7 +10,7 @@ local Elastic = loadstring(game:HttpGet(
 local Icons = {
 	Combat  = "rbxassetid://10734950020",
 	Visuals = "rbxassetid://10709790948",
-	Weapons = "rbxassetid://101317334384757",
+	Weapons = "rbxassetid://83313626819084",
 	Sounds  = "rbxassetid://10734896206",
 	Tracers = "rbxassetid://94654949230438",
 }
@@ -19,6 +19,22 @@ Elastic:SetWindowKeybind(Enum.KeyCode.RightShift)
 
 local Window = Elastic:Window()
 
+local ASSETS_FOLDER = CW.Paths.CURSOR_FOLDER -- "CycleWare/Assets"
+
+local function resolveAssetPath(input)
+	if not input then return nil end
+	local trimmed = input:match("^%s*(.-)%s*$")
+	if trimmed == "" then return nil end
+	if trimmed:find("/") or trimmed:find("\\") then
+		return trimmed
+	end
+	return ASSETS_FOLDER.."/"..trimmed
+end
+
+local function filenameOnly(fullPath)
+	return fullPath:match("([^/\\]+)$") or fullPath
+end
+
 
 local CombatTab = Window:Tab({
 	Title = "Hitmarker",
@@ -26,9 +42,8 @@ local CombatTab = Window:Tab({
 })
 
 local function applyHitmarkerFile(value)
-	if value and value ~= "" then
-		CW.Paths.HITMARKER_FILE = value
-	end
+	local resolved = resolveAssetPath(value)
+	if resolved then CW.Paths.HITMARKER_FILE = resolved end
 end
 
 local function applyHitmarkerSize(v)
@@ -61,7 +76,7 @@ end
 
 CombatTab:Textbox({
 	Title = "Hitmarker File",
-	Placeholder = CW.Paths.HITMARKER_FILE,
+	Placeholder = filenameOnly(CW.Paths.HITMARKER_FILE),
 	Flag = "Hitmarker_FilePath",
 	Callback = applyHitmarkerFile,
 })
@@ -137,9 +152,8 @@ local VisualsTab = Window:Tab({
 })
 
 local function applyCursorFile(value)
-	if value and value ~= "" then
-		CW.Paths.CURSOR_FILE = value
-	end
+	local resolved = resolveAssetPath(value)
+	if resolved then CW.Paths.CURSOR_FILE = resolved end
 end
 
 local cursorSizeDebounceThread = nil
@@ -171,7 +185,7 @@ end
 
 VisualsTab:Textbox({
 	Title = "Cursor File",
-	Placeholder = CW.Paths.CURSOR_FILE,
+	Placeholder = filenameOnly(CW.Paths.CURSOR_FILE),
 	Flag = "Cursor_FilePath",
 	Callback = applyCursorFile,
 })
@@ -206,14 +220,12 @@ local WeaponsTab = Window:Tab({
 })
 
 local function applyTextureFile(value)
-	if value and value ~= "" then
-		CW.Paths.TEXTURE_FILE = value
-	end
+	local resolved = resolveAssetPath(value)
+	if resolved then CW.Paths.TEXTURE_FILE = resolved end
 end
-
 WeaponsTab:Textbox({
 	Title = "Texture File",
-	Placeholder = CW.Paths.TEXTURE_FILE,
+	Placeholder = filenameOnly(CW.Paths.TEXTURE_FILE),
 	Flag = "Texture_FilePath",
 	Callback = applyTextureFile,
 })
@@ -236,9 +248,8 @@ local SoundsTab = Window:Tab({
 })
 
 local function applySoundFile(value)
-	if value and value ~= "" then
-		CW.Paths.SOUND_FILE = value
-	end
+	local resolved = resolveAssetPath(value)
+	if resolved then CW.Paths.SOUND_FILE = resolved end
 end
 
 local function applySoundVolume(v)
@@ -247,7 +258,7 @@ end
 
 SoundsTab:Textbox({
 	Title = "Hit Sound File",
-	Placeholder = CW.Paths.SOUND_FILE,
+	Placeholder = filenameOnly(CW.Paths.SOUND_FILE),
 	Flag = "Sound_FilePath",
 	Callback = applySoundFile,
 })
