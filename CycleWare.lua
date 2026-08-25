@@ -31,12 +31,14 @@ local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService  = game:GetService("UserInputService")
 local GuiService        = game:GetService("GuiService")
+local HttpService       = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local Mouse       = LocalPlayer:GetMouse()
 
 local CW = getgenv().__CW_CORE_STATE
 local isFirstRun = false
+
 if not CW then
 	isFirstRun = true
 	CW = {
@@ -58,6 +60,7 @@ if not CW then
 	}
 	getgenv().__CW_CORE_STATE = CW
 end
+
 CW.IsFirstRun  = isFirstRun
 CW.LocalPlayer = LocalPlayer
 CW.Mouse       = Mouse
@@ -66,7 +69,9 @@ if CW.Debug == nil then CW.Debug = true end
 CW.Debug = boolOr(_cfg.DEBUG, CW.Debug)
 
 function CW.Log(msg)
-	if CW.Debug then print("[CW] " .. msg) end
+	if CW.Debug then
+		print("[CW] " .. msg)
+	end
 end
 
 function CW.Warn(msg)
@@ -100,6 +105,81 @@ CW.Settings.HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, t
 CW.Settings.HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, true)
 CW.Settings.HITMARKER_FADEOUT         = boolOr(_cfg.HITMARKER_FADEOUT, true)
 
+CW.Paths.TEXTURE_FILE = _cfg.TEXTURE_FILE or "CycleWare/Assets/texture.png"
+
+CW.resolveAssetPath = function(input)
+	if not input then return nil end
+
+	local trimmed = tostring(input):match("^%s*(.-)%s*$")
+	if trimmed == "" then return nil end
+
+	if trimmed:find("/") or trimmed:find("\\") then
+		return trimmed
+	end
+
+	return CW.Paths.CURSOR_FOLDER .. "/" .. trimmed
+end
+
+CW.Settings.WeaponTextureFilesByKey =
+	CW.Settings.WeaponTextureFilesByKey or {}
+
+local SETTINGS_FILE = CW.Paths.CACHE_FOLDER .. "/ui_settings.json"
+
+if isfile(SETTINGS_FILE) then
+	local ok, raw = pcall(readfile, SETTINGS_FILE)
+
+	if ok then
+		local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
+
+		if ok2 and type(data) == "table" then
+			local function readPath(flag)
+				local entry = data[flag]
+
+				if type(entry) == "table" and entry[2] then
+					return CW.resolveAssetPath(entry[2])
+				end
+
+				return nil
+			end
+
+			local hm  = readPath("Hitmarker_FilePath")
+			local cur = readPath("Cursor_FilePath")
+			local tex = readPath("Texture_FilePath")
+			local snd = readPath("Sound_FilePath")
+
+			if hm then
+				CW.Paths.HITMARKER_FILE = hm
+			end
+
+			if cur then
+				CW.Paths.CURSOR_FILE = cur
+			end
+
+			if tex then
+				CW.Paths.TEXTURE_FILE = tex
+			end
+
+			if snd then
+				CW.Paths.SOUND_FILE = snd
+			end
+
+			for flag, entry in pairs(data) do
+				local weaponKey = flag:match("^WeaponTex_(.+)$")
+
+				if weaponKey and type(entry) == "table" and entry[2] then
+					local resolved = CW.resolveAssetPath(entry[2])
+
+					if resolved then
+						CW.Settings.WeaponTextureFilesByKey[weaponKey] = resolved
+					end
+				end
+			end
+
+			CW.Log("Loaded saved asset filenames from ui_settings.json")
+		end
+	end
+end
+
 if not CW.ShootEvent then
 	CW.ShootEvent = ReplicatedStorage:WaitForChild("GunRemotes"):WaitForChild("ShootEvent")
 end
@@ -115,16 +195,26 @@ if isFirstRun then
 	end)
 
 	UserInputService.InputChanged:Connect(function(input)
-		if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+
 		local inset = GuiService:GetGuiInset()
+
 		CW.State.mouseX = input.Position.X + inset.X
 		CW.State.mouseY = input.Position.Y + inset.Y
 
 		for clone in pairs(CW.ActiveFollowClones) do
 			local ok = pcall(function()
-				clone.Position = UDim2.fromOffset(CW.State.mouseX, CW.State.mouseY)
+				clone.Position = UDim2.fromOffset(
+					CW.State.mouseX,
+					CW.State.mouseY
+				)
 			end)
-			if not ok then CW.ActiveFollowClones[clone] = nil end
+
+			if not ok then
+				CW.ActiveFollowClones[clone] = nil
+			end
 		end
 	end)
 end
