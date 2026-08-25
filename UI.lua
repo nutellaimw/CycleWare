@@ -223,12 +223,37 @@ local function applyTextureFile(value)
 	local resolved = resolveAssetPath(value)
 	if resolved then CW.Paths.TEXTURE_FILE = resolved end
 end
+
 WeaponsTab:Textbox({
 	Title = "Texture File",
 	Placeholder = filenameOnly(CW.Paths.TEXTURE_FILE),
 	Flag = "Texture_FilePath",
 	Callback = applyTextureFile,
 })
+
+if CW.WeaponList and CW.normalizeTextureKey and CW.setWeaponTextureFile then
+	for _, weaponName in ipairs(CW.WeaponList) do
+		local key = CW.normalizeTextureKey(weaponName)
+		local flag = "WeaponTex_" .. key
+
+		local function applyThisWeaponTexture(value)
+			CW.setWeaponTextureFile(weaponName, value)
+
+			if CW.reloadTextures then
+				CW.reloadTextures()
+			end
+		end
+
+		WeaponsTab:Textbox({
+			Title = weaponName .. " Texture",
+			Placeholder = key .. ".png (leave empty for generic)",
+			Flag = flag,
+			Callback = applyThisWeaponTexture,
+		})
+
+		ApplyFunctions[flag] = applyThisWeaponTexture
+	end
+end
 
 WeaponsTab:Button({
 	Title = "Reload Textures",
@@ -237,8 +262,6 @@ WeaponsTab:Button({
 		if CW.reloadTextures then
 			CW.reloadTextures()
 		end
-
-		
 	end,
 })
 
