@@ -5,7 +5,7 @@ local LocalPlayer = CW.LocalPlayer
 
 local _cfg = getgenv().CW_CONFIG or {}
 
-CW.Paths.TEXTURE_FILE         = _cfg.TEXTURE_FILE or "CycleWare/Assets/texture.png"
+CW.Paths.TEXTURE_FILE         = CW.Paths.TEXTURE_FILE or _cfg.TEXTURE_FILE or "CycleWare/Assets/texture.png"
 CW.Paths.TEXTURE_CACHE_FOLDER = CW.Paths.CACHE_FOLDER.."/TextureCache"
 CW.Paths.TEXTURE_SIG_FILE     = CW.Paths.CACHE_FOLDER.."/texture.sig"
 
@@ -41,49 +41,92 @@ local CUSTOM_MESH_WEAPONS = _cfg.CUSTOM_MESH_WEAPONS or {
 	},
 }
 
-CW.Assets.weaponTextures = CW.Assets.weaponTextures or {}
-
 local function normalizeKey(s)
 	return (s:gsub("%A", "")):lower()
 end
 
+local WEAPON_LIST = {}
 local NORMALIZED_TO_WEAPON = {}
-
 for weaponName in pairs(WEAPON_MESHES) do
+	table.insert(WEAPON_LIST, weaponName)
 	NORMALIZED_TO_WEAPON[normalizeKey(weaponName)] = weaponName
 end
-
 for weaponName in pairs(CUSTOM_MESH_WEAPONS) do
+	table.insert(WEAPON_LIST, weaponName)
 	NORMALIZED_TO_WEAPON[normalizeKey(weaponName)] = weaponName
 end
+table.sort(WEAPON_LIST)
 
-local function scanPerGunTextureFiles()
-	local found = {}
-	local ok, files = pcall(listfiles, CW.Paths.CURSOR_FOLDER)
-	if not ok or not files then return found end
+CW.WeaponList          = WEAPON_LIST
+CW.normalizeTextureKey = normalizeKey
 
-	for _, path in ipairs(files) do
-		local name = path:match("([^/\\]+)$")
+CW.Assets.weaponTextures = CW.Assets.weaponTextures or {}
+CW.Settings.WeaponTextureFiles = CW.Settings.WeaponTextureFiles or {}
 
-		if name then
-			local lower = name:lower()
+if CW.Settings.WeaponTextureFilesByKey then
+	for key, path in pairs(CW.Settings.WeaponTextureFilesByKey) do
+		local weaponName = NORMALIZED_TO_WEAPON[key]
+		if weaponName then
+			CW.Settings.WeaponTextureFiles[weaponName] = path
+		end
+	end
+end
 
-			if lower:sub(1, 8) == "texture_"
-				and lower:sub(-4) == ".png"
-				and lower ~= "texture.png" then
+function CW.setWeaponTextureFile(weaponName, filename)
+	local resolved = CW.resolveAssetPath(filename)
+	CW.Settings.WeaponTextureFiles[weaponName] = resolved
+	if not resolved then
+		CW.Assets.weaponTextures[weaponName] = nil
+	end
+end
 
-				local suffix = name:sub(9, #name - 4)
-				local normSuffix = normalizeKey(suffix)
-				local weaponName = NORMALIZED_TO_WEAPON[normSuffix]
+local function reloadGenericTexture()
+	local asset, failReason = CW.loadCachedAsset({
+		file        = CW.Paths.TEXTURE_FILE,
+		sigFile     = CW.Paths.TEXTURE_SIG_FILE,
+		cacheFolder = CW.Paths.TEXTURE_CACHE_FOLDER,
+		prefix      = "tex",
+		ext         = ".png",
+		label       = "generic texture ("..CW.Paths.TEXTURE_FILE..")",
+		isUnchanged = function() return CW.Assets.weaponTexture ~= nil end,
+	})
+	if asset then
+		CW.Assets.weaponTexture = asset
+	elseif failReason == "missing" or failReason == "error" then
+		CW.Assets.weaponTexture = nil
+	end
+end
 
-				if weaponName then
-					found[weaponName] = path
-				end
+local function reloadPerGunTextures()
+	for _, weaponName in ipairs(WEAPON_LIST) do
+		local filePath = CW.Settings.WeaponTextureFiles[weaponName]
+
+		if not filePath then
+			CW.Assets.weaponTextures[weaponName] = nil
+		else
+			local key     = normalizeKey(weaponName)
+			local sigFile = CW.Paths.TEXTURE_CACHE_FOLDER.."/gun_"..key..".sig"
+
+			local asset, failReason = CW.loadCachedAsset({
+				file        = filePath,
+				sigFile     = sigFile,
+				cacheFolder = CW.Paths.TEXTURE_CACHE_FOLDER,
+				prefix      = "tex_"..key,
+				ext         = ".png",
+				label       = weaponName.." texture ("..filePath..")",
+				isUnchanged = function() return CW.Assets.weaponTextures[weaponName] ~= nil end,
+			})
+
+			if asset then
+				CW.Assets.weaponTextures[weaponName] = asset
+			elseif failReason == "missing" then
+				CW.Warn(weaponName.." texture file not found: "..filePath)
+				CW.Assets.weaponTextures[weaponName] = nil
+			elseif failReason == "error" then
+				CW.Assets.weaponTextures[weaponName] = nil
 			end
 		end
 	end
-
-	return found
 end
 
 local function buildCustomMesh(tool, cfg)
@@ -94,12 +137,9 @@ local function buildCustomMesh(tool, cfg)
 	end
 
 	local old = tool:FindFirstChild(cfg.meshName)
-	if old then
-		old:Destroy()
-	end
+	if old then old:Destroy() end
 
 	local handle = tool:FindFirstChild("Handle")
-
 	local mesh = Instance.new("MeshPart")
 	mesh.Name       = cfg.meshName
 	mesh.MeshId     = cfg.meshId
@@ -114,38 +154,25 @@ local function buildCustomMesh(tool, cfg)
 	if handle then
 		mesh.CFrame = handle.CFrame
 			* CFrame.new(cfg.offset)
-			* CFrame.Angles(
-				math.rad(cfg.rotation.X),
-				math.rad(cfg.rotation.Y),
-				math.rad(cfg.rotation.Z)
-			)
-
+			* CFrame.Angles(math.rad(cfg.rotation.X), math.rad(cfg.rotation.Y), math.rad(cfg.rotation.Z))
 		mesh.Parent = tool
-
-		local weld = Instance.new("WeldConstraint")
-		weld.Part0 = handle
-		weld.Part1 = mesh
+		local weld  = Instance.new("WeldConstraint")
+		weld.Part0  = handle
+		weld.Part1  = mesh
 		weld.Parent = mesh
 	else
 		mesh.Parent = tool
 	end
 
 	CW.Log("Custom mesh built for "..tool.Name)
-
 	return mesh
 end
 
 local function applyTexture(tool)
-	local textureId =
-		CW.Assets.weaponTextures[tool.Name]
-		or CW.Assets.weaponTexture
-
-	if not textureId then
-		return
-	end
+	local textureId = CW.Assets.weaponTextures[tool.Name] or CW.Assets.weaponTexture
+	if not textureId then return end
 
 	local customCfg = CUSTOM_MESH_WEAPONS[tool.Name]
-
 	if customCfg then
 		local mesh = buildCustomMesh(tool, customCfg)
 		mesh.TextureID = textureId
@@ -153,17 +180,13 @@ local function applyTexture(tool)
 	end
 
 	local meshName = WEAPON_MESHES[tool.Name]
-	if not meshName then
-		return
-	end
+	if not meshName then return end
 
 	local mesh = tool:FindFirstChild(meshName, true)
-
 	if mesh and mesh:IsA("MeshPart") then
 		mesh.TextureID = textureId
 	end
 end
-
 CW.applyWeaponTexture = applyTexture
 
 local function applyToContainer(container)
@@ -172,85 +195,24 @@ local function applyToContainer(container)
 	end
 end
 
-local function reloadTexturesAndApply()
-	local genericAsset, genericFailReason = CW.loadCachedAsset({
-		file        = CW.Paths.TEXTURE_FILE,
-		sigFile     = CW.Paths.TEXTURE_SIG_FILE,
-		cacheFolder = CW.Paths.TEXTURE_CACHE_FOLDER,
-		prefix      = "tex",
-		ext         = ".png",
-		label       = "texture.png",
-		isUnchanged = function()
-			return CW.Assets.weaponTexture ~= nil
-		end,
-	})
-
-	if genericAsset then
-		CW.Assets.weaponTexture = genericAsset
-	elseif genericFailReason == "missing"
-		or genericFailReason == "error" then
-
-		CW.Assets.weaponTexture = nil
-	end
-
-	local perGunFiles, activeThisRun = scanPerGunTextureFiles(), {}
-
-	for weaponName, filePath in pairs(perGunFiles) do
-		local key = normalizeKey(weaponName)
-
-		local asset, failReason = CW.loadCachedAsset({
-			file        = filePath,
-			sigFile     = CW.Paths.TEXTURE_CACHE_FOLDER.."/gun_"..key..".sig",
-			cacheFolder = CW.Paths.TEXTURE_CACHE_FOLDER,
-			prefix      = "tex_"..key,
-			ext         = ".png",
-			label       = "texture for "..weaponName,
-
-			isUnchanged = function()
-				return CW.Assets.weaponTextures[weaponName] ~= nil
-			end,
-		})
-
-		if asset then
-			CW.Assets.weaponTextures[weaponName] = asset
-		elseif failReason == "missing"
-			or failReason == "error" then
-
-			CW.Assets.weaponTextures[weaponName] = nil
-		end
-
-		activeThisRun[weaponName] = true
-	end
-
-	for weaponName in pairs(CW.Assets.weaponTextures) do
-		if not activeThisRun[weaponName] then
-			CW.Assets.weaponTextures[weaponName] = nil
-		end
-	end
-
-	local backpack = LocalPlayer:FindFirstChild("Backpack")
-
-	if backpack then
-		applyToContainer(backpack)
-	end
-
-	if LocalPlayer.Character then
-		applyToContainer(LocalPlayer.Character)
-	end
-end
-
-CW.reloadTextures = reloadTexturesAndApply
-
-reloadTexturesAndApply()
-
 local function monitor(container)
 	container.ChildAdded:Connect(function(child)
 		task.wait(0.1)
 		applyTexture(child)
 	end)
-
 	applyToContainer(container)
 end
+
+local function reloadTexturesAndApply()
+	reloadGenericTexture()
+	reloadPerGunTextures()
+
+	local backpack = LocalPlayer:FindFirstChild("Backpack")
+	if backpack then applyToContainer(backpack) end
+	if LocalPlayer.Character then applyToContainer(LocalPlayer.Character) end
+end
+CW.reloadTextures = reloadTexturesAndApply
+reloadTexturesAndApply()
 
 if CW.IsFirstRun then
 	monitor(LocalPlayer:WaitForChild("Backpack"))
@@ -261,15 +223,5 @@ if CW.IsFirstRun then
 
 	if LocalPlayer.Character then
 		monitor(LocalPlayer.Character)
-	end
-else
-	local backpack = LocalPlayer:FindFirstChild("Backpack")
-
-	if backpack then
-		applyToContainer(backpack)
-	end
-
-	if LocalPlayer.Character then
-		applyToContainer(LocalPlayer.Character)
 	end
 end
