@@ -9,35 +9,12 @@
 </div>
 
 
-CURRENTLY UNDER MAINTENANCE
+## (CURRENTLY UNDER MAINTENANCE)
 
-A Prison Life enhancer (vibe coded, but fully works, and developed by someone who actually knows what they're doing). Customizable, and open source.
+A Prison Life script with the main purpose to only apply visual hitmarkers. 
+Fully Customizable, and open source.
 
 ## Loader
-
-```lua
-getgenv().CW_CONFIG = {
-    CURSOR_FILE                = "CycleWare/Assets/cursor.png",
-    HITMARKER_FILE             = "CycleWare/Assets/hitmarker.png",
-    SOUND_FILE                 = "CycleWare/Assets/sound.mp3",
-    HITMARKER_SIZE             = 40,
-    SOUND_VOLUME               = 1,
-    CURSOR_TARGET_SIZE         = 82,
-    HITMARKER_RANDOM_ROTATION  = true,
-    HITMARKER_FOLLOW_MOUSE     = true,
-    HITMARKER_VISIBLE_DURATION = 0.05,
-    HITMARKER_FADEOUT          = true,
-    HITMARKER_FADEOUT_DURATION = 0.15,
-    customBulletTracers        = false,
-    tracerColor                = Color3.fromRGB(170, 0, 255),
-    glowColor                  = Color3.fromRGB(200, 100, 255),
-    tracerWidth                = 0.05,
-    tracerLifetime             = 0.05,
-    applyToOthers              = false,
-}
-
-loadstring(game:HttpGet("https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CycleWare.lua"))()
-```
 
 Differently of other scripts, CycleWare does not use imagelabels as the cursor. Instead, we use the MouseIcon, which offers 0 delay on mov.
 The only thing in usage as imagelabel is the hitmarker. But we plan to change that in the future.
@@ -57,25 +34,7 @@ checkcaller,
 getnamecallmethod.
 
 
-## How to use
-
-To setup, first run the script once. After that, open your executor workspace folder. There will be created a folder named CycleWare. Open it.
-Inside, open Assets, and paste the files you would like as your cursor, hitmarker, hit sound, and gun texture, named exactly like this respectably:
-
-
-```text
-cursor.png
-hitmarker.png
-sound.mp3
-texture.png or texture_<gunname>.png to apply a texture to a specific weapon.
-```
-
-(currently no other file format is supported)
-
-Re-run the script and it will be all applied. You can change settings/assets in real time, not needing to rejoin the game.
-Everything else is edited directly on the script.
-
-If you still need help, feel free to dm me on discord: nutella_i
+feel free to dm me on discord if you want to talk to me: nutella_i
 
 if you want to see a showcase, there is a small edit i made in my YouTube channel: https://www.youtube.com/@nutella_i
 
