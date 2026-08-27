@@ -40,4 +40,4 @@ if you want to see a showcase, there is a small edit i made in my YouTube channe
 
 This script was a try at recreating an old prison life script with the same idea behind it. But since prison life got updated and the original script was never updated, I decided to step in and remake it. 
 
-The original script is also available for anyone to see: https://raw.githubusercontent.com/VapingCat/IA-Battlegrounds-Hitmarkers-Cursor/main/script.lua
+The original script is also still available for anyone to see: https://raw.githubusercontent.com/VapingCat/IA-Battlegrounds-Hitmarkers-Cursor/main/script.lua
