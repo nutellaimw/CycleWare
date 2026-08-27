@@ -32,6 +32,8 @@ checkcaller,
 getnamecallmethod.
 
 
+## Other
+
 feel free to dm me on discord if you want to talk to me: nutella_i
 
 if you want to see a showcase, there is a small edit i made in my YouTube channel: https://www.youtube.com/@nutella_i
