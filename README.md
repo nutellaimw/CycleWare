@@ -11,7 +11,7 @@
 
 ## (CURRENTLY UNDER MAINTENANCE)
 
-A Prison Life script with the main purpose to apply visual hitmarkers. 
+A Prison Life script with the main purpose to apply visual hitmarkers and other small assists. 
 Fully Customizable, and open source.
 
 ## Loader
