@@ -1024,6 +1024,14 @@ end
 local function reloadPerGunTextures()
 	for _, weaponName in ipairs(WEAPON_LIST) do
 		local filePath = CW.Settings.WeaponTextureFiles[weaponName]
+		if not filePath then
+			local defaultPath = CW.resolveAssetPath(normalizeKey(weaponName)..".png")
+			local ok, exists = pcall(isfile, defaultPath)
+			if ok and exists then
+				filePath = defaultPath
+				CW.Settings.WeaponTextureFiles[weaponName] = defaultPath
+			end
+		end
 
 		if not filePath then
 			CW.Assets.weaponTextures[weaponName] = nil
@@ -1393,6 +1401,17 @@ if CW.IsFirstRun then
 		pcall(function() CW.IAPortable:Destroy() end)
 		pcall(function() if CW.State.enforcerConn then CW.State.enforcerConn:Disconnect() end end)
 		pcall(function() if CW.State.enableConn   then CW.State.enableConn:Disconnect()   end end)
+		pcall(function() if CW.State.sprintCharacterConn then CW.State.sprintCharacterConn:Disconnect() end end)
+		pcall(function() if CW.State.chatToggleConn then CW.State.chatToggleConn:Disconnect() end end)
+		pcall(function() if CW.State.ammoGuiConn then CW.State.ammoGuiConn:Disconnect() end end)
+		pcall(function() if CW.State.ammoCharacterConn then CW.State.ammoCharacterConn:Disconnect() end end)
+		pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
+		pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
+		pcall(function()
+			local contextActions = game:GetService("ContextActionService")
+			contextActions:UnbindAction("CycleWareSprintToggle")
+			contextActions:UnbindAction("CycleWareProtectSprint")
+		end)
 		CW.ActiveFollowClones = {}
 	end)
 end
@@ -1419,7 +1438,7 @@ local Icons = {
 	Tracers = "rbxassetid://94654949230438",
 }
 
-Elastic:SetWindowKeybind(Enum.KeyCode.RightShift)
+Elastic:SetWindowKeybind(Enum.KeyCode.RightControl)
 
 local Window = Elastic:Window()
 
@@ -1430,14 +1449,17 @@ local function filenameOnly(fullPath)
 end
 
 
-local CombatTab = Window:Tab({
-	Title = "Hitmarker",
+local EffectsTab = Window:Tab({
+	Title = "Effects",
 	Icon = Icons.Combat
 })
 
 local function applyHitmarkerFile(value)
 	local resolved = resolveAssetPath(value)
-	if resolved then CW.Paths.HITMARKER_FILE = resolved end
+	if resolved then
+		CW.Paths.HITMARKER_FILE = resolved
+		if CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
+	end
 end
 
 local function applyHitmarkerSize(v)
@@ -1468,14 +1490,15 @@ local function applyHitmarkerFadeoutDuration(v)
 	CW.Settings.HITMARKER_FADEOUT_DURATION = v
 end
 
-CombatTab:Textbox({
+EffectsTab:Textbox({
 	Title = "Hitmarker File",
+	Default = CW.Paths.HITMARKER_FILE,
 	Placeholder = filenameOnly(CW.Paths.HITMARKER_FILE),
 	Flag = "Hitmarker_FilePath",
 	Callback = applyHitmarkerFile,
 })
 
-CombatTab:Slider({
+EffectsTab:Slider({
 	Title = "Hitmarker Size",
 	Min = 8,
 	Max = 200,
@@ -1485,21 +1508,21 @@ CombatTab:Slider({
 	Callback = applyHitmarkerSize,
 })
 
-CombatTab:Toggle({
+EffectsTab:Toggle({
 	Title = "Random Rotation",
 	Default = CW.Settings.HITMARKER_RANDOM_ROTATION,
 	Flag = "Hitmarker_RandomRotation",
 	Callback = applyHitmarkerRandomRotation,
 })
 
-CombatTab:Toggle({
+EffectsTab:Toggle({
 	Title = "Follow Mouse",
 	Default = CW.Settings.HITMARKER_FOLLOW_MOUSE,
 	Flag = "Hitmarker_FollowMouse",
 	Callback = applyHitmarkerFollowMouse,
 })
 
-CombatTab:Slider({
+EffectsTab:Slider({
 	Title = "Visible Duration",
 	Min = 0,
 	Max = 1,
@@ -1510,14 +1533,14 @@ CombatTab:Slider({
 	Callback = applyHitmarkerVisibleDuration,
 })
 
-CombatTab:Toggle({
+EffectsTab:Toggle({
 	Title = "Fadeout",
 	Default = CW.Settings.HITMARKER_FADEOUT,
 	Flag = "Hitmarker_Fadeout",
 	Callback = applyHitmarkerFadeout,
 })
 
-CombatTab:Slider({
+EffectsTab:Slider({
 	Title = "Fadeout Duration",
 	Min = 0,
 	Max = 1,
@@ -1528,26 +1551,17 @@ CombatTab:Slider({
 	Callback = applyHitmarkerFadeoutDuration,
 })
 
-CombatTab:Button({
-	Title = "Reload Hitmarker",
-	Action = "Reload",
-	Callback = function()
-		if CW.reloadHitmarkerAsset then
-			CW.reloadHitmarkerAsset()
-		end
-
-		
-	end,
-})
-
 local VisualsTab = Window:Tab({
-	Title = "Cursor",
+	Title = "Visuals",
 	Icon = Icons.Visuals
 })
 
 local function applyCursorFile(value)
 	local resolved = resolveAssetPath(value)
-	if resolved then CW.Paths.CURSOR_FILE = resolved end
+	if resolved then
+		CW.Paths.CURSOR_FILE = resolved
+		if CW.reloadCursor then CW.reloadCursor() end
+	end
 end
 
 local cursorSizeDebounceThread = nil
@@ -1579,6 +1593,7 @@ end
 
 VisualsTab:Textbox({
 	Title = "Cursor File",
+	Default = CW.Paths.CURSOR_FILE,
 	Placeholder = filenameOnly(CW.Paths.CURSOR_FILE),
 	Flag = "Cursor_FilePath",
 	Callback = applyCursorFile,
@@ -1596,85 +1611,101 @@ VisualsTab:Slider({
 	end,
 })
 
-VisualsTab:Button({
-	Title = "Reload Cursor",
-	Action = "Reload",
-	Callback = function()
-		if CW.reloadCursor then
-			CW.reloadCursor()
-		end
-
-		
-	end,
-})
-
-local WeaponsTab = Window:Tab({
-	Title = "Weapon Textures",
-	Icon = Icons.Weapons
-})
+local WeaponsTab = VisualsTab
 
 local function applyTextureFile(value)
 	local resolved = resolveAssetPath(value)
-	if resolved then CW.Paths.TEXTURE_FILE = resolved end
+	if resolved then
+		CW.Paths.TEXTURE_FILE = resolved
+		if CW.reloadTextures then CW.reloadTextures() end
+	end
 end
 
 WeaponsTab:Textbox({
-	Title = "Texture File",
+	Title = "Default Weapon Texture",
+	Default = CW.Paths.TEXTURE_FILE,
 	Placeholder = filenameOnly(CW.Paths.TEXTURE_FILE),
 	Flag = "Texture_FilePath",
 	Callback = applyTextureFile,
 })
 
-local ApplyFunctions = {}
+local weaponStatusRefreshers = {}
 
 if CW.WeaponList and CW.normalizeTextureKey and CW.setWeaponTextureFile then
 	for _, weaponName in ipairs(CW.WeaponList) do
-		local key = CW.normalizeTextureKey(weaponName)
+		local weapon = weaponName
+		local key = CW.normalizeTextureKey(weapon)
 		local flag = "WeaponTex_" .. key
+		local defaultPath = resolveAssetPath(key .. ".png")
+		local titleLabel
+
+		local function refreshWeaponStatus()
+			if not titleLabel or not titleLabel.Parent then return end
+
+			local texturePath = CW.Settings.WeaponTextureFiles[weapon] or defaultPath
+			local ok, exists = pcall(isfile, texturePath)
+			local title = weapon:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+			titleLabel.RichText = true
+			titleLabel.Text = ok and exists
+				and '<font color="#4ADE80">' .. title .. "</font> Texture"
+				or title .. " Texture"
+		end
 
 		local function applyThisWeaponTexture(value)
-			CW.setWeaponTextureFile(weaponName, value)
+			CW.setWeaponTextureFile(weapon, value)
 
 			if CW.reloadTextures then
 				CW.reloadTextures()
 			end
+			refreshWeaponStatus()
 		end
 
-		local ok, err = pcall(function()
+		local created, createError = pcall(function()
 			WeaponsTab:Textbox({
-				Title = weaponName .. " Texture",
+				Title = weapon .. " Texture",
+				Default = CW.Settings.WeaponTextureFiles[weapon] or defaultPath,
 				Placeholder = key .. ".png (leave empty for generic)",
 				Flag = flag,
 				Callback = applyThisWeaponTexture,
 			})
 		end)
 
-		if ok then
-			ApplyFunctions[flag] = applyThisWeaponTexture
+		if created then
+			local statusOk = pcall(function()
+			for _, rowInfo in ipairs(Window.AllRows or {}) do
+				if rowInfo.Title == weapon .. " Texture" and rowInfo.Row then
+					for _, child in ipairs(rowInfo.Row:GetChildren()) do
+						if child:IsA("TextLabel") then
+							titleLabel = child
+							break
+						end
+					end
+					break
+				end
+			end
+			weaponStatusRefreshers[weapon] = refreshWeaponStatus
+			refreshWeaponStatus()
+			end)
+			if not statusOk then
+				weaponStatusRefreshers[weapon] = function() end
+			end
 		else
-			warn("[CW] Failed to create texture control for " .. weaponName .. ": " .. tostring(err))
+			warn("[CW] Failed to create texture control for " .. weapon .. ": " .. tostring(createError))
 		end
 	end
 end
 
-WeaponsTab:Button({
-	Title = "Reload Textures",
-	Action = "Reload",
-	Callback = function()
-		if CW.reloadTextures then
-			CW.reloadTextures()
-		end
-	end,
-})
-
 local SoundsTab = Window:Tab({
-	Title = "Gun Sounds",
+	Title = "Audio",
 	Icon = Icons.Sounds
 })
 
 local function applySoundFile(value)
 	local resolved = resolveAssetPath(value)
-	if resolved then CW.Paths.SOUND_FILE = resolved end
+	if resolved then
+		CW.Paths.SOUND_FILE = resolved
+		if CW.reloadSoundAsset then CW.reloadSoundAsset() end
+	end
 end
 
 local function applySoundVolume(v)
@@ -1683,6 +1714,7 @@ end
 
 SoundsTab:Textbox({
 	Title = "Hit Sound File",
+	Default = CW.Paths.SOUND_FILE,
 	Placeholder = filenameOnly(CW.Paths.SOUND_FILE),
 	Flag = "Sound_FilePath",
 	Callback = applySoundFile,
@@ -1699,22 +1731,7 @@ SoundsTab:Slider({
 	Callback = applySoundVolume,
 })
 
-SoundsTab:Button({
-	Title = "Reload Sound",
-	Action = "Reload",
-	Callback = function()
-		if CW.reloadSoundAsset then
-			CW.reloadSoundAsset()
-		end
-
-		
-	end,
-})
-
-local TracersTab = Window:Tab({
-	Title = "Bullet Tracers",
-	Icon = Icons.Tracers
-})
+local TracersTab = EffectsTab
 
 local function applyTracerEnabled(s)
 	CW.Settings.CUSTOM_BULLET_TRACERS = s
@@ -1847,7 +1864,22 @@ ContextActionService:BindActionAtPriority(
 	onSprintShift,
 	false,
 	Enum.ContextActionPriority.High.Value,
-	Enum.KeyCode.LeftShift,
+	Enum.KeyCode.LeftShift
+)
+
+local function onRightShiftDuringSprint()
+	if sprinting then
+		return Enum.ContextActionResult.Sink
+	end
+	return Enum.ContextActionResult.Pass
+end
+
+ContextActionService:UnbindAction("CycleWareProtectSprint")
+ContextActionService:BindActionAtPriority(
+	"CycleWareProtectSprint",
+	onRightShiftDuringSprint,
+	false,
+	Enum.ContextActionPriority.High.Value + 1,
 	Enum.KeyCode.RightShift
 )
 
@@ -1917,6 +1949,246 @@ UtilityTab:Toggle({
 	Callback = applyChatToggle,
 })
 
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local VirtualInputManager
+pcall(function()
+	VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+local AMMO_LABEL_PATH = "Home.hud.BottomRightFrame.GunFrame.BulletsLabel"
+CW.Settings.AUTO_RELOAD_LABEL_PATH = AMMO_LABEL_PATH
+if CW.Settings.AUTO_RELOAD_ENABLED == nil then
+	CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED ~= false
+end
+
+if CW.State.clearAmmoLabelWatchers then
+	CW.State.clearAmmoLabelWatchers(true)
+end
+
+local ammoLabelConnections = {}
+local ammoLabelStates = setmetatable({}, { __mode = "k" })
+local autoReloadWarned = false
+local autoReloadLabelWarned = false
+local ammoScanGeneration = 0
+local rebuildAmmoLabelWatchers
+
+local function clearAmmoLabelWatchers(resetStates)
+	for _, connection in pairs(ammoLabelConnections) do
+		connection:Disconnect()
+	end
+	table.clear(ammoLabelConnections)
+	if resetStates then
+		table.clear(ammoLabelStates)
+	end
+end
+CW.State.clearAmmoLabelWatchers = clearAmmoLabelWatchers
+
+local function parseAmmoText(text)
+	local current, capacity = tostring(text):match("^%s*(%d+)%s*/%s*(%d+)%s*$")
+	return tonumber(current), tonumber(capacity)
+end
+
+local function isTextGui(instance)
+	return instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")
+end
+
+local function isNamedAmmoLabel(instance)
+	local name = instance.Name:lower()
+	return name:find("ammo", 1, true) ~= nil
+		or name:find("magazine", 1, true) ~= nil
+		or name:find("magcount", 1, true) ~= nil
+		or name:find("clipammo", 1, true) ~= nil
+		or name:find("bullet", 1, true) ~= nil
+end
+
+local function findConfiguredAmmoLabel()
+	local current = PlayerGui
+	for part in AMMO_LABEL_PATH:gmatch("[^%.]+") do
+		current = current and current:FindFirstChild(part)
+	end
+
+	if current and isTextGui(current) then return current end
+	return nil
+end
+
+local function findAmmoLabels()
+	local configured = findConfiguredAmmoLabel()
+	if configured then return { configured } end
+
+	local namedLabels = {}
+	local fractionLabels = {}
+	for _, instance in ipairs(PlayerGui:GetDescendants()) do
+		if isTextGui(instance) then
+			if isNamedAmmoLabel(instance) then
+				table.insert(namedLabels, instance)
+			elseif parseAmmoText(instance.Text) then
+				table.insert(fractionLabels, instance)
+			end
+		end
+	end
+
+	if #namedLabels == 1 then return namedLabels end
+	if #namedLabels > 1 then return {} end
+	if #fractionLabels == 1 then return fractionLabels end
+	return {}
+end
+
+local function pressReloadKey()
+	if VirtualInputManager then
+		local pressed = pcall(function()
+			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+		end)
+		if pressed then
+			task.wait(0.02)
+			local released, releaseError = pcall(function()
+				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+			end)
+			if released then return true end
+			if not autoReloadWarned then
+				autoReloadWarned = true
+				CW.Warn("Auto Reload could not release the R key: " .. tostring(releaseError))
+			end
+			return false
+		end
+	end
+
+	if type(keypress) == "function" and type(keyrelease) == "function" then
+		local pressed = pcall(keypress, 0x52)
+		if pressed then
+			task.wait(0.02)
+			local released, releaseError = pcall(keyrelease, 0x52)
+			if released then return true end
+			if not autoReloadWarned then
+				autoReloadWarned = true
+				CW.Warn("Auto Reload could not release the R key: " .. tostring(releaseError))
+			end
+			return false
+		end
+	end
+
+	if type(keytap) == "function" then
+		local ok = pcall(keytap, 0x52)
+		if ok then return true end
+	end
+	if type(keystroke) == "function" then
+		local ok = pcall(keystroke, 0x52)
+		if ok then return true end
+	end
+
+	if not autoReloadWarned then
+		autoReloadWarned = true
+		CW.Warn("Auto Reload requires VirtualInputManager or an executor key input function.")
+	end
+	return false
+end
+
+local function attemptReload(label)
+	if not CW.Settings.AUTO_RELOAD_ENABLED or UserInputService:GetFocusedTextBox() then return end
+	if UserInputService:IsKeyDown(Enum.KeyCode.R) then return end
+	local character = LocalPlayer.Character
+	if not character or not character:FindFirstChildOfClass("Tool") then return end
+
+	local state = ammoLabelStates[label]
+	local now = os.clock()
+	if state and now - state.lastReload < 0.3 then return end
+	state = state or { lastReload = 0 }
+	state.lastReload = now
+	ammoLabelStates[label] = state
+
+	task.spawn(function()
+		if not pressReloadKey() then return end
+		task.wait(0.15)
+		if not CW.Settings.AUTO_RELOAD_ENABLED or not label.Parent then return end
+		if UserInputService:GetFocusedTextBox() then return end
+		local current = parseAmmoText(label.Text)
+		if current == 0 then
+			pressReloadKey()
+		end
+	end)
+end
+
+local function onAmmoLabelChanged(label)
+	if not CW.Settings.AUTO_RELOAD_ENABLED then return end
+	local current, capacity = parseAmmoText(label.Text)
+	if current == nil or capacity == nil then return end
+
+	local state = ammoLabelStates[label]
+	if not state or state.capacity ~= capacity then
+		state = { capacity = capacity, lastReload = 0 }
+		ammoLabelStates[label] = state
+	end
+
+	if current == 0 then
+		attemptReload(label)
+	else
+		state.lastReload = 0
+	end
+end
+
+rebuildAmmoLabelWatchers = function()
+	clearAmmoLabelWatchers()
+	ammoScanGeneration = ammoScanGeneration + 1
+	local generation = ammoScanGeneration
+	if not CW.Settings.AUTO_RELOAD_ENABLED then return end
+
+	task.spawn(function()
+		for _ = 1, 20 do
+			if generation ~= ammoScanGeneration or not CW.Settings.AUTO_RELOAD_ENABLED then return end
+
+			local labels = findAmmoLabels()
+			if #labels > 0 then
+				autoReloadLabelWarned = false
+				for _, label in ipairs(labels) do
+					ammoLabelConnections[label] = label:GetPropertyChangedSignal("Text"):Connect(function()
+						onAmmoLabelChanged(label)
+					end)
+					onAmmoLabelChanged(label)
+				end
+				return
+			end
+
+			task.wait(0.5)
+		end
+
+		if generation == ammoScanGeneration and not autoReloadLabelWarned then
+			autoReloadLabelWarned = true
+			CW.Warn("Auto Reload could not find the ammo label at PlayerGui." .. AMMO_LABEL_PATH)
+		end
+	end)
+end
+
+local function applyAutoReload(enabled)
+	CW.Settings.AUTO_RELOAD_ENABLED = enabled == true
+	rebuildAmmoLabelWatchers()
+end
+
+if CW.State.ammoGuiConn then
+	CW.State.ammoGuiConn:Disconnect()
+end
+CW.State.ammoGuiConn = PlayerGui.DescendantAdded:Connect(function(instance)
+	if not CW.Settings.AUTO_RELOAD_ENABLED or not isTextGui(instance) then return end
+	if isNamedAmmoLabel(instance) or parseAmmoText(instance.Text) then
+		task.defer(rebuildAmmoLabelWatchers)
+	end
+end)
+
+if CW.State.ammoCharacterConn then
+	CW.State.ammoCharacterConn:Disconnect()
+end
+CW.State.ammoCharacterConn = LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(1)
+	if CW.Settings.AUTO_RELOAD_ENABLED then
+		rebuildAmmoLabelWatchers()
+	end
+end)
+
+UtilityTab:Toggle({
+	Title = "Auto Reload at 0 Ammo",
+	Default = CW.Settings.AUTO_RELOAD_ENABLED == true,
+	Flag = "AutoReload_Enabled",
+	Callback = applyAutoReload,
+})
+
 local SettingsTab = Window.ConfigTab
 
 do
@@ -1934,6 +2206,35 @@ do
 		end,
 	})
 end
+
+local function reloadAllSettingsAssets()
+	local reloaders = {
+		{ "hitmarker", CW.reloadHitmarkerAsset },
+		{ "cursor", CW.reloadCursor },
+		{ "textures", CW.reloadTextures },
+		{ "sound", CW.reloadSoundAsset },
+	}
+
+	for _, entry in ipairs(reloaders) do
+		if type(entry[2]) == "function" then
+			local ok, err = pcall(entry[2])
+			if not ok then
+				CW.Warn("Failed to reload " .. entry[1] .. ": " .. tostring(err))
+			end
+		end
+	end
+
+	for _, refreshStatus in pairs(weaponStatusRefreshers) do
+		pcall(refreshStatus)
+	end
+	CW.Log("Settings and local assets reloaded.")
+end
+
+SettingsTab:Button({
+	Title = "Reload Settings",
+	Action = "Reload",
+	Callback = reloadAllSettingsAssets,
+})
 
 local function serializeValue(componentType, value, component)
 	if componentType == "Keybind" then
@@ -1984,35 +2285,6 @@ local function deserializeValue(componentType, saved)
 	return saved
 end
 
-for flag, callback in pairs({
-	Hitmarker_FilePath        = applyHitmarkerFile,
-	Hitmarker_Size            = applyHitmarkerSize,
-	Hitmarker_RandomRotation  = applyHitmarkerRandomRotation,
-	Hitmarker_FollowMouse     = applyHitmarkerFollowMouse,
-	Hitmarker_VisibleDuration = applyHitmarkerVisibleDuration,
-	Hitmarker_Fadeout         = applyHitmarkerFadeout,
-	Hitmarker_FadeoutDuration = applyHitmarkerFadeoutDuration,
-
-	Cursor_FilePath = applyCursorFile,
-	Cursor_Size     = function(v) applyCursorSize(v, true) end,
-
-	Texture_FilePath = applyTextureFile,
-
-	Sound_FilePath = applySoundFile,
-	Sound_Volume   = applySoundVolume,
-
-	Tracer_Enabled       = applyTracerEnabled,
-	Tracer_Color         = applyTracerColor,
-	Tracer_GlowColor     = applyTracerGlowColor,
-	Tracer_Width         = applyTracerWidth,
-	Tracer_Lifetime      = applyTracerLifetime,
-	Tracer_ApplyToOthers = applyTracerApplyToOthers,
-	Sprint_ToggleEnabled = applySprintToggle,
-	Chat_ToggleEnabled   = applyChatToggle,
-}) do
-	ApplyFunctions[flag] = callback
-end
-
 local SETTINGS_FILE = CW.Paths.CACHE_FOLDER.."/ui_settings.json"
 
 local function saveSettings()
@@ -2057,8 +2329,6 @@ local function loadSettings()
 	local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
 	if not ok2 or type(data) ~= "table" then return end
 
-	local touchedPaths = {}
-
 	for flag, entry in pairs(data) do
 		local component = Elastic.Flags[flag]
 
@@ -2070,10 +2340,7 @@ local function loadSettings()
 			end)
 
 			if ok3 and currentType == componentType then
-				local applyFn = ApplyFunctions[flag]
-				local restored = false
-
-				local ok4 = pcall(function()
+				pcall(function()
 					if componentType == "Colorpicker" then
 						local color, transparency = deserializeValue(componentType, saved)
 						if color then
@@ -2081,30 +2348,17 @@ local function loadSettings()
 							if transparency ~= nil and component.SetTransparency then
 								component:SetTransparency(transparency)
 							end
-							if applyFn then applyFn(color) end
-							restored = true
 						end
 					else
 						local value = deserializeValue(componentType, saved)
 						if value ~= nil then
 							component:SetValue(value)
-							if applyFn then applyFn(value) end
-							restored = true
 						end
 					end
 				end)
-
-				if ok4 and restored and flag:find("_FilePath$") then
-					touchedPaths[flag] = true
-				end
 			end
 		end
 	end
-
-	if touchedPaths.Cursor_FilePath and CW.reloadCursor then CW.reloadCursor() end
-	if touchedPaths.Hitmarker_FilePath and CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
-	if touchedPaths.Sound_FilePath and CW.reloadSoundAsset then CW.reloadSoundAsset() end
-	if touchedPaths.Texture_FilePath and CW.reloadTextures then CW.reloadTextures() end
 end
 
 SettingsTab:Button({
@@ -2116,6 +2370,10 @@ SettingsTab:Button({
 })
 
 loadSettings()
+
+if CW.Settings.AUTO_RELOAD_ENABLED and ammoScanGeneration == 0 then
+	rebuildAmmoLabelWatchers()
+end
 
 print("[CW] UI loaded.")
 end)
