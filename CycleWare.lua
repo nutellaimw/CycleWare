@@ -106,9 +106,6 @@ CW.resolveAssetPath = function(input)
 	return CW.Paths.CURSOR_FOLDER .. "/" .. trimmed
 end
 
-CW.Settings.WeaponTextureFilesByKey =
-	CW.Settings.WeaponTextureFilesByKey or {}
-
 local SETTINGS_FILE = CW.Paths.CACHE_FOLDER .. "/ui_settings.json"
 local settingsFileExists = false
 pcall(function()
@@ -151,19 +148,6 @@ if settingsFileExists then
 
 			if snd then
 				CW.Paths.SOUND_FILE = snd
-			end
-
-			for flag, entry in pairs(data) do
-				local weaponKey = flag:match("^WeaponTex_(.+)$")
-				if weaponKey == "ak" then weaponKey = "ak47" end
-
-				if weaponKey and type(entry) == "table" and entry[2] then
-					local resolved = CW.resolveAssetPath(entry[2])
-
-					if resolved then
-						CW.Settings.WeaponTextureFilesByKey[weaponKey] = resolved
-					end
-				end
 			end
 
 			CW.Log("Loaded saved asset filenames from ui_settings.json")
@@ -970,39 +954,26 @@ local function normalizeKey(s)
 end
 
 local WEAPON_LIST = {}
-local NORMALIZED_TO_WEAPON = {}
+local SEEN_WEAPONS = {}
 for weaponName in pairs(WEAPON_MESHES) do
-	table.insert(WEAPON_LIST, weaponName)
-	NORMALIZED_TO_WEAPON[normalizeKey(weaponName)] = weaponName
+	if not SEEN_WEAPONS[weaponName] then
+		SEEN_WEAPONS[weaponName] = true
+		table.insert(WEAPON_LIST, weaponName)
+	end
 end
 for weaponName in pairs(CUSTOM_MESH_WEAPONS) do
-	table.insert(WEAPON_LIST, weaponName)
-	NORMALIZED_TO_WEAPON[normalizeKey(weaponName)] = weaponName
+	if not SEEN_WEAPONS[weaponName] then
+		SEEN_WEAPONS[weaponName] = true
+		table.insert(WEAPON_LIST, weaponName)
+	end
 end
 table.sort(WEAPON_LIST)
 
 CW.WeaponList          = WEAPON_LIST
 CW.normalizeTextureKey = normalizeKey
-
-CW.Assets.weaponTextures = CW.Assets.weaponTextures or {}
-CW.Settings.WeaponTextureFiles = CW.Settings.WeaponTextureFiles or {}
-
-if CW.Settings.WeaponTextureFilesByKey then
-	for key, path in pairs(CW.Settings.WeaponTextureFilesByKey) do
-		local weaponName = NORMALIZED_TO_WEAPON[key]
-		if weaponName then
-			CW.Settings.WeaponTextureFiles[weaponName] = path
-		end
-	end
-end
-
-function CW.setWeaponTextureFile(weaponName, filename)
-	local resolved = CW.resolveAssetPath(filename)
-	CW.Settings.WeaponTextureFiles[weaponName] = resolved
-	if not resolved then
-		CW.Assets.weaponTextures[weaponName] = nil
-	end
-end
+CW.Assets.weaponTextures = nil
+CW.Settings.WeaponTextureFiles = nil
+CW.Settings.WeaponTextureFilesByKey = nil
 
 local function reloadGenericTexture()
 	local asset, failReason = CW.loadCachedAsset({
@@ -1018,46 +989,6 @@ local function reloadGenericTexture()
 		CW.Assets.weaponTexture = asset
 	elseif failReason == "missing" or failReason == "error" then
 		CW.Assets.weaponTexture = nil
-	end
-end
-
-local function reloadPerGunTextures()
-	for _, weaponName in ipairs(WEAPON_LIST) do
-		local filePath = CW.Settings.WeaponTextureFiles[weaponName]
-		if not filePath then
-			local defaultPath = CW.resolveAssetPath(normalizeKey(weaponName)..".png")
-			local ok, exists = pcall(isfile, defaultPath)
-			if ok and exists then
-				filePath = defaultPath
-				CW.Settings.WeaponTextureFiles[weaponName] = defaultPath
-			end
-		end
-
-		if not filePath then
-			CW.Assets.weaponTextures[weaponName] = nil
-		else
-			local key     = normalizeKey(weaponName)
-			local sigFile = CW.Paths.TEXTURE_CACHE_FOLDER.."/gun_"..key..".sig"
-
-			local asset, failReason = CW.loadCachedAsset({
-				file        = filePath,
-				sigFile     = sigFile,
-				cacheFolder = CW.Paths.TEXTURE_CACHE_FOLDER,
-				prefix      = "tex_"..key,
-				ext         = ".png",
-				label       = weaponName.." texture ("..filePath..")",
-				isUnchanged = function() return CW.Assets.weaponTextures[weaponName] ~= nil end,
-			})
-
-			if asset then
-				CW.Assets.weaponTextures[weaponName] = asset
-			elseif failReason == "missing" then
-				CW.Warn(weaponName.." texture file not found: "..filePath)
-				CW.Assets.weaponTextures[weaponName] = nil
-			elseif failReason == "error" then
-				CW.Assets.weaponTextures[weaponName] = nil
-			end
-		end
 	end
 end
 
@@ -1101,7 +1032,8 @@ local function buildCustomMesh(tool, cfg)
 end
 
 local function applyTexture(tool)
-	local textureId = CW.Assets.weaponTextures[tool.Name] or CW.Assets.weaponTexture
+	if not tool:IsA("Tool") then return end
+	local textureId = CW.Assets.weaponTexture
 	if not textureId then return end
 
 	local customCfg = CUSTOM_MESH_WEAPONS[tool.Name]
@@ -1137,7 +1069,6 @@ end
 
 local function reloadTexturesAndApply()
 	reloadGenericTexture()
-	reloadPerGunTextures()
 
 	local backpack = LocalPlayer:FindFirstChild("Backpack")
 	if backpack then applyToContainer(backpack) end
@@ -1407,6 +1338,7 @@ if CW.IsFirstRun then
 		pcall(function() if CW.State.ammoCharacterConn then CW.State.ammoCharacterConn:Disconnect() end end)
 		pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
 		pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
+		pcall(function() if CW.State.stopWeaponShootSoundOverrides then CW.State.stopWeaponShootSoundOverrides() end end)
 		pcall(function()
 			local contextActions = game:GetService("ContextActionService")
 			contextActions:UnbindAction("CycleWareSprintToggle")
@@ -1438,7 +1370,7 @@ local Icons = {
 	Tracers = "rbxassetid://94654949230438",
 }
 
-Elastic:SetWindowKeybind(Enum.KeyCode.RightControl)
+Elastic:SetWindowKeybind(nil)
 
 local Window = Elastic:Window()
 
@@ -1611,8 +1543,6 @@ VisualsTab:Slider({
 	end,
 })
 
-local WeaponsTab = VisualsTab
-
 local function applyTextureFile(value)
 	local resolved = resolveAssetPath(value)
 	if resolved then
@@ -1621,80 +1551,13 @@ local function applyTextureFile(value)
 	end
 end
 
-WeaponsTab:Textbox({
-	Title = "Default Weapon Texture",
+VisualsTab:Textbox({
+	Title = "Shared Weapon Texture",
 	Default = CW.Paths.TEXTURE_FILE,
 	Placeholder = filenameOnly(CW.Paths.TEXTURE_FILE),
 	Flag = "Texture_FilePath",
 	Callback = applyTextureFile,
 })
-
-local weaponStatusRefreshers = {}
-
-if CW.WeaponList and CW.normalizeTextureKey and CW.setWeaponTextureFile then
-	for _, weaponName in ipairs(CW.WeaponList) do
-		local weapon = weaponName
-		local key = CW.normalizeTextureKey(weapon)
-		local flag = "WeaponTex_" .. key
-		local defaultPath = resolveAssetPath(key .. ".png")
-		local titleLabel
-
-		local function refreshWeaponStatus()
-			if not titleLabel or not titleLabel.Parent then return end
-
-			local texturePath = CW.Settings.WeaponTextureFiles[weapon] or defaultPath
-			local ok, exists = pcall(isfile, texturePath)
-			local title = weapon:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-			titleLabel.RichText = true
-			titleLabel.Text = ok and exists
-				and '<font color="#4ADE80">' .. title .. "</font> Texture"
-				or title .. " Texture"
-		end
-
-		local function applyThisWeaponTexture(value)
-			CW.setWeaponTextureFile(weapon, value)
-
-			if CW.reloadTextures then
-				CW.reloadTextures()
-			end
-			refreshWeaponStatus()
-		end
-
-		local created, createError = pcall(function()
-			WeaponsTab:Textbox({
-				Title = weapon .. " Texture",
-				Default = CW.Settings.WeaponTextureFiles[weapon] or defaultPath,
-				Placeholder = key .. ".png (leave empty for generic)",
-				Flag = flag,
-				Callback = applyThisWeaponTexture,
-			})
-		end)
-
-		if created then
-			local statusOk = pcall(function()
-			for _, rowInfo in ipairs(Window.AllRows or {}) do
-				if rowInfo.Title == weapon .. " Texture" and rowInfo.Row then
-					for _, child in ipairs(rowInfo.Row:GetChildren()) do
-						if child:IsA("TextLabel") then
-							titleLabel = child
-							break
-						end
-					end
-					break
-				end
-			end
-			weaponStatusRefreshers[weapon] = refreshWeaponStatus
-			refreshWeaponStatus()
-			end)
-			if not statusOk then
-				weaponStatusRefreshers[weapon] = function() end
-			end
-		else
-			warn("[CW] Failed to create texture control for " .. weapon .. ": " .. tostring(createError))
-		end
-	end
-end
-
 local SoundsTab = Window:Tab({
 	Title = "Audio",
 	Icon = Icons.Sounds
@@ -1730,6 +1593,283 @@ SoundsTab:Slider({
 	Flag = "Sound_Volume",
 	Callback = applySoundVolume,
 })
+
+local configuredWeaponSounds = CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES
+	or _cfg.WEAPON_SHOOT_SOUNDS
+CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES = type(configuredWeaponSounds) == "table"
+	and configuredWeaponSounds or {}
+if CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED == nil then
+	CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED = _cfg.WEAPON_SOUND_OVERRIDE_ENABLED ~= false
+end
+if CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS == nil then
+	CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS = _cfg.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS == true
+end
+
+if CW.State.stopWeaponShootSoundOverrides then
+	pcall(CW.State.stopWeaponShootSoundOverrides)
+end
+
+local weaponSoundOverrides = CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES
+local activeWeaponSounds = setmetatable({}, { __mode = "k" })
+local watchedSoundContainers = setmetatable({}, { __mode = "k" })
+local weaponSoundPlayerConnections = {}
+local weaponSoundGlobalConnections = {}
+local weaponSoundRefreshScheduled = false
+local weaponSoundRefreshGeneration = 0
+
+local function disconnectList(connections)
+	for _, connection in ipairs(connections) do
+		pcall(function() connection:Disconnect() end)
+	end
+	table.clear(connections)
+end
+
+local function restoreWeaponSound(sound)
+	local data = activeWeaponSounds[sound]
+	if not data then return end
+	activeWeaponSounds[sound] = nil
+	if data.connection then
+		pcall(function() data.connection:Disconnect() end)
+	end
+	if sound.Parent then
+		pcall(function() sound.SoundId = data.originalId end)
+	end
+end
+
+local function stopWeaponShootSoundOverrides()
+	weaponSoundRefreshGeneration = weaponSoundRefreshGeneration + 1
+	weaponSoundRefreshScheduled = false
+	disconnectList(weaponSoundGlobalConnections)
+	for _, connections in pairs(weaponSoundPlayerConnections) do
+		disconnectList(connections)
+	end
+	table.clear(weaponSoundPlayerConnections)
+	for container, data in pairs(watchedSoundContainers) do
+		disconnectList(data.connections)
+		watchedSoundContainers[container] = nil
+	end
+	for sound in pairs(activeWeaponSounds) do
+		restoreWeaponSound(sound)
+	end
+end
+CW.State.stopWeaponShootSoundOverrides = stopWeaponShootSoundOverrides
+
+local function findSoundTool(sound)
+	local ancestor = sound.Parent
+	while ancestor do
+		if ancestor:IsA("Tool") then return ancestor end
+		ancestor = ancestor.Parent
+	end
+	return nil
+end
+
+local function applyWeaponSound(sound, targetId, tool, player, container)
+	local data = activeWeaponSounds[sound]
+	if not data then
+		data = {
+			originalId = sound.SoundId,
+			tool = tool,
+			player = player,
+			container = container,
+			targetId = targetId,
+		}
+		activeWeaponSounds[sound] = data
+		local ok, connection = pcall(function()
+			return sound:GetPropertyChangedSignal("SoundId"):Connect(function()
+				local current = activeWeaponSounds[sound]
+				if current and sound.Parent and sound.SoundId ~= current.targetId then
+					pcall(function() sound.SoundId = current.targetId end)
+				end
+			end)
+		end)
+		if ok then data.connection = connection end
+	else
+		data.tool = tool
+		data.player = player
+		data.container = container
+		data.targetId = targetId
+	end
+
+	if sound.SoundId ~= targetId then
+		pcall(function() sound.SoundId = targetId end)
+	end
+end
+
+local function applyWeaponSoundToTool(tool, player, container)
+	if not tool:IsA("Tool") then return end
+	if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
+	if player ~= LocalPlayer and not CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS then return end
+
+	local targetId = weaponSoundOverrides[tool.Name]
+	if type(targetId) ~= "string" or targetId == "" then return end
+	for _, descendant in ipairs(tool:GetDescendants()) do
+		if descendant:IsA("Sound") and descendant.Name == "ShootSound" then
+			applyWeaponSound(descendant, targetId, tool, player, container)
+		end
+	end
+end
+
+local function unwatchSoundContainer(container)
+	local data = watchedSoundContainers[container]
+	if not data then return end
+	watchedSoundContainers[container] = nil
+	disconnectList(data.connections)
+	for sound, soundData in pairs(activeWeaponSounds) do
+		if soundData.container == container then
+			restoreWeaponSound(sound)
+		end
+	end
+end
+
+local function watchSoundContainer(container, player)
+	if watchedSoundContainers[container] then return end
+	local data = { player = player, connections = {} }
+	watchedSoundContainers[container] = data
+
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Tool") then
+			applyWeaponSoundToTool(child, player, container)
+		end
+	end
+
+	table.insert(data.connections, container.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("Tool") then
+			task.defer(applyWeaponSoundToTool, descendant, player, container)
+		elseif descendant:IsA("Sound") and descendant.Name == "ShootSound" then
+			local tool = findSoundTool(descendant)
+			if tool then applyWeaponSoundToTool(tool, player, container) end
+		end
+	end))
+
+	table.insert(data.connections, container.DescendantRemoving:Connect(function(descendant)
+		if descendant:IsA("Sound") then
+			restoreWeaponSound(descendant)
+		elseif descendant:IsA("Tool") then
+			for sound, soundData in pairs(activeWeaponSounds) do
+				if soundData.tool == descendant then restoreWeaponSound(sound) end
+			end
+		end
+	end))
+end
+
+local function removeWeaponSoundPlayer(player)
+	local connections = weaponSoundPlayerConnections[player]
+	if connections then
+		disconnectList(connections)
+		weaponSoundPlayerConnections[player] = nil
+	end
+	for container, data in pairs(watchedSoundContainers) do
+		if data.player == player then unwatchSoundContainer(container) end
+	end
+end
+
+local function watchWeaponSoundPlayer(player)
+	if weaponSoundPlayerConnections[player] then return end
+	local connections = {}
+	weaponSoundPlayerConnections[player] = connections
+
+	table.insert(connections, player.CharacterAdded:Connect(function(character)
+		watchSoundContainer(character, player)
+	end))
+	table.insert(connections, player.CharacterRemoving:Connect(unwatchSoundContainer))
+	if player.Character then
+		watchSoundContainer(player.Character, player)
+	end
+
+	if player == LocalPlayer then
+		local backpack = player:FindFirstChildOfClass("Backpack")
+		if backpack then watchSoundContainer(backpack, player) end
+		table.insert(connections, player.ChildAdded:Connect(function(child)
+			if child:IsA("Backpack") then watchSoundContainer(child, player) end
+		end))
+	end
+end
+
+local function refreshWeaponShootSoundOverrides()
+	stopWeaponShootSoundOverrides()
+	if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
+	for _, player in ipairs(Players:GetPlayers()) do
+		watchWeaponSoundPlayer(player)
+	end
+	table.insert(weaponSoundGlobalConnections, Players.PlayerAdded:Connect(watchWeaponSoundPlayer))
+	table.insert(weaponSoundGlobalConnections, Players.PlayerRemoving:Connect(removeWeaponSoundPlayer))
+end
+
+local function scheduleWeaponShootSoundRefresh()
+	if weaponSoundRefreshScheduled then return end
+	weaponSoundRefreshScheduled = true
+	local generation = weaponSoundRefreshGeneration
+	task.defer(function()
+		if generation ~= weaponSoundRefreshGeneration then return end
+		weaponSoundRefreshScheduled = false
+		refreshWeaponShootSoundOverrides()
+	end)
+end
+
+local function normalizeWeaponSoundId(value)
+	local trimmed = tostring(value or ""):match("^%s*(.-)%s*$")
+	if trimmed == "" then return nil end
+	local digits = trimmed:match("^(%d+)$") or trimmed:match("^rbxassetid://(%d+)$")
+	if not digits or digits == "0" then return false end
+	return "rbxassetid://" .. digits
+end
+
+for weapon, soundId in pairs(weaponSoundOverrides) do
+	local normalizedId = normalizeWeaponSoundId(soundId)
+	weaponSoundOverrides[weapon] = normalizedId ~= false and normalizedId or nil
+end
+
+local function setWeaponShootSound(weapon, value)
+	local soundId = normalizeWeaponSoundId(value)
+	if soundId == false then
+		CW.Warn("Invalid sound asset ID for " .. weapon .. "; use a numeric ID or rbxassetid://<ID>.")
+		weaponSoundOverrides[weapon] = nil
+	else
+		weaponSoundOverrides[weapon] = soundId
+	end
+	scheduleWeaponShootSoundRefresh()
+end
+
+local function applyWeaponSoundOverridesEnabled(enabled)
+	CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED = enabled == true
+	scheduleWeaponShootSoundRefresh()
+end
+
+local function applyWeaponSoundOverridesToOthers(enabled)
+	CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS = enabled == true
+	scheduleWeaponShootSoundRefresh()
+end
+
+SoundsTab:Toggle({
+	Title = "Enable Weapon Sound Overrides",
+	Default = CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED,
+	Flag = "WeaponSoundOverrides_Enabled",
+	Callback = applyWeaponSoundOverridesEnabled,
+})
+
+SoundsTab:Toggle({
+	Title = "Apply to Other Players Locally",
+	Default = CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS,
+	Flag = "WeaponSoundOverrides_Others",
+	Callback = applyWeaponSoundOverridesToOthers,
+})
+
+if CW.WeaponList then
+	for _, weaponName in ipairs(CW.WeaponList) do
+		local weapon = weaponName
+		local key = CW.normalizeTextureKey and CW.normalizeTextureKey(weapon)
+			or weapon:lower():gsub("%W", "")
+		SoundsTab:Textbox({
+			Title = weapon .. " Shoot Sound",
+			Default = weaponSoundOverrides[weapon] or "",
+			Placeholder = "Sound ID or rbxassetid://<ID>",
+			Flag = "WeaponShootSound_" .. key,
+			Callback = function(value)
+				setWeaponShootSound(weapon, value)
+			end,
+		})
+	end
+end
 
 local TracersTab = EffectsTab
 
@@ -1867,7 +2007,11 @@ ContextActionService:BindActionAtPriority(
 	Enum.KeyCode.LeftShift
 )
 
-local function onRightShiftDuringSprint()
+local function onRightShiftAction(_, inputState)
+	if inputState == Enum.UserInputState.Begin then
+		Window:ToggleVisibility()
+	end
+
 	if sprinting then
 		return Enum.ContextActionResult.Sink
 	end
@@ -1877,7 +2021,7 @@ end
 ContextActionService:UnbindAction("CycleWareProtectSprint")
 ContextActionService:BindActionAtPriority(
 	"CycleWareProtectSprint",
-	onRightShiftDuringSprint,
+	onRightShiftAction,
 	false,
 	Enum.ContextActionPriority.High.Value + 1,
 	Enum.KeyCode.RightShift
@@ -2224,9 +2368,7 @@ local function reloadAllSettingsAssets()
 		end
 	end
 
-	for _, refreshStatus in pairs(weaponStatusRefreshers) do
-		pcall(refreshStatus)
-	end
+	refreshWeaponShootSoundOverrides()
 	CW.Log("Settings and local assets reloaded.")
 end
 
@@ -2370,6 +2512,7 @@ SettingsTab:Button({
 })
 
 loadSettings()
+scheduleWeaponShootSoundRefresh()
 
 if CW.Settings.AUTO_RELOAD_ENABLED and ammoScanGeneration == 0 then
 	rebuildAmmoLabelWatchers()
