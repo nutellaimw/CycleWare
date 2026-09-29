@@ -1,4 +1,3 @@
--- Standalone entry point; module bodies below are kept in isolated scopes.
 local _cfg = getgenv().CW_CONFIG or {}
 
 local function boolOr(v, default)
