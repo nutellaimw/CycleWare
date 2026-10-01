@@ -21,7 +21,7 @@ The only thing in usage as imagelabel is the hitmarker. But we plan to change th
 
 ## Requirements
 
-You executor must support these functions:
+You executor must support these sUNC functions:
 
 Full File API,
 getcustomasset,
