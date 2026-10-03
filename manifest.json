@@ -1,22 +1,64 @@
 {
   "schemaVersion": 1,
-  "revision": "COLOQUE_O_SHA_DO_COMMIT",
+  "revision": "28fbae543e7f914fbd637b85cf1f2a355565e66b",
   "assets": {
     "Cursors": [
-      { "path": "Cursors/Cursor.png" }
+      { "path": "Cursors/animegirl.png" },
+      { "path": "Cursors/bluedot.png" },
+      { "path": "Cursors/bluexhair.png" },
+      { "path": "Cursors/circunferece.png" },
+      { "path": "Cursors/greendot.png" },
+      { "path": "Cursors/greenxhair.png" },
+      { "path": "Cursors/heart.png" },
+      { "path": "Cursors/heartcrosshair.png" },
+      { "path": "Cursors/kuromimaid.png" },
+      { "path": "Cursors/pc.png" },
+      { "path": "Cursors/pluscursor.png" },
+      { "path": "Cursors/purpledot.png" },
+      { "path": "Cursors/purplepluscursor.png" },
+      { "path": "Cursors/reddotwdiagonalcrosshairs.png" },
+      { "path": "Cursors/reverscursor.png" },
+      { "path": "Cursors/scoop.png" },
+      { "path": "Cursors/trianglecrosshair.png" },
+      { "path": "Cursors/whitedot.png" }
     ],
     "Hitmarkers": [
-      { "path": "Hitmarkers/Hit.png" }
+      { "path": "Hitmarkers/default.png" },
+      { "path": "Hitmarkers/fourwhitesolderinghitmarker.tiff" },
+      { "path": "Hitmarkers/hitmarker2.png" },
+      { "path": "Hitmarkers/purplehitmarker.png" },
+      { "path": "Hitmarkers/redhitmarker.png" }
     ],
     "HitSounds": [
-      { "path": "HitSounds/Hit.mp3" }
+      { "path": "HitSounds/bip.wav" },
+      { "path": "HitSounds/bipsfx.wav" },
+      { "path": "HitSounds/bubble.wav" },
+      { "path": "HitSounds/default.mp3" },
+      { "path": "HitSounds/plublub.wav" },
+      { "path": "HitSounds/plubsfx.wav" },
+      { "path": "HitSounds/sfx.wav" },
+      { "path": "HitSounds/sfxabu.wav" },
+      { "path": "HitSounds/sfxblurred.wav" },
+      { "path": "HitSounds/softclick.wav" }
     ],
     "Textures": {
-      "M9": [
-        { "path": "Textures/M9/M9.png" }
-      ],
       "AK-47": [
-        { "path": "Textures/AK-47/AK.png" }
+        { "path": "Textures/AK-47/texture - cópia 2.png" }
+      ],
+      "M4A1": [
+        { "path": "Textures/M4A1/texture - cópia 3.png" }
+      ],
+      "M9": [
+        { "path": "Textures/M9/texture - cópia 4.png" }
+      ],
+      "MP5": [
+        { "path": "Textures/MP5/texture - cópia 5.png" }
+      ],
+      "Remington 870": [
+        { "path": "Textures/Remington 870/texture - cópia.png" }
+      ],
+      "Revolver": [
+        { "path": "Textures/Revolver/texture.png" }
       ]
     }
   }
