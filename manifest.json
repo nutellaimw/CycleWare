@@ -24,7 +24,7 @@
     ],
     "Hitmarkers": [
       { "path": "Hitmarkers/default.png" },
-      { "path": "Hitmarkers/fourwhitesolderinghitmarker.tiff" },
+      { "path": "Hitmarkers/fourwhitesolderinghitmarker.png" },
       { "path": "Hitmarkers/hitmarker2.png" },
       { "path": "Hitmarkers/purplehitmarker.png" },
       { "path": "Hitmarkers/redhitmarker.png" }
