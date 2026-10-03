@@ -24,7 +24,7 @@
     ],
     "Hitmarkers": [
       { "path": "Hitmarkers/default.png" },
-      { "path": "Hitmarkers/fourwhitesolderinghitmarker.png" },
+      { "path": "Hitmarkers/fourwhitesolderinghitmarker.tiff" },
       { "path": "Hitmarkers/hitmarker2.png" },
       { "path": "Hitmarkers/purplehitmarker.png" },
       { "path": "Hitmarkers/redhitmarker.png" }
@@ -36,6 +36,7 @@
       { "path": "HitSounds/default.mp3" },
       { "path": "HitSounds/plublub.mp3" },
       { "path": "HitSounds/plubsfx.mp3" },
+      { "path": "HitSounds/pluc.mp3" },
       { "path": "HitSounds/sfx.mp3" },
       { "path": "HitSounds/sfxabu.mp3" },
       { "path": "HitSounds/sfxblurred.mp3" },
