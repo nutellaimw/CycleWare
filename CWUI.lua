@@ -325,14 +325,20 @@ function Section:AddDropdown(o)
 		Size = UDim2.new(0.4, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Right, Text = tostring(selected or "—"),
 		TextColor3 = Theme.SubText, TextSize = 14, Font = Enum.Font.GothamMedium, Parent = head,
 	})
-	local list = new("Frame", {
-		BackgroundTransparency = 1, Position = UDim2.fromOffset(6, 38), Size = UDim2.new(1, -12, 0, 0), Parent = row,
+	local maxList = o.MaxHeight or 168
+	local list = new("ScrollingFrame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(6, 38),
+		Size = UDim2.new(1, -12, 0, 0), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Divider,
+		ScrollingDirection = Enum.ScrollingDirection.Y, Parent = row,
 	}, { new("UIListLayout", { Padding = UDim.new(0, 2) }) })
 
 	local obj = { Instance = row }
-	local function height() return 36 + 8 + #options * 28 end
+	local function listHeight() return math.min(#options * 28, maxList) end
+	local function height() return 36 + 8 + listHeight() end
 	local function setOpen(v)
 		open = v
+		list.Size = UDim2.new(1, -12, 0, listHeight())
 		tween(row, { Size = UDim2.new(1, 0, 0, open and height() or 36) }, 0.2)
 	end
 	function obj:Set(v, silent)
@@ -375,6 +381,7 @@ end
 --       Columns     = 4,                          -- colunas
 --       Aspect      = 1,                          -- altura/largura da miniatura
 --       MaxHeight   = 260,                        -- se definido, a grade rola internamente
+--       LazyLoad    = true,                       -- só carrega as miniaturas quando a galeria ficar visível
 --       Default     = "nome ou caminho",          -- seleção inicial
 --       AllowDeselect = false,                    -- clicar de novo remove a seleção
 --       Callback    = function(item) end,         -- item = { Name, Path, Asset }  (nil se desmarcou)
@@ -387,10 +394,22 @@ function Section:AddGallery(o)
 	local aspect   = o.Aspect or 1
 	local maxHeight = o.MaxHeight
 	local PAD = 8
+	local container
 	local entries, selected = {}, nil
 	local firstBuild = true
+	local lazy = o.LazyLoad == true
+	local started = not lazy -- with LazyLoad, thumbnails load only once the gallery is actually visible
 
-	local container = new("Frame", {
+	local function isShown()
+		local inst = container
+		while inst and not inst:IsA("LayerCollector") do
+			if inst:IsA("GuiObject") and not inst.Visible then return false end
+			inst = inst.Parent
+		end
+		return inst ~= nil
+	end
+
+	container = new("Frame", {
 		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 		LayoutOrder = self:_next(), Parent = self._body,
 	}, { new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
@@ -566,9 +585,8 @@ function Section:AddGallery(o)
 
 		e.cell, e.stroke, e.name, e.badge = cell, stroke, name, badge
 
-		-- placeholder pulsando até a imagem carregar
+		-- placeholder pulsando até a imagem carregar (só começa quando o carregamento começa)
 		local pulse = TweenService:Create(thumb, TweenInfo.new(0.7, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { BackgroundTransparency = 0.65 })
-		pulse:Play()
 		local function onLoaded(asset)
 			pcall(function()
 				pulse:Cancel()
@@ -582,8 +600,18 @@ function Section:AddGallery(o)
 				end
 			end)
 		end
-		local cachedAsset = type(item.Path) == "string" and assetCache[item.Path]
-		if cachedAsset then onLoaded(cachedAsset) else enqueueLoad(item.Path, onLoaded) end
+		e.load = function()
+			if e.loadStarted then return end
+			e.loadStarted = true
+			local cachedAsset = type(item.Path) == "string" and assetCache[item.Path]
+			if cachedAsset then
+				onLoaded(cachedAsset)
+			else
+				pulse:Play()
+				enqueueLoad(item.Path, onLoaded)
+			end
+		end
+		if started then e.load() end
 
 		-- interação
 		cell.MouseEnter:Connect(function()
@@ -660,6 +688,19 @@ function Section:AddGallery(o)
 
 	if refreshBtn then refreshBtn.MouseButton1Click:Connect(build) end
 	build()
+
+	if lazy then
+		task.spawn(function()
+			while not started and container.Parent do
+				if isShown() then
+					started = true
+					for _, e in ipairs(entries) do e.load() end
+					break
+				end
+				task.wait(0.25)
+			end
+		end)
+	end
 	return obj
 end
 
@@ -881,8 +922,10 @@ function CW:CreateWindow(cfg)
 		})
 	end
 
-	self._tabList = new("Frame", {
-		Name = "Tabs", BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 66), Size = UDim2.new(1, 0, 1, -140), Parent = sidebar,
+	self._tabList = new("ScrollingFrame", {
+		Name = "Tabs", BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 66),
+		Size = UDim2.new(1, 0, 1, -140), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = 0, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = sidebar,
 	}, {
 		new("UIListLayout", { Padding = UDim.new(0, 2.5), SortOrder = Enum.SortOrder.LayoutOrder }),
 		new("UIPadding", { PaddingTop = UDim.new(0, 4) }),
