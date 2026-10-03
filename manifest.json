@@ -30,16 +30,16 @@
       { "path": "Hitmarkers/redhitmarker.png" }
     ],
     "HitSounds": [
-      { "path": "HitSounds/bip.wav" },
-      { "path": "HitSounds/bipsfx.wav" },
-      { "path": "HitSounds/bubble.wav" },
+      { "path": "HitSounds/bip.mp3" },
+      { "path": "HitSounds/bipsfx.mp3" },
+      { "path": "HitSounds/bubble.mp3" },
       { "path": "HitSounds/default.mp3" },
-      { "path": "HitSounds/plublub.wav" },
-      { "path": "HitSounds/plubsfx.wav" },
-      { "path": "HitSounds/sfx.wav" },
-      { "path": "HitSounds/sfxabu.wav" },
-      { "path": "HitSounds/sfxblurred.wav" },
-      { "path": "HitSounds/softclick.wav" }
+      { "path": "HitSounds/plublub.mp3" },
+      { "path": "HitSounds/plubsfx.mp3" },
+      { "path": "HitSounds/sfx.mp3" },
+      { "path": "HitSounds/sfxabu.mp3" },
+      { "path": "HitSounds/sfxblurred.mp3" },
+      { "path": "HitSounds/softclick.mp3" }
     ],
     "Textures": {
       "AK-47": [
