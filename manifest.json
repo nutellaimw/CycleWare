@@ -24,7 +24,6 @@
     ],
     "Hitmarkers": [
       { "path": "Hitmarkers/default.png" },
-      { "path": "Hitmarkers/fourwhitesolderinghitmarker.tiff" },
       { "path": "Hitmarkers/hitmarker2.png" },
       { "path": "Hitmarkers/purplehitmarker.png" },
       { "path": "Hitmarkers/redhitmarker.png" }
@@ -39,18 +38,17 @@
       { "path": "HitSounds/pluc.mp3" },
       { "path": "HitSounds/sfx.mp3" },
       { "path": "HitSounds/sfxabu.mp3" },
-      { "path": "HitSounds/sfxblurred.mp3" },
-      { "path": "HitSounds/softclick.mp3" }
+      { "path": "HitSounds/sfxblurred.mp3" }
     ],
     "Textures": {
       "AK-47": [
-        { "path": "Textures/AK-47/texture.png" }
+        { "path": "Textures/AK-47/texture - cópia 2.png" }
       ],
       "M4A1": [
-        { "path": "Textures/M4A1/texture.png" }
+        { "path": "Textures/M4A1/texture - cópia 3.png" }
       ],
       "M9": [
-        { "path": "Textures/M9/texture.png" }
+        { "path": "Textures/M9/texture - cópia 4.png" }
       ],
       "MP5": [
         { "path": "Textures/MP5/texture.png" }
