@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "revision": "COLOQUE_O_SHA_DO_COMMIT",
+  "assets": {
+    "Cursors": [
+      { "path": "Cursors/Cursor.png" }
+    ],
+    "Hitmarkers": [
+      { "path": "Hitmarkers/Hit.png" }
+    ],
+    "HitSounds": [
+      { "path": "HitSounds/Hit.mp3" }
+    ],
+    "Textures": {
+      "M9": [
+        { "path": "Textures/M9/M9.png" }
+      ],
+      "AK-47": [
+        { "path": "Textures/AK-47/AK.png" }
+      ]
+    }
+  }
+}
