@@ -1,4 +1,13 @@
-local _cfg = getgenv().CW_CONFIG or {}
+-- Standalone entry point; module bodies below are kept in isolated scopes.
+local _env = getgenv()
+local _cfg = _env.CW_CONFIG
+if type(_cfg) ~= "table" then
+	_cfg = {}
+	_env.CW_CONFIG = _cfg
+end
+if type(_cfg.ASSET_MANIFEST_URL) ~= "string" or _cfg.ASSET_MANIFEST_URL == "" then
+	_cfg.ASSET_MANIFEST_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/manifest.json"
+end
 
 local function boolOr(v, default)
 	if v == nil then return default end
@@ -65,20 +74,25 @@ end
 
 CW.Log(isFirstRun and "First run — initializing." or "Re-run detected — updating settings only.")
 
-CW.Paths.CURSOR_FILE    = _cfg.CURSOR_FILE    or "CycleWare/Assets/cursor.png"
-CW.Paths.HITMARKER_FILE = _cfg.HITMARKER_FILE or "CycleWare/Assets/hitmarker.png"
-CW.Paths.SOUND_FILE     = _cfg.SOUND_FILE     or "CycleWare/Assets/sound.mp3"
+CW.Paths.CURSOR_ROOT = "CycleWare"
+CW.Paths.LIBRARY_ROOT = CW.Paths.CURSOR_ROOT .. "/Library"
+CW.Paths.CURSORS_FOLDER = CW.Paths.LIBRARY_ROOT .. "/Cursors"
+CW.Paths.HITMARKERS_FOLDER = CW.Paths.LIBRARY_ROOT .. "/Hitmarkers"
+CW.Paths.HIT_SOUNDS_FOLDER = CW.Paths.LIBRARY_ROOT .. "/HitSounds"
+CW.Paths.TEXTURES_FOLDER = CW.Paths.LIBRARY_ROOT .. "/Textures"
+CW.Paths.OFFICIAL_FOLDER = "_Official"
+CW.Paths.CACHE_FOLDER = CW.Paths.CURSOR_ROOT .. "/Cache"
+CW.Paths.GENERATED_FOLDER = CW.Paths.CACHE_FOLDER .. "/Generated"
+CW.Paths.TINTED_FOLDER = CW.Paths.GENERATED_FOLDER .. "/Cursors"
+CW.Paths.CURSOR_SIG_FILE = CW.Paths.TINTED_FOLDER .. "/cursor.sig"
+CW.Paths.MANIFEST_FILE = CW.Paths.LIBRARY_ROOT .. "/manifest.json"
+CW.Paths.LIBRARY_REVISION_FILE = CW.Paths.LIBRARY_ROOT .. "/.revision"
+CW.Paths.SETTINGS_FILE = CW.Paths.CACHE_FOLDER .. "/ui_settings.json"
 
-CW.Paths.CURSOR_ROOT            = "CycleWare"
-CW.Paths.CURSOR_FOLDER          = "CycleWare/Assets"
-CW.Paths.CACHE_FOLDER           = CW.Paths.CURSOR_FOLDER.."/Cache"
-CW.Paths.TINTED_FOLDER          = CW.Paths.CACHE_FOLDER.."/Tinted"
-CW.Paths.HITMARKER_CACHE_FOLDER = CW.Paths.CACHE_FOLDER.."/HitmarkerCache"
-CW.Paths.SOUND_CACHE_FOLDER     = CW.Paths.CACHE_FOLDER.."/SoundCache"
-
-CW.Paths.CURSOR_SIG_FILE    = CW.Paths.CACHE_FOLDER.."/cursor.sig"
-CW.Paths.HITMARKER_SIG_FILE = CW.Paths.CACHE_FOLDER.."/hitmarker.sig"
-CW.Paths.SOUND_SIG_FILE     = CW.Paths.CACHE_FOLDER.."/sound.sig"
+CW.Paths.CURSOR_FILE = nil
+CW.Paths.HITMARKER_FILE = nil
+CW.Paths.SOUND_FILE = nil
+CW.Paths.TEXTURE_FILE = nil
 
 CW.Settings.HITMARKER_SIZE             = numOr(_cfg.HITMARKER_SIZE, 50, 1)
 CW.Settings.SOUND_VOLUME               = numOr(_cfg.SOUND_VOLUME, 1, 0)
@@ -90,72 +104,96 @@ CW.Settings.HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, t
 CW.Settings.HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, true)
 CW.Settings.HITMARKER_FADEOUT         = boolOr(_cfg.HITMARKER_FADEOUT, true)
 
-CW.Paths.TEXTURE_FILE = _cfg.TEXTURE_FILE or "CycleWare/Assets/texture.png"
+CW.Settings.ASSET_SELECTIONS = CW.Settings.ASSET_SELECTIONS or {
+	Cursor = nil,
+	Hitmarker = nil,
+	HitSound = nil,
+	Textures = {},
+}
+CW._SavedSettings = {}
 
-CW.resolveAssetPath = function(input)
-	if not input then return nil end
-
-	local trimmed = tostring(input):match("^%s*(.-)%s*$")
-	if trimmed == "" then return nil end
-
-	if trimmed:find("/") or trimmed:find("\\") then
-		return trimmed
-	end
-
-	return CW.Paths.CURSOR_FOLDER .. "/" .. trimmed
-end
-
-local SETTINGS_FILE = CW.Paths.CACHE_FOLDER .. "/ui_settings.json"
 local settingsFileExists = false
 pcall(function()
-	settingsFileExists = isfile(SETTINGS_FILE)
+	settingsFileExists = isfile(CW.Paths.SETTINGS_FILE)
 end)
 
 if settingsFileExists then
-	local ok, raw = pcall(readfile, SETTINGS_FILE)
+	local ok, raw = pcall(readfile, CW.Paths.SETTINGS_FILE)
 
 	if ok then
 		local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
 
 		if ok2 and type(data) == "table" then
-			local function readPath(flag)
-				local entry = data[flag]
-
-				if type(entry) == "table" and entry[2] then
-					return CW.resolveAssetPath(entry[2])
+			local values = data.Settings
+			if type(values) ~= "table" then
+				values = {}
+				local legacyFlags = {
+					Hitmarker_Size = "HITMARKER_SIZE",
+					Hitmarker_RandomRotation = "HITMARKER_RANDOM_ROTATION",
+					Hitmarker_FollowMouse = "HITMARKER_FOLLOW_MOUSE",
+					Hitmarker_VisibleDuration = "HITMARKER_VISIBLE_DURATION",
+					Hitmarker_Fadeout = "HITMARKER_FADEOUT",
+					Hitmarker_FadeoutDuration = "HITMARKER_FADEOUT_DURATION",
+					Cursor_Size = "CURSOR_TARGET_SIZE",
+					Sound_Volume = "SOUND_VOLUME",
+					Tracer_Enabled = "CUSTOM_BULLET_TRACERS",
+					Tracer_Width = "TRACER_WIDTH",
+					Tracer_Lifetime = "TRACER_LIFETIME",
+					Tracer_ApplyToOthers = "TRACER_APPLY_TO_OTHERS",
+					Sprint_ToggleEnabled = "SHIFT_TOGGLE_ENABLED",
+					Chat_ToggleEnabled = "CHAT_TOGGLE_ENABLED",
+					AutoReload_Enabled = "AUTO_RELOAD_ENABLED",
+					WeaponSoundOverrides_Enabled = "WEAPON_SOUND_OVERRIDE_ENABLED",
+					WeaponSoundOverrides_Others = "WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS",
+				}
+				for flag, key in pairs(legacyFlags) do
+					local entry = data[flag]
+					if type(entry) == "table" then values[key] = entry[2] end
 				end
-
-				return nil
+				if type(data.Tracer_Color) == "table" then
+					local color = data.Tracer_Color[2]
+					if type(color) == "table" and color.R and color.G and color.B then
+						values.TRACER_COLOR = Color3.new(color.R, color.G, color.B)
+					end
+				end
+				if type(data.Tracer_GlowColor) == "table" then
+					local color = data.Tracer_GlowColor[2]
+					if type(color) == "table" and color.R and color.G and color.B then
+						values.TRACER_GLOW_COLOR = Color3.new(color.R, color.G, color.B)
+					end
+				end
+			end
+			CW._SavedSettings = values
+			for key, value in pairs(values) do
+				local current = CW.Settings[key]
+				if type(current) == type(value) and type(value) ~= "table" then
+					CW.Settings[key] = value
+				elseif type(current) == "table" and type(value) == "table" then
+					CW.Settings[key] = value
+				end
 			end
 
-			local hm  = readPath("Hitmarker_FilePath")
-			local cur = readPath("Cursor_FilePath")
-			local tex = readPath("Texture_FilePath")
-			local snd = readPath("Sound_FilePath")
-
-			if hm then
-				CW.Paths.HITMARKER_FILE = hm
+			local selections = data.AssetSelections
+			if type(selections) == "table" then
+				for _, key in ipairs({ "Cursor", "Hitmarker", "HitSound" }) do
+					if type(selections[key]) == "string" then
+						CW.Settings.ASSET_SELECTIONS[key] = selections[key]
+					end
+				end
+				if type(selections.Textures) == "table" then
+					CW.Settings.ASSET_SELECTIONS.Textures = selections.Textures
+				end
 			end
 
-			if cur then
-				CW.Paths.CURSOR_FILE = cur
-			end
-
-			if tex then
-				CW.Paths.TEXTURE_FILE = tex
-			end
-
-			if snd then
-				CW.Paths.SOUND_FILE = snd
-			end
-
-			CW.Log("Loaded saved asset filenames from ui_settings.json")
+			CW.Log("Loaded saved UI settings and asset selections")
 		end
 	end
 end
 
+-- ShootEvent is resolved (and waited for) by the Hook module.
 if not CW.ShootEvent then
-	CW.ShootEvent = ReplicatedStorage:WaitForChild("GunRemotes"):WaitForChild("ShootEvent")
+	local gunRemotes = ReplicatedStorage:FindFirstChild("GunRemotes")
+	CW.ShootEvent = gunRemotes and gunRemotes:FindFirstChild("ShootEvent")
 end
 
 do
@@ -204,8 +242,18 @@ local bxor    = bit32.bxor
 local rshift  = bit32.rshift
 
 local ALL_FOLDERS = {
-	CW.Paths.CURSOR_ROOT, CW.Paths.CURSOR_FOLDER, CW.Paths.CACHE_FOLDER,
-	CW.Paths.TINTED_FOLDER, CW.Paths.HITMARKER_CACHE_FOLDER, CW.Paths.SOUND_CACHE_FOLDER,
+	CW.Paths.CURSOR_ROOT,
+	CW.Paths.LIBRARY_ROOT,
+	CW.Paths.CURSORS_FOLDER,
+	CW.Paths.CURSORS_FOLDER.."/"..CW.Paths.OFFICIAL_FOLDER,
+	CW.Paths.HITMARKERS_FOLDER,
+	CW.Paths.HITMARKERS_FOLDER.."/"..CW.Paths.OFFICIAL_FOLDER,
+	CW.Paths.HIT_SOUNDS_FOLDER,
+	CW.Paths.HIT_SOUNDS_FOLDER.."/"..CW.Paths.OFFICIAL_FOLDER,
+	CW.Paths.TEXTURES_FOLDER,
+	CW.Paths.CACHE_FOLDER,
+	CW.Paths.GENERATED_FOLDER,
+	CW.Paths.TINTED_FOLDER,
 }
 
 function CW.ensureFolders()
@@ -216,6 +264,15 @@ function CW.ensureFolders()
 	end
 end
 CW.ensureFolders()
+
+-- Cooperative yielding for heavy loops (PNG codec) so the game never freezes.
+local lastYield = os.clock()
+function CW.yieldBudget()
+	if os.clock() - lastYield > 0.008 then
+		task.wait()
+		lastYield = os.clock()
+	end
+end
 
 function CW.readSigFile(path)
 	if not isfile(path) then return nil end
@@ -264,7 +321,7 @@ end
 
 function CW.computeFileSignature(path, prefix, extra)
 	extra = extra or ""
-	if not isfile(path) then
+	if not path or not isfile(path) then
 		return prefix..":none"..extra, nil
 	end
 	local ok, data = pcall(readfile, path)
@@ -274,49 +331,421 @@ function CW.computeFileSignature(path, prefix, extra)
 	return prefix..":"..CW.crc32(data)..extra, data
 end
 
-function CW.loadCachedAsset(cfg)
-	if not isfile(cfg.file) then
-		CW.Log(cfg.label .. " file not found — place one at " .. cfg.file)
+function CW.loadLibraryAsset(cfg)
+	if not cfg.file or not isfile(cfg.file) then
+		CW.Log(cfg.label .. " file not found in the asset library")
 		return nil, "missing"
 	end
 
-	local sig, data  = CW.computeFileSignature(cfg.file, cfg.prefix)
-	local sigHash     = sformat("%08x", CW.crc32(sig))
-	local storedHash  = CW.readSigFile(cfg.sigFile)
-	local cachedPath  = cfg.cacheFolder.."/"..cfg.prefix.."_"..sigHash..cfg.ext
-
-	local unchanged = storedHash == sigHash and isfile(cachedPath)
-	if cfg.isUnchanged then
-		unchanged = unchanged and cfg.isUnchanged()
-	end
-	
-	if unchanged then
-		CW.Log(cfg.label .. " unchanged — keeping current asset")
-		return nil, nil
-	end
-
-	if storedHash and storedHash ~= sigHash then
-		CW.Log(cfg.label .. " changed since last run — reloading new file")
-	else
-		CW.Log(cfg.label .. " " .. (CW.IsFirstRun and "loaded" or "reloaded") .. " from file.")
-	end
-
-	if not data then
-		CW.Warn("readfile failed for " .. cfg.label)
-		return nil, "error"
-	end
-	writefile(cachedPath, data)
-
-	local ok, asset = pcall(getcustomasset, cachedPath)
+	local ok, asset = pcall(getcustomasset, cfg.file)
 	if not ok or not asset then
-		CW.Warn("getcustomasset failed for " .. cfg.label)
+		CW.Warn("getcustomasset failed for " .. cfg.label .. ": " .. tostring(asset))
 		return nil, "error"
 	end
 
-	writefile(cfg.sigFile, sigHash)
-	CW.pruneOldFiles(cfg.cacheFolder, cfg.prefix.."_", sigHash, cfg.label)
+	CW.Log(cfg.label .. " loaded from " .. cfg.file)
 	return asset, nil
 end
+end
+
+
+do
+-- AssetLibrary.lua
+local CW = getgenv().__CW_CORE_STATE
+local HttpService = game:GetService("HttpService")
+
+local CATEGORY_INFO = {
+	Cursors = { folder = CW.Paths.CURSORS_FOLDER, extensions = { png = true } },
+	Hitmarkers = { folder = CW.Paths.HITMARKERS_FOLDER, extensions = { png = true } },
+	-- Roblox only decodes mp3/ogg for audio; wav is not supported.
+	HitSounds = { folder = CW.Paths.HIT_SOUNDS_FOLDER, extensions = { mp3 = true, ogg = true } },
+}
+local SELECTION_KEYS = {
+	Cursors = "Cursor",
+	Hitmarkers = "Hitmarker",
+	HitSounds = "HitSound",
+}
+local ASSET_EXTENSIONS = { png = true, mp3 = true, ogg = true }
+
+local function ensureFolderPath(path)
+	local current = ""
+	for segment in path:gmatch("[^/]+") do
+		current = current == "" and segment or current .. "/" .. segment
+		local exists = false
+		pcall(function() exists = isfolder(current) end)
+		if not exists then pcall(makefolder, current) end
+	end
+end
+
+local function validWeaponName(weapon)
+	return type(weapon) == "string"
+		and weapon ~= "." and weapon ~= ".."
+		and weapon:match("^[%w_%-%. ]+$") ~= nil
+end
+
+local function validManifestPath(category, path)
+	if type(path) ~= "string" or path:find("\\", 1, true) or path:match("^/") then return false end
+	for segment in path:gmatch("[^/]+") do
+		if segment == "." or segment == ".." or segment:find("[%c]") then return false end
+	end
+	local extension = path:match("%.([%w]+)$")
+	if not extension then return false end
+	extension = extension:lower()
+	local info = CATEGORY_INFO[category]
+	if info then
+		return path:match("^" .. category .. "/[^/]+$") ~= nil
+			and info.extensions[extension] == true
+	end
+	if category == "Textures" then
+		return path:match("^Textures/[^/]+/[^/]+$") ~= nil
+			and extension == "png"
+	end
+	return false
+end
+
+local function detectAssetFormat(path, data)
+	if type(data) ~= "string" or #data < 4 then return "empty or truncated" end
+	local extension = path:match("%.([%w]+)$")
+	if not extension then return "unknown" end
+	extension = extension:lower()
+
+	if data:sub(1, 8) == "\137\80\78\71\13\10\26\10" then return "png" end
+	if data:sub(1, 4) == "MM\0\42" or data:sub(1, 4) == "II\42\0" then return "tiff" end
+	if data:sub(1, 3) == "\255\216\255" then return "jpeg" end
+	if data:sub(1, 4) == "OggS" then return "ogg" end
+	if data:sub(1, 3) == "ID3" then return "mp3" end
+	local first, second = string.byte(data, 1, 2)
+	if first == 0xFF and second and bit32.band(second, 0xE0) == 0xE0 then return "mp3" end
+	if data:match("^%d%d%d:%s") then return "HTTP error response" end
+	return "unknown"
+end
+
+local invalidAssetWarnings = {}
+
+local function libraryRelative(path)
+	if type(path) ~= "string" then return nil end
+	local normalized = path:gsub("\\", "/")
+	local prefix = CW.Paths.LIBRARY_ROOT .. "/"
+	if normalized:sub(1, #prefix) == prefix then
+		return normalized:sub(#prefix + 1)
+	end
+	local marker = "/" .. prefix
+	local markerIndex = normalized:find(marker, 1, true)
+	if markerIndex then return normalized:sub(markerIndex + #marker) end
+	return nil
+end
+
+CW.Library = {}
+CW.Library.ensureFolder = ensureFolderPath
+
+function CW.Library.list(category, weapon)
+	local info = CATEGORY_INFO[category]
+	local directories = {}
+	if info then
+		table.insert(directories, info.folder .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+		table.insert(directories, info.folder)
+	elseif category == "Textures" and type(weapon) == "string" then
+		local weaponFolder = CW.Paths.TEXTURES_FOLDER .. "/" .. weapon
+		table.insert(directories, weaponFolder .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+		table.insert(directories, weaponFolder)
+	else
+		return {}
+	end
+
+	local extensions = info and info.extensions or { png = true }
+	local result = {}
+	for _, directory in ipairs(directories) do
+		local ok, files = pcall(listfiles, directory)
+		if ok and type(files) == "table" then
+			for _, filePath in ipairs(files) do
+				local normalized = tostring(filePath):gsub("\\", "/")
+				local filename = normalized:match("([^/]+)$") or normalized
+				local extension = filename:match("%.([%w]+)$")
+				if extension and extensions[extension:lower()] then
+					local relative = libraryRelative(normalized)
+					if relative then
+						local okData, data = pcall(readfile, normalized)
+						local actualFormat = okData and detectAssetFormat(normalized, data) or "unreadable"
+						if actualFormat == extension:lower() then
+							table.insert(result, {
+								Name = filename:gsub("%.[%w]+$", ""),
+								Path = CW.Paths.LIBRARY_ROOT .. "/" .. relative,
+								Relative = relative,
+							})
+						elseif not invalidAssetWarnings[normalized] then
+							invalidAssetWarnings[normalized] = true
+							CW.Warn("Skipped invalid library asset " .. relative .. " (expected " .. extension:lower() .. ", detected " .. actualFormat .. ")")
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(result, function(left, right)
+		return left.Relative:lower() < right.Relative:lower()
+	end)
+	return result
+end
+
+function CW.Library.relative(path)
+	return libraryRelative(path)
+end
+
+function CW.Library.setSelection(category, weapon, relative)
+	local selections = CW.Settings.ASSET_SELECTIONS
+	if category == "Textures" then
+		selections.Textures = selections.Textures or {}
+		selections.Textures[weapon] = relative
+	else
+		local key = SELECTION_KEYS[category]
+		if key then selections[key] = relative end
+	end
+end
+
+function CW.Library.selectedPath(category, weapon)
+	local selections = CW.Settings.ASSET_SELECTIONS
+	local selected
+	if category == "Textures" then
+		selected = selections.Textures and selections.Textures[weapon]
+	else
+		local key = SELECTION_KEYS[category]
+		selected = key and selections[key]
+	end
+	local files = CW.Library.list(category, weapon)
+	for _, item in ipairs(files) do
+		if item.Relative == selected then return item.Path, item.Relative end
+	end
+	local first = files[1]
+	if category == "Textures" then
+		CW.Library.setSelection(category, weapon, nil)
+		return nil, nil
+	end
+	if first then
+		CW.Library.setSelection(category, weapon, first.Relative)
+		return first.Path, first.Relative
+	end
+	CW.Library.setSelection(category, weapon, nil)
+	return nil, nil
+end
+
+local function officialDestination(category, relativePath)
+	if category == "Textures" then
+		local weapon, filename = relativePath:match("^Textures/([^/]+)/([^/]+)$")
+		if not validWeaponName(weapon) then return nil end
+		return CW.Paths.TEXTURES_FOLDER .. "/" .. weapon .. "/" .. CW.Paths.OFFICIAL_FOLDER .. "/" .. filename
+	end
+	local info = CATEGORY_INFO[category]
+	if not info then return nil end
+	local filename = relativePath:match("^" .. category .. "/([^/]+)$")
+	if not filename then return nil end
+	return info.folder .. "/" .. CW.Paths.OFFICIAL_FOLDER .. "/" .. filename
+end
+
+local function encodeURLPath(path)
+	return (path:gsub("([^%w_%.%-~/])", function(character)
+		return string.format("%%%02X", string.byte(character))
+	end))
+end
+
+-- Removes official files that no longer exist in the manifest (never touches user files).
+local function pruneOfficial(expected)
+	local function pruneFolder(folder)
+		local okFolder, exists = pcall(isfolder, folder)
+		if not okFolder or not exists then return end
+		local ok, files = pcall(listfiles, folder)
+		if not ok or type(files) ~= "table" then return end
+		for _, filePath in ipairs(files) do
+			local normalized = tostring(filePath):gsub("\\", "/")
+			local relative = libraryRelative(normalized)
+			local extension = normalized:match("%.([%w]+)$")
+			if relative and extension and ASSET_EXTENSIONS[extension:lower()] and not expected[relative] then
+				if pcall(delfile, filePath) then
+					CW.Log("Removed obsolete official asset " .. relative)
+				end
+			end
+		end
+	end
+
+	for _, info in pairs(CATEGORY_INFO) do
+		pruneFolder(info.folder .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+	end
+	local ok, weaponFolders = pcall(listfiles, CW.Paths.TEXTURES_FOLDER)
+	if ok and type(weaponFolders) == "table" then
+		for _, weaponFolder in ipairs(weaponFolders) do
+			pruneFolder((tostring(weaponFolder):gsub("\\", "/")) .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+		end
+	end
+end
+
+local function syncImpl()
+	local manifestURL = _cfg.ASSET_MANIFEST_URL
+	if type(manifestURL) ~= "string" or manifestURL == "" then
+		CW.Log("Asset manifest URL is unset; using files already in Library")
+		return false
+	end
+	CW.Log("Fetching asset manifest")
+	if type(game.HttpGet) ~= "function" then
+		CW.Warn("HttpGet unavailable; using files already in Library")
+		return false
+	end
+
+	local fetched, raw = pcall(function() return game:HttpGet(manifestURL) end)
+	if not fetched or type(raw) ~= "string" then
+		CW.Warn("Could not download the asset manifest: " .. tostring(raw))
+		return false
+	end
+	local decoded, manifest = pcall(HttpService.JSONDecode, HttpService, raw)
+	if not decoded or type(manifest) ~= "table" or manifest.schemaVersion ~= 1 or type(manifest.assets) ~= "table" then
+		CW.Warn("Asset manifest is invalid or uses an unsupported schema")
+		return false
+	end
+
+	local baseURL = manifestURL:match("^(.*)/[^/]+$")
+	if not baseURL then
+		CW.Warn("Asset manifest URL must point to a file under a raw repository URL")
+		return false
+	end
+	local revision = type(manifest.revision) == "string" and manifest.revision ~= ""
+		and manifest.revision or string.format("%08x", CW.crc32(raw))
+	local previousRevision = CW.readSigFile(CW.Paths.LIBRARY_REVISION_FILE)
+	local complete = true
+	local skipped = 0
+	local pending = {}
+
+	for category, entries in pairs(manifest.assets) do
+		if category == "Textures" and type(entries) == "table" then
+			for weapon, weaponEntries in pairs(entries) do
+				if validWeaponName(weapon) and type(weaponEntries) == "table" then
+					ensureFolderPath(CW.Paths.TEXTURES_FOLDER .. "/" .. weapon .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+					for _, entry in ipairs(weaponEntries) do
+						local manifestWeapon
+						if type(entry) == "table" and type(entry.path) == "string" then
+							manifestWeapon = entry.path:match("^Textures/([^/]+)/")
+						end
+						if type(entry) == "table" and manifestWeapon == weapon and validManifestPath(category, entry.path) then
+							table.insert(pending, { category = category, path = entry.path, crc32 = entry.crc32 })
+						else
+							skipped = skipped + 1
+							CW.Warn("Skipped invalid texture entry in manifest")
+						end
+					end
+				else
+					skipped = skipped + 1
+				end
+			end
+		elseif CATEGORY_INFO[category] and type(entries) == "table" then
+			for _, entry in ipairs(entries) do
+				if type(entry) == "table" and validManifestPath(category, entry.path) then
+					table.insert(pending, { category = category, path = entry.path, crc32 = entry.crc32 })
+				else
+					skipped = skipped + 1
+					CW.Warn("Skipped invalid " .. category .. " entry in manifest")
+				end
+			end
+		elseif category ~= "Textures" then
+			complete = false
+			skipped = skipped + 1
+			CW.Warn("Skipped unsupported manifest category: " .. tostring(category))
+		end
+	end
+
+	CW.Log(string.format("Manifest contains %d supported assets; skipped %d unsupported entries", #pending, skipped))
+	pcall(writefile, CW.Paths.MANIFEST_FILE, raw)
+
+	local expected = {}
+	for index, entry in ipairs(pending) do
+		if index == 1 or index % 5 == 0 or index == #pending then
+			CW.Log(string.format("Syncing asset %d/%d: %s", index, #pending, entry.path))
+		end
+		local destination = officialDestination(entry.category, entry.path)
+		if not destination then
+			complete = false
+		else
+			local destinationRelative = libraryRelative(destination)
+			if destinationRelative then expected[destinationRelative] = true end
+			ensureFolderPath(destination:match("^(.*)/[^/]+$"))
+
+			-- Validate cached bytes before trusting the extension or manifest revision.
+			local needsDownload = true
+			if isfile(destination) then
+				local ok, existing = pcall(readfile, destination)
+				local actualFormat = ok and detectAssetFormat(entry.path, existing) or "unreadable"
+				if actualFormat == entry.path:match("%.([%w]+)$"):lower() then
+					if entry.crc32 then
+						local expectedCRC = tostring(entry.crc32):lower():gsub("^0x", "")
+						needsDownload = string.format("%08x", CW.crc32(existing)):lower() ~= expectedCRC
+					else
+						needsDownload = previousRevision ~= revision
+					end
+				else
+					CW.Warn("Cached asset " .. entry.path .. " is invalid (detected " .. actualFormat .. "); downloading again")
+				end
+			end
+
+			if needsDownload then
+				local remotePath = encodeURLPath(entry.path)
+				local downloaded, bytes = pcall(function() return game:HttpGet(baseURL .. "/" .. remotePath) end)
+				if downloaded and type(bytes) == "string" then
+					local actualFormat = detectAssetFormat(entry.path, bytes)
+					local expectedFormat = entry.path:match("%.([%w]+)$"):lower()
+					local expectedCRC = entry.crc32 and tostring(entry.crc32):lower():gsub("^0x", "")
+					local actualCRC = string.format("%08x", CW.crc32(bytes)):lower()
+					if actualFormat ~= expectedFormat then
+						complete = false
+						CW.Warn("Rejected " .. entry.path .. ": expected " .. expectedFormat .. " content, detected " .. actualFormat .. ". Check the GitHub path and file format.")
+					elseif expectedCRC and actualCRC ~= expectedCRC then
+						complete = false
+						CW.Warn("Checksum mismatch for " .. entry.path)
+					else
+						local temporary = destination .. ".download"
+						local wrote = pcall(writefile, temporary, bytes)
+						local readOK, verified = pcall(readfile, temporary)
+						local saved = wrote and readOK and verified == bytes
+						if saved then saved = pcall(writefile, destination, verified) end
+						pcall(delfile, temporary)
+						if not saved then
+							complete = false
+							CW.Warn("Could not save official asset " .. entry.path)
+						end
+					end
+				else
+					complete = false
+					CW.Warn("Could not download official asset " .. entry.path)
+				end
+			end
+		end
+		if index % 5 == 0 then task.wait() end
+	end
+
+	-- Persist a valid manifest revision even when a few entries fail. Good files then
+	-- stay cached, while missing/invalid paths are retried because their files fail validation.
+	pcall(writefile, CW.Paths.LIBRARY_REVISION_FILE, revision)
+	if complete then
+		if skipped == 0 and #pending > 0 then pruneOfficial(expected) end
+		CW.Log("Asset library synchronized at revision " .. revision)
+	else
+		CW.Warn("Asset sync finished with invalid or unavailable files; valid assets were kept")
+	end
+	return complete
+end
+
+-- Only one sync at a time; concurrent callers wait for the running one.
+function CW.Library.sync()
+	if CW.State.syncing then
+		while CW.State.syncing do task.wait(0.1) end
+		return CW.State.lastSyncResult == true
+	end
+	CW.State.syncing = true
+	local ok, result = pcall(syncImpl)
+	CW.State.syncing = false
+	CW.State.lastSyncResult = ok and result == true
+	if not ok then error(result, 0) end
+	return result
+end
+
+CW.Paths.CURSOR_FILE = CW.Library.selectedPath("Cursors")
+CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
+CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
 end
 
 
@@ -342,6 +771,7 @@ local function adler32(s)
 		local b = sbyte(s, i)
 		s1 = (s1 + b) % 65521
 		s2 = (s2 + s1) % 65521
+		if i % 65536 == 0 then CW.yieldBudget() end
 	end
 	return s2 * 65536 + s1
 end
@@ -395,6 +825,7 @@ local function deflateFixedHuffman(raw)
 	for i = 1, #raw do
 		local code, len = literalCode(sbyte(raw, i))
 		writeHuffman(code, len)
+		if i % 8192 == 0 then CW.yieldBudget() end
 	end
 
 	writeHuffman(0, 7)
@@ -415,6 +846,7 @@ function CW.encodePNG(px, w, h)
 			row[#row+1] = schar(px[i], px[i+1], px[i+2], px[i+3])
 		end
 		rows[y+1] = tconcat(row)
+		if y % 8 == 0 then CW.yieldBudget() end
 	end
 	local raw = tconcat(rows)
 	return "\137\80\78\71\13\10\26\10"
@@ -430,6 +862,7 @@ local function inflate(data)
 	for i = 1, #data do bytes[i] = sbyte(data, i) end
 	local pos, bitbuf, bitcount = 1, 0, 0
 	local out, opos = {}, 1
+	local ticks = 0
 
 	local function readbits(n)
 		while bitcount < n do
@@ -491,6 +924,8 @@ local function inflate(data)
 
 	local function decodeBlock(llt, ddt, mLL, mD)
 		while true do
+			ticks = ticks + 1
+			if ticks % 16384 == 0 then CW.yieldBudget() end
 			local sym = decode(llt, mLL)
 			if sym < 256 then out[opos]=sym; opos=opos+1
 			elseif sym == 256 then break
@@ -545,6 +980,7 @@ end
 function CW.parsePNG(data)
 	assert(data:sub(1,8) == "\137\80\78\71\13\10\26\10", "not a PNG")
 	local pos, w, h, bitDepth, colorType = 9
+	local interlace = 0
 	local idatParts, palette, transAlpha = {}, {}, {}
 
 	while pos <= #data do
@@ -559,7 +995,9 @@ function CW.parsePNG(data)
 			h         = sbyte(chunk,5)*16777216+sbyte(chunk,6)*65536+sbyte(chunk,7)*256+sbyte(chunk,8)
 			bitDepth  = sbyte(chunk,9)
 			colorType = sbyte(chunk,10)
-			assert(bitDepth==8 or (colorType==3 and bitDepth<=8), "parsePNG: unsupported bit depth "..bitDepth)
+			interlace = sbyte(chunk,13)
+			assert(bitDepth == 8, "parsePNG: unsupported bit depth "..tostring(bitDepth))
+			assert(interlace == 0, "parsePNG: interlaced PNGs are not supported")
 		elseif typ == "PLTE" then
 			for i = 0, floor(#chunk/3)-1 do
 				palette[i] = {sbyte(chunk,i*3+1), sbyte(chunk,i*3+2), sbyte(chunk,i*3+3)}
@@ -578,6 +1016,7 @@ function CW.parsePNG(data)
 	for i = 1, stride do prev[i] = 0 end
 
 	for y = 0, h-1 do
+		if y % 8 == 0 then CW.yieldBudget() end
 		local ftype = sbyte(rawData, rpos); rpos = rpos+1
 		local row = {}
 		for x = 1, stride do
@@ -616,6 +1055,7 @@ function CW.resizePixels(px, w, h, tw, th)
 	if tw==w and th==h then return px,w,h end
 	local out, scaleX, scaleY = {}, w/tw, h/th
 	for y=0,th-1 do
+		if y % 8 == 0 then CW.yieldBudget() end
 		local srcY = mmin(floor(y*scaleY), h-1)
 		for x=0,tw-1 do
 			local srcX = mmin(floor(x*scaleX), w-1)
@@ -631,6 +1071,7 @@ end
 function CW.applyTint(px, w, h, tR, tG, tB)
 	local out = {}
 	for i=1, w*h*4, 4 do
+		if (i - 1) % 65536 == 0 then CW.yieldBudget() end
 		local r,g,b,a = px[i] or 0, px[i+1] or 0, px[i+2] or 0, px[i+3] or 0
 		if a > 10 then
 			local lum = (0.299*r + 0.587*g + 0.114*b) / 255
@@ -719,6 +1160,7 @@ local function activateCursors()
 	CW.State.cursorsReady = true
 	UserInputService.MouseIconEnabled = true
 	CW.State.currentCursorKey = nil
+	CW.State.lastTarget = nil -- force the PreRender loop to re-evaluate the hovered target
 	setOSCursor("white")
 	connectEnforcer()
 end
@@ -731,12 +1173,18 @@ end
 
 local function reloadCursorFromSource(sigHash, data)
 	if not data then
-		CW.Warn("No valid cursor image found at "..CW.Paths.CURSOR_FILE.." — place a PNG there and re-run.")
+		CW.Warn("No valid cursor image found at " .. tostring(CW.Paths.CURSOR_FILE) .. " — place a PNG in the cursor library and refresh.")
 		return false
 	end
 	local ok2, px, w, h = pcall(CW.parsePNG, data)
 	if not ok2 then
-		CW.Warn("parsePNG failed: "..tostring(px))
+		-- Unsupported PNG variant (interlaced, 16-bit, ...): use the original image as-is.
+		CW.Warn("parsePNG failed (" .. tostring(px) .. "); using the original image without resize/tint")
+		local okAsset, asset = pcall(getcustomasset, CW.Paths.CURSOR_FILE)
+		if okAsset and asset then
+			CW.Assets.white, CW.Assets.red, CW.Assets.green = asset, asset, asset
+			return true
+		end
 		return false
 	end
 	CW.Log(sformat("Loaded new cursor.png (%d×%d)", w, h))
@@ -761,7 +1209,26 @@ local function reloadCursorFromSource(sigHash, data)
 	return true
 end
 
-local function generateCursors()
+local function generateCursorsOnce()
+	if not CW.Paths.CURSOR_FILE then
+		CW.Assets.white, CW.Assets.red, CW.Assets.green = nil, nil, nil
+		CW.State.cursorsReady = false
+		CW.State.currentCursorKey = nil
+		for _, key in ipairs({ "enforcerConn", "enableConn" }) do
+			local connection = CW.State[key]
+			if connection then
+				pcall(function() connection:Disconnect() end)
+				CW.State[key] = nil
+			end
+		end
+		pcall(function()
+			UserInputService.MouseIconEnabled = true
+			UserInputService.MouseIcon = ""
+		end)
+		CW.Warn("No cursor found; add a PNG to " .. CW.Paths.CURSORS_FOLDER .. " and refresh the asset library.")
+		return
+	end
+
 	local currentSig, data = computeCursorSourceSignature()
 	local sigHash    = sformat("%08x", CW.crc32(currentSig))
 	local storedHash = CW.readSigFile(CW.Paths.CURSOR_SIG_FILE)
@@ -787,6 +1254,22 @@ local function generateCursors()
 		activateCursors()
 		CW.Log("OS cursor active (regenerated from new original).")
 	end
+end
+
+-- The codec now yields, so serialise runs: a request made while one is running
+-- marks the state dirty and triggers exactly one more pass with the latest settings.
+local function generateCursors()
+	if CW.State.cursorBusy then
+		CW.State.cursorDirty = true
+		return
+	end
+	CW.State.cursorBusy = true
+	repeat
+		CW.State.cursorDirty = false
+		local ok, err = pcall(generateCursorsOnce)
+		if not ok then CW.Warn("Cursor generation failed: " .. tostring(err)) end
+	until not CW.State.cursorDirty
+	CW.State.cursorBusy = false
 end
 
 CW.reloadCursor = generateCursors
@@ -835,18 +1318,12 @@ end
 CW.HMTemplate.Size = UDim2.new(0, CW.Settings.HITMARKER_SIZE, 0, CW.Settings.HITMARKER_SIZE)
 
 local function reloadHitmarker()
-	local asset = CW.loadCachedAsset({
-		file        = CW.Paths.HITMARKER_FILE,
-		sigFile     = CW.Paths.HITMARKER_SIG_FILE,
-		cacheFolder = CW.Paths.HITMARKER_CACHE_FOLDER,
-		prefix      = "hm",
-		ext         = ".png",
-		label       = "hitmarker.png",
-		isUnchanged = function() return CW.HMTemplate.Image ~= "" end,
+	local asset = CW.loadLibraryAsset({
+		file = CW.Paths.HITMARKER_FILE,
+		label = "hitmarker",
 	})
-	if asset then
-		CW.HMTemplate.Image = asset
-	end
+	-- Clear the old image when the selection is gone, instead of keeping a stale one.
+	CW.HMTemplate.Image = asset or ""
 end
 
 CW.reloadHitmarkerAsset = reloadHitmarker
@@ -862,14 +1339,9 @@ local SoundService = game:GetService("SoundService")
 local Debris       = game:GetService("Debris")
 
 local function reloadSound()
-	local asset, failReason = CW.loadCachedAsset({
-		file        = CW.Paths.SOUND_FILE,
-		sigFile     = CW.Paths.SOUND_SIG_FILE,
-		cacheFolder = CW.Paths.SOUND_CACHE_FOLDER,
-		prefix      = "snd",
-		ext         = ".mp3",
-		label       = "sound.mp3",
-		isUnchanged = function() return CW.Settings.SOUND_ID ~= nil end,
+	local asset, failReason = CW.loadLibraryAsset({
+		file = CW.Paths.SOUND_FILE,
+		label = "hit sound",
 	})
 	if asset then
 		CW.Settings.SOUND_ID = asset
@@ -912,13 +1384,7 @@ local LocalPlayer = CW.LocalPlayer
 
 local _cfg = getgenv().CW_CONFIG or {}
 
-CW.Paths.TEXTURE_FILE         = CW.Paths.TEXTURE_FILE or _cfg.TEXTURE_FILE or "CycleWare/Assets/texture.png"
-CW.Paths.TEXTURE_CACHE_FOLDER = CW.Paths.CACHE_FOLDER.."/TextureCache"
-CW.Paths.TEXTURE_SIG_FILE     = CW.Paths.CACHE_FOLDER.."/texture.sig"
-
-if not isfolder(CW.Paths.TEXTURE_CACHE_FOLDER) then
-	pcall(makefolder, CW.Paths.TEXTURE_CACHE_FOLDER)
-end
+CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER)
 
 local WEAPON_MESHES = _cfg.WEAPON_MESHES or {
 	["M9"]            = "Meshes/M9_3",
@@ -927,25 +1393,6 @@ local WEAPON_MESHES = _cfg.WEAPON_MESHES or {
 	["Revolver"]      = "Meshes/revolver (3)",
 	["MP5"]           = "GunMesh",
 	["AK-47"]         = "Meshes/AK47_7",
-}
-
-local CUSTOM_MESH_WEAPONS = _cfg.CUSTOM_MESH_WEAPONS or {
-	["FAL"] = {
-		meshId      = "rbxassetid://90772329772088",
-		meshName    = "FAL/Meshes",
-		removeNames = { ["Smooth Block Model"] = true, ["Black"] = true },
-		offset      = Vector3.new(0.05, 0.2, -0.55),
-		rotation    = Vector3.new(0, 90, 0),
-		size        = Vector3.new(0.4, 0.4, 0.4),
-	},
-	["M700"] = {
-		meshId      = "rbxassetid://109235772617313",
-		meshName    = "M700/Meshes",
-		removeNames = { ["Smooth Block Model"] = true },
-		offset      = Vector3.new(0, 0.43, -0.8),
-		rotation    = Vector3.new(0, 90, 0),
-		size        = Vector3.new(1, 1, 1),
-	},
 }
 
 local function normalizeKey(s)
@@ -960,94 +1407,50 @@ for weaponName in pairs(WEAPON_MESHES) do
 		table.insert(WEAPON_LIST, weaponName)
 	end
 end
-for weaponName in pairs(CUSTOM_MESH_WEAPONS) do
-	if not SEEN_WEAPONS[weaponName] then
-		SEEN_WEAPONS[weaponName] = true
-		table.insert(WEAPON_LIST, weaponName)
-	end
-end
 table.sort(WEAPON_LIST)
 
 CW.WeaponList          = WEAPON_LIST
 CW.normalizeTextureKey = normalizeKey
-CW.Assets.weaponTextures = nil
-CW.Settings.WeaponTextureFiles = nil
-CW.Settings.WeaponTextureFilesByKey = nil
+CW.Assets.weaponTextures = {}
+CW.State.originalWeaponTextureIds = CW.State.originalWeaponTextureIds
+	or setmetatable({}, { __mode = "k" })
+CW.Settings.ASSET_SELECTIONS.Textures = CW.Settings.ASSET_SELECTIONS.Textures or {}
 
-local function reloadGenericTexture()
-	local asset, failReason = CW.loadCachedAsset({
-		file        = CW.Paths.TEXTURE_FILE,
-		sigFile     = CW.Paths.TEXTURE_SIG_FILE,
-		cacheFolder = CW.Paths.TEXTURE_CACHE_FOLDER,
-		prefix      = "tex",
-		ext         = ".png",
-		label       = "generic texture ("..CW.Paths.TEXTURE_FILE..")",
-		isUnchanged = function() return CW.Assets.weaponTexture ~= nil end,
-	})
-	if asset then
-		CW.Assets.weaponTexture = asset
-	elseif failReason == "missing" or failReason == "error" then
-		CW.Assets.weaponTexture = nil
-	end
+for _, weaponName in ipairs(WEAPON_LIST) do
+	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName)
+	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 end
 
-local function buildCustomMesh(tool, cfg)
-	for _, desc in ipairs(tool:GetDescendants()) do
-		if cfg.removeNames[desc.Name] then
-			desc:Destroy()
-		end
+local function findWeaponMesh(tool, meshPath)
+	local current = tool
+	for segment in meshPath:gmatch("[^/]+") do
+		current = current and current:FindFirstChild(segment)
+		if not current then break end
 	end
+	if current and current:IsA("MeshPart") then return current end
 
-	local old = tool:FindFirstChild(cfg.meshName)
-	if old then old:Destroy() end
-
-	local handle = tool:FindFirstChild("Handle")
-	local mesh = Instance.new("MeshPart")
-	mesh.Name       = cfg.meshName
-	mesh.MeshId     = cfg.meshId
-	mesh.Material   = Enum.Material.SmoothPlastic
-	mesh.Size       = cfg.size
-	mesh.Anchored   = false
-	mesh.CanCollide = false
-	mesh.CanQuery   = false
-	mesh.CanTouch   = false
-	mesh.Massless   = true
-
-	if handle then
-		mesh.CFrame = handle.CFrame
-			* CFrame.new(cfg.offset)
-			* CFrame.Angles(math.rad(cfg.rotation.X), math.rad(cfg.rotation.Y), math.rad(cfg.rotation.Z))
-		mesh.Parent = tool
-		local weld  = Instance.new("WeldConstraint")
-		weld.Part0  = handle
-		weld.Part1  = mesh
-		weld.Parent = mesh
-	else
-		mesh.Parent = tool
-	end
-
-	CW.Log("Custom mesh built for "..tool.Name)
-	return mesh
+	local meshName = meshPath:match("([^/]+)$")
+	local fallback = meshName and tool:FindFirstChild(meshName, true)
+	if fallback and fallback:IsA("MeshPart") then return fallback end
+	return nil
 end
 
 local function applyTexture(tool)
 	if not tool:IsA("Tool") then return end
-	local textureId = CW.Assets.weaponTexture
-	if not textureId then return end
-
-	local customCfg = CUSTOM_MESH_WEAPONS[tool.Name]
-	if customCfg then
-		local mesh = buildCustomMesh(tool, customCfg)
-		mesh.TextureID = textureId
-		return
-	end
-
 	local meshName = WEAPON_MESHES[tool.Name]
 	if not meshName then return end
 
-	local mesh = tool:FindFirstChild(meshName, true)
-	if mesh and mesh:IsA("MeshPart") then
-		mesh.TextureID = textureId
+	local mesh = findWeaponMesh(tool, meshName)
+	if mesh then
+		local originals = CW.State.originalWeaponTextureIds
+		if originals[mesh] == nil then originals[mesh] = mesh.TextureID end
+		local textureId = CW.Assets.weaponTextures[tool.Name]
+		if textureId then
+			mesh.TextureID = textureId
+		elseif originals[mesh] ~= nil then
+			mesh.TextureID = originals[mesh]
+			originals[mesh] = nil
+		end
 	end
 end
 CW.applyWeaponTexture = applyTexture
@@ -1067,7 +1470,19 @@ local function monitor(container)
 end
 
 local function reloadTexturesAndApply()
-	reloadGenericTexture()
+	local loadedTextures = {}
+	for _, weaponName in ipairs(WEAPON_LIST) do
+		local filePath = CW.Library.selectedPath("Textures", weaponName)
+		if filePath then
+			local ok, asset = pcall(getcustomasset, filePath)
+			if ok and asset then
+				loadedTextures[weaponName] = asset
+			else
+				CW.Warn("Could not load selected texture for " .. weaponName)
+			end
+		end
+	end
+	CW.Assets.weaponTextures = loadedTextures
 
 	local backpack = LocalPlayer:FindFirstChild("Backpack")
 	if backpack then applyToContainer(backpack) end
@@ -1077,7 +1492,17 @@ CW.reloadTextures = reloadTexturesAndApply
 reloadTexturesAndApply()
 
 if CW.IsFirstRun then
-	monitor(LocalPlayer:WaitForChild("Backpack"))
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if backpack then
+		monitor(backpack)
+	else
+		CW.State.backpackMonitorConn = LocalPlayer.ChildAdded:Connect(function(child)
+			if not child:IsA("Backpack") then return end
+			CW.State.backpackMonitorConn:Disconnect()
+			CW.State.backpackMonitorConn = nil
+			monitor(child)
+		end)
+	end
 
 	LocalPlayer.CharacterAdded:Connect(function(character)
 		monitor(character)
@@ -1175,51 +1600,71 @@ local function createEnergyTracer(startPos, endPos)
 	Debris:AddItem(glow, life)
 end
 
-if CW.IsFirstRun then
-	local ok, TracersModule = pcall(function()
-		return require(ReplicatedStorage.SharedModules.GunTracers)
-	end)
+local function shouldUseCustom()
+	if not CW.Settings.CUSTOM_BULLET_TRACERS then return false end
+	if CW.Settings.TRACER_APPLY_TO_OTHERS then return true end
+	return isLocalPlayerShot()
+end
 
-	if ok and TracersModule then
-		CW.TracersModule          = TracersModule
-		CW._originalCreateBullet  = TracersModule.createBullet
-		CW._originalCreateTaser   = TracersModule.createTaser
-		CW._originalCreateSniper  = TracersModule.createSniper
+-- Installs the override once; returns false (so we can retry) if the game module isn't ready yet.
+local function installTracers()
+	if CW.State.tracersHooked then return true end
 
-		local function shouldUseCustom()
-			if not CW.Settings.CUSTOM_BULLET_TRACERS then return false end
-			if CW.Settings.TRACER_APPLY_TO_OTHERS then return true end
-			return isLocalPlayerShot()
+	local shared = ReplicatedStorage:FindFirstChild("SharedModules")
+	local moduleScript = shared and shared:FindFirstChild("GunTracers")
+	if not moduleScript then return false end
+
+	local ok, TracersModule = pcall(require, moduleScript)
+	if not ok or type(TracersModule) ~= "table" then return false end
+
+	CW.TracersModule          = TracersModule
+	CW._originalCreateBullet  = TracersModule.createBullet
+	CW._originalCreateTaser   = TracersModule.createTaser
+	CW._originalCreateSniper  = TracersModule.createSniper
+
+	TracersModule.createBullet = function(startPos, endPos)
+		if shouldUseCustom() then
+			createEnergyTracer(startPos, endPos)
+		else
+			CW._originalCreateBullet(startPos, endPos)
 		end
-
-		TracersModule.createBullet = function(startPos, endPos)
-			if shouldUseCustom() then
-				createEnergyTracer(startPos, endPos)
-			else
-				CW._originalCreateBullet(startPos, endPos)
-			end
-		end
-
-		TracersModule.createTaser = function(startPos, endPos)
-			if shouldUseCustom() then
-				createEnergyTracer(startPos, endPos)
-			else
-				CW._originalCreateTaser(startPos, endPos)
-			end
-		end
-
-		TracersModule.createSniper = function(startPos, endPos)
-			if shouldUseCustom() then
-				createEnergyTracer(startPos, endPos)
-			else
-				CW._originalCreateSniper(startPos, endPos)
-			end
-		end
-
-		CW.Log("Tracer override installed.")
-	else
-		CW.Warn("GunTracers module not found — custom tracers disabled.")
 	end
+
+	TracersModule.createTaser = function(startPos, endPos)
+		if shouldUseCustom() then
+			createEnergyTracer(startPos, endPos)
+		else
+			CW._originalCreateTaser(startPos, endPos)
+		end
+	end
+
+	TracersModule.createSniper = function(startPos, endPos)
+		if shouldUseCustom() then
+			createEnergyTracer(startPos, endPos)
+		else
+			CW._originalCreateSniper(startPos, endPos)
+		end
+	end
+
+	CW.State.tracersHooked = true
+	CW.Log("Tracer override installed.")
+	return true
+end
+
+if not installTracers() and not CW.State.tracersRetrying then
+	CW.State.tracersRetrying = true
+	task.spawn(function()
+		local deadline = os.clock() + 60
+		while os.clock() < deadline do
+			task.wait(1)
+			if installTracers() then
+				CW.State.tracersRetrying = false
+				return
+			end
+		end
+		CW.State.tracersRetrying = false
+		CW.Warn("GunTracers module not found — custom tracers disabled.")
+	end)
 end
 end
 
@@ -1228,89 +1673,123 @@ do
 -- Hook.lua
 local CW = getgenv().__CW_CORE_STATE
 
-local Players      = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService  = game:GetService("UserInputService")
 
 local LocalPlayer = CW.LocalPlayer
 
-if CW.IsFirstRun then
-	CW.Bindable = Instance.new("BindableEvent")
+-- Shot handler. Stored on CW so a re-run updates the logic without re-hooking.
+function CW.onShot(bullets)
+	if type(bullets) ~= "table" then return end
 
-	CW.Bindable.Event:Connect(function(bullets)
-		if type(bullets) ~= "table" then return end
-
-		local shotHit = false
-		for _, bullet in pairs(bullets) do
-			if type(bullet) == "table" then
-				local hit = bullet[3]
-				if typeof(hit) == "Instance" and hit:IsA("BasePart") and hit.Parent then
-					local character = hit.Parent
-					local player = Players:GetPlayerFromCharacter(character)
-						or (character.Parent and Players:GetPlayerFromCharacter(character.Parent))
-					if player and player ~= LocalPlayer and player.TeamColor ~= CW.State.cachedTeamColor then
-						shotHit = true
-						break
-					end
+	local shotHit = false
+	for _, bullet in pairs(bullets) do
+		if type(bullet) == "table" then
+			local hit = bullet[3]
+			if typeof(hit) == "Instance" and hit:IsA("BasePart") and hit.Parent then
+				local character = hit.Parent
+				local player = Players:GetPlayerFromCharacter(character)
+					or (character.Parent and Players:GetPlayerFromCharacter(character.Parent))
+				if player and player ~= LocalPlayer and player.TeamColor ~= CW.State.cachedTeamColor then
+					shotHit = true
+					break
 				end
 			end
 		end
-		if not shotHit then return end
-		CW.playHitSound()
+	end
+	if not shotHit then return end
+	CW.playHitSound()
 
-		local Clone = CW.HMTemplate:Clone()
-		Clone.Size              = UDim2.new(0, CW.Settings.HITMARKER_SIZE, 0, CW.Settings.HITMARKER_SIZE)
-		Clone.Position           = UDim2.fromOffset(CW.State.mouseX, CW.State.mouseY)
-		Clone.Rotation           = CW.Settings.HITMARKER_RANDOM_ROTATION and math.random(0,90) or 0
-		Clone.ImageTransparency = 0
-		Clone.Parent             = CW.IAPortable
+	-- Read the real mouse position now; mouseX/Y only update on MouseMovement.
+	local loc = UserInputService:GetMouseLocation()
+	CW.State.mouseX, CW.State.mouseY = loc.X, loc.Y
 
-		if CW.Settings.HITMARKER_FOLLOW_MOUSE then
-			CW.ActiveFollowClones[Clone] = true
-		end
+	local Clone = CW.HMTemplate:Clone()
+	Clone.Size              = UDim2.new(0, CW.Settings.HITMARKER_SIZE, 0, CW.Settings.HITMARKER_SIZE)
+	Clone.Position          = UDim2.fromOffset(CW.State.mouseX, CW.State.mouseY)
+	Clone.Rotation          = CW.Settings.HITMARKER_RANDOM_ROTATION and math.random(0,90) or 0
+	Clone.ImageTransparency = 0
+	Clone.Parent            = CW.IAPortable
 
-		local function finishClone()
-			CW.ActiveFollowClones[Clone] = nil
-			if Clone.Parent then Clone:Destroy() end
-		end
+	if CW.Settings.HITMARKER_FOLLOW_MOUSE then
+		CW.ActiveFollowClones[Clone] = true
+	end
 
-		task.delay(CW.Settings.HITMARKER_VISIBLE_DURATION, function()
-			if not Clone.Parent then return end
+	local function finishClone()
+		CW.ActiveFollowClones[Clone] = nil
+		if Clone.Parent then Clone:Destroy() end
+	end
 
-			if CW.Settings.HITMARKER_FADEOUT then
-				local baseSize = Clone.Size
-				local growSize = UDim2.new(
-					0, baseSize.X.Offset * 1.35,
-					0, baseSize.Y.Offset * 1.35
+	task.delay(CW.Settings.HITMARKER_VISIBLE_DURATION, function()
+		if not Clone.Parent then return end
+
+		if CW.Settings.HITMARKER_FADEOUT then
+			local baseSize = Clone.Size
+			local growSize = UDim2.new(
+				0, baseSize.X.Offset * 1.35,
+				0, baseSize.Y.Offset * 1.35
+			)
+
+			local ok = pcall(function()
+				local tween = TweenService:Create(
+					Clone,
+					TweenInfo.new(
+						CW.Settings.HITMARKER_FADEOUT_DURATION,
+						Enum.EasingStyle.Quad,
+						Enum.EasingDirection.Out
+					),
+					{ ImageTransparency = 1, Size = growSize }
 				)
-
-				local ok = pcall(function()
-					local tween = TweenService:Create(
-						Clone,
-						TweenInfo.new(
-							CW.Settings.HITMARKER_FADEOUT_DURATION,
-							Enum.EasingStyle.Quad,
-							Enum.EasingDirection.Out
-						),
-						{ ImageTransparency = 1, Size = growSize }
-					)
-					tween.Completed:Connect(finishClone)
-					tween:Play()
-				end)
-				if not ok then finishClone() end
-			else
-				finishClone()
-			end
-		end)
+				tween.Completed:Connect(finishClone)
+				tween:Play()
+			end)
+			if not ok then finishClone() end
+		else
+			finishClone()
+		end
 	end)
+end
+
+-- The hook only forwards the call: our logic runs deferred and protected,
+-- so it can never break or delay the game's own FireServer.
+local function installShootHook()
+	if CW.State.shootHooked then return true end
+
+	local remotes = ReplicatedStorage:FindFirstChild("GunRemotes")
+	local shootEvent = remotes and remotes:FindFirstChild("ShootEvent")
+	if not shootEvent then return false end
+	CW.ShootEvent = shootEvent
 
 	local OldNameCall
-	OldNameCall = hookmetamethod(CW.ShootEvent, "__namecall", newcclosure(function(self, ...)
+	OldNameCall = hookmetamethod(shootEvent, "__namecall", newcclosure(function(self, ...)
 		if checkcaller() then return OldNameCall(self, ...) end
 		if getnamecallmethod() == "FireServer" and self == CW.ShootEvent then
-			CW.Bindable.Fire(CW.Bindable, ...)
+			local bullets = ...
+			task.defer(function()
+				local ok, err = pcall(CW.onShot, bullets)
+				if not ok then CW.Warn("Shot handler error: " .. tostring(err)) end
+			end)
 		end
 		return OldNameCall(self, ...)
 	end))
+
+	CW.State.shootHooked = true
+	CW.Log("ShootEvent hook installed")
+	return true
+end
+
+if not installShootHook() and not CW.State.shootHookRetrying then
+	CW.State.shootHookRetrying = true
+	task.spawn(function()
+		local remotes = ReplicatedStorage:WaitForChild("GunRemotes", 60)
+		if remotes then remotes:WaitForChild("ShootEvent", 60) end
+		CW.State.shootHookRetrying = false
+		if not installShootHook() then
+			CW.Warn("GunRemotes.ShootEvent not found; hitmarker detection unavailable")
+		end
+	end)
 end
 end
 
@@ -1329,12 +1808,14 @@ if CW.IsFirstRun then
 		pcall(function() UserInputService.MouseIconEnabled=true end)
 		pcall(function() UserInputService.MouseIcon="" end)
 		pcall(function() CW.IAPortable:Destroy() end)
+		pcall(function() if CW.UIWindow then CW.UIWindow:Destroy() end end)
 		pcall(function() if CW.State.enforcerConn then CW.State.enforcerConn:Disconnect() end end)
 		pcall(function() if CW.State.enableConn   then CW.State.enableConn:Disconnect()   end end)
 		pcall(function() if CW.State.sprintCharacterConn then CW.State.sprintCharacterConn:Disconnect() end end)
 		pcall(function() if CW.State.chatToggleConn then CW.State.chatToggleConn:Disconnect() end end)
 		pcall(function() if CW.State.ammoGuiConn then CW.State.ammoGuiConn:Disconnect() end end)
 		pcall(function() if CW.State.ammoCharacterConn then CW.State.ammoCharacterConn:Disconnect() end end)
+		pcall(function() if CW.State.backpackMonitorConn then CW.State.backpackMonitorConn:Disconnect() end end)
 		pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
 		pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
 		pcall(function() if CW.State.stopWeaponShootSoundOverrides then CW.State.stopWeaponShootSoundOverrides() end end)
@@ -1350,248 +1831,237 @@ end
 
 
 do
+-- Sync.lua
+-- Runs independently of the UI: official assets are downloaded even if the UI fails to load,
+-- and everything that consumes assets is reloaded as soon as the download finishes.
+local CW = getgenv().__CW_CORE_STATE
+
+function CW.reloadCoreAssets()
+	CW.Paths.CURSOR_FILE = CW.Library.selectedPath("Cursors")
+	CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
+	CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
+
+	local reloaders = {
+		{ "hitmarker", CW.reloadHitmarkerAsset },
+		{ "cursor", CW.reloadCursor },
+		{ "textures", CW.reloadTextures },
+		{ "sound", CW.reloadSoundAsset },
+	}
+	for _, entry in ipairs(reloaders) do
+		if type(entry[2]) == "function" then
+			local ok, err = pcall(entry[2])
+			if not ok then
+				CW.Warn("Failed to reload " .. entry[1] .. ": " .. tostring(err))
+			end
+		end
+	end
+end
+
+CW.State.syncFinished = false
+CW.State.syncCallbacks = {}
+
+task.spawn(function()
+	local ok, result = pcall(CW.Library.sync)
+	if not ok then
+		CW.Warn("Asset sync failed: " .. tostring(result))
+	elseif not result then
+		CW.Warn("Asset sync incomplete; continuing with available local files")
+	end
+
+	local reloadOK, reloadError = pcall(CW.reloadCoreAssets)
+	if not reloadOK then CW.Warn("Core asset reload failed: " .. tostring(reloadError)) end
+
+	CW.State.syncFinished = true
+	local callbacks = CW.State.syncCallbacks
+	CW.State.syncCallbacks = {}
+	for _, callback in ipairs(callbacks) do
+		pcall(callback)
+	end
+end)
+end
+
+
+do
 -- UI.lua
 local uiOk, uiError = pcall(function()
 local CW = getgenv().__CW_CORE_STATE
 assert(CW, "CycleWare must be loaded before UI.lua")
 
+for key, value in pairs(CW._SavedSettings or {}) do
+	if key ~= "ASSET_SELECTIONS" and key ~= "SOUND_ID" and key ~= "AUTO_RELOAD_LABEL_PATH" then
+		local current = CW.Settings[key]
+		if current == nil or type(current) == type(value) then
+			CW.Settings[key] = value
+		end
+	end
+end
+
 local HttpService = game:GetService("HttpService")
 
-local Elastic = loadstring(game:HttpGet(
-	"https://raw.githubusercontent.com/53845052/roblox-uis/refs/heads/main/ElasticLib.lua"
-))()
-
-local Icons = {
-	Combat  = "rbxassetid://10734950020",
-	Visuals = "rbxassetid://10709790948",
-	Weapons = "rbxassetid://83313626819084",
-	Sounds  = "rbxassetid://10734896206",
-	Tracers = "rbxassetid://94654949230438",
-}
-
-Elastic:SetWindowKeybind(nil)
-
-local Window = Elastic:Window()
-
-local resolveAssetPath = CW.resolveAssetPath
-
-local function filenameOnly(fullPath)
-	return fullPath:match("([^/\\]+)$") or fullPath
+-- Runs one UI section in isolation so a failure in one tab doesn't take the others down.
+local function guarded(name, fn)
+	local ok, err = pcall(fn)
+	if not ok then CW.Warn("UI section '" .. name .. "' failed: " .. tostring(err)) end
+	return ok
 end
 
+-- Autosave (debounced). Assigned for real in the Settings section.
+local scheduleSave = function() end
 
-local EffectsTab = Window:Tab({
-	Title = "Effects",
-	Icon = Icons.Combat
-})
+local UI_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CWUI.lua"
+CW.Log("Downloading CycleWare UI from GitHub")
+local fetchOK, uiSource = pcall(function()
+	return game:HttpGet(UI_URL)
+end)
+assert(fetchOK and type(uiSource) == "string" and uiSource ~= "", "Could not download CycleWareUI.lua from GitHub: " .. tostring(uiSource))
+CW.Log("CycleWare UI source downloaded")
 
-local function applyHitmarkerFile(value)
-	local resolved = resolveAssetPath(value)
-	if resolved then
-		CW.Paths.HITMARKER_FILE = resolved
-		if CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
+local loadUI, compileError = loadstring(uiSource)
+assert(type(loadUI) == "function", tostring(compileError or "Could not compile CycleWareUI.lua"))
+local CWUI = loadUI()
+assert(type(CWUI) == "table" and type(CWUI.CreateWindow) == "function", "Invalid CycleWareUI library")
+
+if CW.UIWindow and type(CW.UIWindow.Destroy) == "function" then
+	pcall(function() CW.UIWindow:Destroy() end)
+end
+local Window = CWUI:CreateWindow({ Title = "CW", ToggleKey = false })
+CW.UIWindow = Window
+Window.ToggleVisibility = Window.Toggle
+
+local function mapControlOptions(options)
+	options = options or {}
+	return {
+		Name = options.Title or options.Name or options.Action,
+		Default = options.Default,
+		Min = options.Min,
+		Max = options.Max,
+		Increment = options.Increment or (options.Decimal and 10 ^ -options.Decimal),
+		Suffix = options.Suffix,
+		Placeholder = options.Placeholder,
+		Options = options.Options,
+		MaxHeight = options.MaxHeight,
+		Callback = options.Callback,
+	}
+end
+
+local function withSave(callback)
+	return function(...)
+		if callback then callback(...) end
+		scheduleSave()
 	end
 end
 
-local function applyHitmarkerSize(v)
-	CW.Settings.HITMARKER_SIZE = v
-
-	if CW.HMTemplate then
-		CW.HMTemplate.Size = UDim2.new(0, v, 0, v)
+local function wrapSection(section)
+	local adapter = {}
+	function adapter:Toggle(control)
+		local o = mapControlOptions(control)
+		o.Callback = withSave(o.Callback)
+		return section:AddToggle(o)
 	end
-end
-
-local function applyHitmarkerRandomRotation(s)
-	CW.Settings.HITMARKER_RANDOM_ROTATION = s
-end
-
-local function applyHitmarkerFollowMouse(s)
-	CW.Settings.HITMARKER_FOLLOW_MOUSE = s
-end
-
-local function applyHitmarkerVisibleDuration(v)
-	CW.Settings.HITMARKER_VISIBLE_DURATION = v
-end
-
-local function applyHitmarkerFadeout(s)
-	CW.Settings.HITMARKER_FADEOUT = s
-end
-
-local function applyHitmarkerFadeoutDuration(v)
-	CW.Settings.HITMARKER_FADEOUT_DURATION = v
-end
-
-EffectsTab:Textbox({
-	Title = "Hitmarker File",
-	Default = CW.Paths.HITMARKER_FILE,
-	Placeholder = filenameOnly(CW.Paths.HITMARKER_FILE),
-	Flag = "Hitmarker_FilePath",
-	Callback = applyHitmarkerFile,
-})
-
-EffectsTab:Slider({
-	Title = "Hitmarker Size",
-	Min = 8,
-	Max = 200,
-	Default = CW.Settings.HITMARKER_SIZE,
-	Suffix = "px",
-	Flag = "Hitmarker_Size",
-	Callback = applyHitmarkerSize,
-})
-
-EffectsTab:Toggle({
-	Title = "Random Rotation",
-	Default = CW.Settings.HITMARKER_RANDOM_ROTATION,
-	Flag = "Hitmarker_RandomRotation",
-	Callback = applyHitmarkerRandomRotation,
-})
-
-EffectsTab:Toggle({
-	Title = "Follow Mouse",
-	Default = CW.Settings.HITMARKER_FOLLOW_MOUSE,
-	Flag = "Hitmarker_FollowMouse",
-	Callback = applyHitmarkerFollowMouse,
-})
-
-EffectsTab:Slider({
-	Title = "Visible Duration",
-	Min = 0,
-	Max = 1,
-	Default = CW.Settings.HITMARKER_VISIBLE_DURATION,
-	Decimal = 2,
-	Suffix = "s",
-	Flag = "Hitmarker_VisibleDuration",
-	Callback = applyHitmarkerVisibleDuration,
-})
-
-EffectsTab:Toggle({
-	Title = "Fadeout",
-	Default = CW.Settings.HITMARKER_FADEOUT,
-	Flag = "Hitmarker_Fadeout",
-	Callback = applyHitmarkerFadeout,
-})
-
-EffectsTab:Slider({
-	Title = "Fadeout Duration",
-	Min = 0,
-	Max = 1,
-	Default = CW.Settings.HITMARKER_FADEOUT_DURATION,
-	Decimal = 2,
-	Suffix = "s",
-	Flag = "Hitmarker_FadeoutDuration",
-	Callback = applyHitmarkerFadeoutDuration,
-})
-
-local VisualsTab = Window:Tab({
-	Title = "Visuals",
-	Icon = Icons.Visuals
-})
-
-local function applyCursorFile(value)
-	local resolved = resolveAssetPath(value)
-	if resolved then
-		CW.Paths.CURSOR_FILE = resolved
-		if CW.reloadCursor then CW.reloadCursor() end
+	function adapter:Slider(control)
+		local o = mapControlOptions(control)
+		o.Callback = withSave(o.Callback)
+		return section:AddSlider(o)
 	end
+	function adapter:Dropdown(control)
+		local o = mapControlOptions(control)
+		o.Callback = withSave(o.Callback)
+		return section:AddDropdown(o)
+	end
+	function adapter:Gallery(control)
+		local o = {}
+		for key, value in pairs(control) do o[key] = value end
+		o.Callback = withSave(control.Callback)
+		return section:AddGallery(o)
+	end
+	function adapter:Button(control) return section:AddButton(mapControlOptions(control)) end
+	function adapter:AddLabel(text) return section:AddLabel(text) end
+	function adapter:AddSubSection(name, open)
+		return wrapSection(section:AddSubSection({ Name = name, Open = open == nil and true or open }))
+	end
+	return adapter
 end
 
-local cursorSizeDebounceThread = nil
+local function createCompatTab(options)
+	options = options or {}
+	local tabName = options.Title or options.Name or "Settings"
+	local tab = Window:AddTab({ Name = tabName })
+	return wrapSection(tab:AddSection({ Name = tabName, Open = true }))
+end
 
-local function applyCursorSize(v, skipDebounce)
-	CW.Settings.CURSOR_TARGET_SIZE = v
+Window.Tab = function(_, options) return createCompatTab(options) end
 
-	if cursorSizeDebounceThread then
-		task.cancel(cursorSizeDebounceThread)
-		cursorSizeDebounceThread = nil
+-- Gallery items come from CW.Library.list so paths are normalised the same way everywhere.
+local function galleryItems(category, weapon)
+	local items = {}
+	for _, item in ipairs(CW.Library.list(category, weapon)) do
+		table.insert(items, { Name = item.Name, Image = item.Path })
 	end
+	return items
+end
 
-	if skipDebounce then
-		if CW.reloadCursor then
-			CW.reloadCursor()
+local HitmarkerGallery, CursorGallery, HitSoundDropdown
+local textureGalleries = {}
+local weaponSoundDropdowns = {}
+
+------------------------------------------------------------------------------
+-- Hit sound catalog / weapon sound override logic (no UI here)
+------------------------------------------------------------------------------
+local hitSoundEntries = {}
+local availableHitSounds = {}
+
+local function refreshHitSoundCatalog()
+	table.clear(hitSoundEntries)
+	table.clear(availableHitSounds)
+	local options = {}
+	for _, item in ipairs(CW.Library.list("HitSounds")) do
+		local label = item.Relative:gsub("^HitSounds/", "")
+		item.Label = label
+		table.insert(hitSoundEntries, item)
+		availableHitSounds[item.Relative] = true
+		table.insert(options, label)
+	end
+	return options
+end
+
+local function hitSoundPath(value)
+	if type(value) ~= "string" then return nil end
+	for _, item in ipairs(hitSoundEntries) do
+		if value == item.Label or value == item.Path or value == item.Relative then
+			return item.Path
 		end
-
-		return
 	end
-
-	cursorSizeDebounceThread = task.delay(2, function()
-		cursorSizeDebounceThread = nil
-
-		if CW.reloadCursor then
-			CW.reloadCursor()
-		end
-	end)
+	local relative = CW.Library.relative(value) or value
+	if availableHitSounds[relative] then
+		return CW.Paths.LIBRARY_ROOT .. "/" .. relative
+	end
+	return nil
 end
 
-VisualsTab:Textbox({
-	Title = "Cursor File",
-	Default = CW.Paths.CURSOR_FILE,
-	Placeholder = filenameOnly(CW.Paths.CURSOR_FILE),
-	Flag = "Cursor_FilePath",
-	Callback = applyCursorFile,
-})
-
-VisualsTab:Slider({
-	Title = "Cursor Size",
-	Min = 16,
-	Max = 256,
-	Default = CW.Settings.CURSOR_TARGET_SIZE,
-	Suffix = "px",
-	Flag = "Cursor_Size",
-	Callback = function(v)
-		applyCursorSize(v, false)
-	end,
-})
-
-local function applyTextureFile(value)
-	local resolved = resolveAssetPath(value)
-	if resolved then
-		CW.Paths.TEXTURE_FILE = resolved
-		if CW.reloadTextures then CW.reloadTextures() end
+local function hitSoundLabel(value)
+	local path = hitSoundPath(value)
+	local relative = path and CW.Library.relative(path)
+	for _, item in ipairs(hitSoundEntries) do
+		if item.Relative == relative then return item.Label end
 	end
+	return nil
 end
 
-VisualsTab:Textbox({
-	Title = "Shared Weapon Texture",
-	Default = CW.Paths.TEXTURE_FILE,
-	Placeholder = filenameOnly(CW.Paths.TEXTURE_FILE),
-	Flag = "Texture_FilePath",
-	Callback = applyTextureFile,
-})
-local SoundsTab = Window:Tab({
-	Title = "Audio",
-	Icon = Icons.Sounds
-})
+-- Label for a saved relative path, even if the file isn't on disk yet (e.g. before the first sync).
+local function relativeLabel(relative)
+	if type(relative) ~= "string" then return nil end
+	return (relative:gsub("^HitSounds/", ""))
+end
 
 local function applySoundFile(value)
-	local resolved = resolveAssetPath(value)
-	if resolved then
-		CW.Paths.SOUND_FILE = resolved
-		if CW.reloadSoundAsset then CW.reloadSoundAsset() end
-	end
+	local path = hitSoundPath(value)
+	if not path then return end
+	CW.Paths.SOUND_FILE = path
+	CW.Library.setSelection("HitSounds", nil, CW.Library.relative(path))
+	if CW.reloadSoundAsset then CW.reloadSoundAsset() end
 end
 
-local function applySoundVolume(v)
-	CW.Settings.SOUND_VOLUME = v
-end
-
-SoundsTab:Textbox({
-	Title = "Hit Sound File",
-	Default = CW.Paths.SOUND_FILE,
-	Placeholder = filenameOnly(CW.Paths.SOUND_FILE),
-	Flag = "Sound_FilePath",
-	Callback = applySoundFile,
-})
-
-SoundsTab:Slider({
-	Title = "Hit Sound Volume",
-	Min = 0,
-	Max = 2,
-	Default = CW.Settings.SOUND_VOLUME,
-	Decimal = 2,
-	Suffix = "x",
-	Flag = "Sound_Volume",
-	Callback = applySoundVolume,
-})
+local hitSoundOptions = refreshHitSoundCatalog()
 
 local configuredWeaponSounds = CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES
 	or _cfg.WEAPON_SHOOT_SOUNDS
@@ -1615,6 +2085,11 @@ local weaponSoundPlayerConnections = {}
 local weaponSoundGlobalConnections = {}
 local weaponSoundRefreshScheduled = false
 local weaponSoundRefreshGeneration = 0
+
+-- Keep saved overrides even if the file isn't downloaded yet; only drop malformed values.
+for weapon, selectedPath in pairs(weaponSoundOverrides) do
+	if type(selectedPath) ~= "string" then weaponSoundOverrides[weapon] = nil end
+end
 
 local function disconnectList(connections)
 	for _, connection in ipairs(connections) do
@@ -1699,8 +2174,12 @@ local function applyWeaponSoundToTool(tool, player, container)
 	if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
 	if player ~= LocalPlayer and not CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS then return end
 
-	local targetId = weaponSoundOverrides[tool.Name]
-	if type(targetId) ~= "string" or targetId == "" then return end
+	local relativePath = weaponSoundOverrides[tool.Name]
+	if type(relativePath) ~= "string" then return end
+	local filePath = CW.Paths.LIBRARY_ROOT .. "/" .. relativePath
+	if not isfile(filePath) then return end
+	local loaded, targetId = pcall(getcustomasset, filePath)
+	if not loaded or type(targetId) ~= "string" then return end
 	for _, descendant in ipairs(tool:GetDescendants()) do
 		if descendant:IsA("Sound") and descendant.Name == "ShootSound" then
 			applyWeaponSound(descendant, targetId, tool, player, container)
@@ -1805,719 +2284,847 @@ local function scheduleWeaponShootSoundRefresh()
 	end)
 end
 
-local function normalizeWeaponSoundId(value)
-	local trimmed = tostring(value or ""):match("^%s*(.-)%s*$")
-	if trimmed == "" then return nil end
-	local digits = trimmed:match("^(%d+)$") or trimmed:match("^rbxassetid://(%d+)$")
-	if not digits or digits == "0" then return false end
-	return "rbxassetid://" .. digits
-end
-
-for weapon, soundId in pairs(weaponSoundOverrides) do
-	local normalizedId = normalizeWeaponSoundId(soundId)
-	weaponSoundOverrides[weapon] = normalizedId ~= false and normalizedId or nil
+local function normalizeWeaponSoundPath(value)
+	local path = hitSoundPath(value)
+	local relative = path and CW.Library.relative(path)
+	if type(relative) == "string" and availableHitSounds[relative] then return relative end
+	return nil
 end
 
 local function setWeaponShootSound(weapon, value)
-	local soundId = normalizeWeaponSoundId(value)
-	if soundId == false then
-		CW.Warn("Invalid sound asset ID for " .. weapon .. "; use a numeric ID or rbxassetid://<ID>.")
-		weaponSoundOverrides[weapon] = nil
-	else
-		weaponSoundOverrides[weapon] = soundId
+	local relative = normalizeWeaponSoundPath(value)
+	if not relative then
+		CW.Warn("Choose a sound file from the local HitSounds library for " .. weapon)
+		return
 	end
+	weaponSoundOverrides[weapon] = relative
 	scheduleWeaponShootSoundRefresh()
 end
 
-local function applyWeaponSoundOverridesEnabled(enabled)
-	CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED = enabled == true
-	scheduleWeaponShootSoundRefresh()
-end
+------------------------------------------------------------------------------
+-- Effects tab (hitmarker + tracers)
+------------------------------------------------------------------------------
+guarded("Effects", function()
+	local EffectsTab = Window:Tab({ Title = "Effects" })
 
-local function applyWeaponSoundOverridesToOthers(enabled)
-	CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS = enabled == true
-	scheduleWeaponShootSoundRefresh()
-end
+	local function applyHitmarkerFile(value)
+		if type(value) ~= "table" or type(value.Path) ~= "string" then return end
+		CW.Paths.HITMARKER_FILE = value.Path
+		CW.Library.setSelection("Hitmarkers", nil, CW.Library.relative(value.Path))
+		if CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
+	end
 
-SoundsTab:Toggle({
-	Title = "Enable Weapon Sound Overrides",
-	Default = CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED,
-	Flag = "WeaponSoundOverrides_Enabled",
-	Callback = applyWeaponSoundOverridesEnabled,
-})
+	HitmarkerGallery = EffectsTab:Gallery({
+		Name = "Hitmarker Library",
+		Items = galleryItems("Hitmarkers"),
+		Default = CW.Paths.HITMARKER_FILE,
+		LazyLoad = true,
+		Columns = 4,
+		MaxHeight = 260,
+		Callback = applyHitmarkerFile,
+	})
 
-SoundsTab:Toggle({
-	Title = "Apply to Other Players Locally",
-	Default = CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS,
-	Flag = "WeaponSoundOverrides_Others",
-	Callback = applyWeaponSoundOverridesToOthers,
-})
+	EffectsTab:Slider({
+		Title = "Hitmarker Size",
+		Min = 8,
+		Max = 200,
+		Default = CW.Settings.HITMARKER_SIZE,
+		Suffix = "px",
+		Flag = "Hitmarker_Size",
+		Callback = function(v)
+			CW.Settings.HITMARKER_SIZE = v
+			if CW.HMTemplate then
+				CW.HMTemplate.Size = UDim2.new(0, v, 0, v)
+			end
+		end,
+	})
 
-if CW.WeaponList then
-	for _, weaponName in ipairs(CW.WeaponList) do
+	EffectsTab:Toggle({
+		Title = "Random Rotation",
+		Default = CW.Settings.HITMARKER_RANDOM_ROTATION,
+		Flag = "Hitmarker_RandomRotation",
+		Callback = function(s) CW.Settings.HITMARKER_RANDOM_ROTATION = s end,
+	})
+
+	EffectsTab:Toggle({
+		Title = "Follow Mouse",
+		Default = CW.Settings.HITMARKER_FOLLOW_MOUSE,
+		Flag = "Hitmarker_FollowMouse",
+		Callback = function(s) CW.Settings.HITMARKER_FOLLOW_MOUSE = s end,
+	})
+
+	EffectsTab:Slider({
+		Title = "Visible Duration",
+		Min = 0,
+		Max = 1,
+		Default = CW.Settings.HITMARKER_VISIBLE_DURATION,
+		Decimal = 2,
+		Suffix = "s",
+		Flag = "Hitmarker_VisibleDuration",
+		Callback = function(v) CW.Settings.HITMARKER_VISIBLE_DURATION = v end,
+	})
+
+	EffectsTab:Toggle({
+		Title = "Fadeout",
+		Default = CW.Settings.HITMARKER_FADEOUT,
+		Flag = "Hitmarker_Fadeout",
+		Callback = function(s) CW.Settings.HITMARKER_FADEOUT = s end,
+	})
+
+	EffectsTab:Slider({
+		Title = "Fadeout Duration",
+		Min = 0,
+		Max = 1,
+		Default = CW.Settings.HITMARKER_FADEOUT_DURATION,
+		Decimal = 2,
+		Suffix = "s",
+		Flag = "Hitmarker_FadeoutDuration",
+		Callback = function(v) CW.Settings.HITMARKER_FADEOUT_DURATION = v end,
+	})
+
+	-- Tracers
+	local tracerPalette = {
+		Violet = Color3.fromRGB(170, 0, 255),
+		Lilac = Color3.fromRGB(200, 100, 255),
+		Red = Color3.fromRGB(255, 64, 64),
+		Green = Color3.fromRGB(64, 220, 96),
+		Cyan = Color3.fromRGB(64, 210, 255),
+		White = Color3.fromRGB(255, 255, 255),
+	}
+
+	local function colorName(color)
+		for name, paletteColor in pairs(tracerPalette) do
+			if color == paletteColor then return name end
+		end
+		return "Violet"
+	end
+	CW.State.tracerColorName = colorName
+
+	-- Colors are userdata and can't be serialised: they are saved by palette name.
+	local savedColor = tracerPalette[CW.Settings.TRACER_COLOR_NAME]
+	if savedColor then CW.Settings.TRACER_COLOR = savedColor end
+	local savedGlow = tracerPalette[CW.Settings.TRACER_GLOW_COLOR_NAME]
+	if savedGlow then CW.Settings.TRACER_GLOW_COLOR = savedGlow end
+
+	EffectsTab:Toggle({
+		Title = "Custom Bullet Tracers",
+		Default = CW.Settings.CUSTOM_BULLET_TRACERS,
+		Flag = "Tracer_Enabled",
+		Callback = function(s) CW.Settings.CUSTOM_BULLET_TRACERS = s end,
+	})
+
+	EffectsTab:Dropdown({
+		Title = "Tracer Color",
+		Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
+		Default = colorName(CW.Settings.TRACER_COLOR),
+		Callback = function(name)
+			CW.Settings.TRACER_COLOR = tracerPalette[name]
+		end,
+	})
+
+	EffectsTab:Dropdown({
+		Title = "Glow Color",
+		Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
+		Default = colorName(CW.Settings.TRACER_GLOW_COLOR),
+		Callback = function(name)
+			CW.Settings.TRACER_GLOW_COLOR = tracerPalette[name]
+		end,
+	})
+
+	EffectsTab:Slider({
+		Title = "Tracer Width",
+		Min = 0.01,
+		Max = 0.5,
+		Default = CW.Settings.TRACER_WIDTH,
+		Decimal = 2,
+		Flag = "Tracer_Width",
+		Callback = function(v) CW.Settings.TRACER_WIDTH = v end,
+	})
+
+	EffectsTab:Slider({
+		Title = "Tracer Lifetime",
+		Min = 0.01,
+		Max = 1,
+		Default = CW.Settings.TRACER_LIFETIME,
+		Decimal = 2,
+		Suffix = "s",
+		Flag = "Tracer_Lifetime",
+		Callback = function(v) CW.Settings.TRACER_LIFETIME = v end,
+	})
+
+	EffectsTab:Toggle({
+		Title = "Apply To Others",
+		Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
+		Flag = "Tracer_ApplyToOthers",
+		Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
+	})
+end)
+
+------------------------------------------------------------------------------
+-- Visuals tab (cursor + weapon textures)
+------------------------------------------------------------------------------
+guarded("Visuals", function()
+	local VisualsTab = Window:Tab({ Title = "Visuals" })
+
+	local function applyCursorFile(value)
+		if type(value) ~= "table" or type(value.Path) ~= "string" then return end
+		CW.Paths.CURSOR_FILE = value.Path
+		CW.Library.setSelection("Cursors", nil, CW.Library.relative(value.Path))
+		if CW.reloadCursor then CW.reloadCursor() end
+	end
+
+	local cursorSizeDebounceThread = nil
+
+	local function applyCursorSize(v)
+		CW.Settings.CURSOR_TARGET_SIZE = v
+
+		if cursorSizeDebounceThread then
+			task.cancel(cursorSizeDebounceThread)
+			cursorSizeDebounceThread = nil
+		end
+
+		cursorSizeDebounceThread = task.delay(2, function()
+			cursorSizeDebounceThread = nil
+			if CW.reloadCursor then CW.reloadCursor() end
+		end)
+	end
+
+	CursorGallery = VisualsTab:Gallery({
+		Name = "Cursor Library",
+		Items = galleryItems("Cursors"),
+		Default = CW.Paths.CURSOR_FILE,
+		LazyLoad = true,
+		Columns = 4,
+		MaxHeight = 260,
+		Callback = applyCursorFile,
+	})
+
+	VisualsTab:Slider({
+		Title = "Cursor Size",
+		Min = 16,
+		Max = 256,
+		Default = CW.Settings.CURSOR_TARGET_SIZE,
+		Suffix = "px",
+		Flag = "Cursor_Size",
+		Callback = applyCursorSize,
+	})
+
+	for _, weaponName in ipairs(CW.WeaponList or {}) do
 		local weapon = weaponName
-		local key = CW.normalizeTextureKey and CW.normalizeTextureKey(weapon)
-			or weapon:lower():gsub("%W", "")
-		SoundsTab:Textbox({
+		local weaponSection = VisualsTab:AddSubSection(weapon, false)
+		local selectedPath = CW.Library.selectedPath("Textures", weapon)
+		local gallery = weaponSection:Gallery({
+			Name = weapon .. " Textures",
+			Items = galleryItems("Textures", weapon),
+			Default = selectedPath,
+			AllowDeselect = true,
+			LazyLoad = true,
+			Columns = 4,
+			MaxHeight = 260,
+			Callback = function(item)
+				CW.Library.setSelection("Textures", weapon,
+					type(item) == "table" and CW.Library.relative(item.Path) or nil)
+				if CW.reloadTextures then CW.reloadTextures() end
+			end,
+		})
+		table.insert(textureGalleries, { weapon = weapon, gallery = gallery })
+	end
+end)
+
+------------------------------------------------------------------------------
+-- Hit Sound tab
+------------------------------------------------------------------------------
+guarded("Hit Sound", function()
+	local HitSoundsTab = Window:Tab({ Title = "Hit Sound" })
+
+	HitSoundDropdown = HitSoundsTab:Dropdown({
+		Title = "Hit Sound",
+		Options = hitSoundOptions,
+		Default = hitSoundLabel(CW.Paths.SOUND_FILE),
+		Callback = applySoundFile,
+	})
+
+	HitSoundsTab:Slider({
+		Title = "Hit Sound Volume",
+		Min = 0,
+		Max = 2,
+		Default = CW.Settings.SOUND_VOLUME,
+		Decimal = 2,
+		Suffix = "x",
+		Flag = "Sound_Volume",
+		Callback = function(v) CW.Settings.SOUND_VOLUME = v end,
+	})
+end)
+
+------------------------------------------------------------------------------
+-- Weapon Sounds tab
+------------------------------------------------------------------------------
+guarded("Weapon Sounds", function()
+	local WeaponSoundsTab = Window:Tab({ Title = "Weapon Sounds" })
+
+	WeaponSoundsTab:Toggle({
+		Title = "Enable Weapon Sound Overrides",
+		Default = CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED,
+		Flag = "WeaponSoundOverrides_Enabled",
+		Callback = function(enabled)
+			CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED = enabled == true
+			scheduleWeaponShootSoundRefresh()
+		end,
+	})
+
+	WeaponSoundsTab:Toggle({
+		Title = "Apply to Other Players Locally",
+		Default = CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS,
+		Flag = "WeaponSoundOverrides_Others",
+		Callback = function(enabled)
+			CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS = enabled == true
+			scheduleWeaponShootSoundRefresh()
+		end,
+	})
+
+	for _, weaponName in ipairs(CW.WeaponList or {}) do
+		local weapon = weaponName
+		local dropdown = WeaponSoundsTab:Dropdown({
 			Title = weapon .. " Shoot Sound",
-			Default = weaponSoundOverrides[weapon] or "",
-			Placeholder = "Sound ID or rbxassetid://<ID>",
-			Flag = "WeaponShootSound_" .. key,
+			Options = hitSoundOptions,
+			Default = relativeLabel(weaponSoundOverrides[weapon]),
 			Callback = function(value)
 				setWeaponShootSound(weapon, value)
 			end,
 		})
+		table.insert(weaponSoundDropdowns, { weapon = weapon, control = dropdown })
 	end
-end
+end)
 
-local TracersTab = EffectsTab
+------------------------------------------------------------------------------
+-- Utilities tab
+------------------------------------------------------------------------------
+guarded("Utilities", function()
+	local UtilityTab = Window:Tab({ Title = "Utilities" })
 
-local function applyTracerEnabled(s)
-	CW.Settings.CUSTOM_BULLET_TRACERS = s
-end
+	local StarterGui = game:GetService("StarterGui")
+	local ContextActionService = game:GetService("ContextActionService")
+	local chatHidden = false
+	local sprinting = false
+	local allowSprintRelease = false
+	local heldShiftKeys = {}
 
-local function applyTracerColor(color)
-	CW.Settings.TRACER_COLOR = color
-end
+	local function onSprintShift(_, inputState, inputObject)
+		local keyCode = inputObject and inputObject.KeyCode
 
-local function applyTracerGlowColor(color)
-	CW.Settings.TRACER_GLOW_COLOR = color
-end
+		if inputState == Enum.UserInputState.Begin then
+			if keyCode and heldShiftKeys[keyCode] then
+				return Enum.ContextActionResult.Pass
+			end
 
-local function applyTracerWidth(v)
-	CW.Settings.TRACER_WIDTH = v
-end
+			local anotherShiftHeld = next(heldShiftKeys) ~= nil
+			if keyCode then heldShiftKeys[keyCode] = true end
+			if anotherShiftHeld or not CW.Settings.SHIFT_TOGGLE_ENABLED then
+				return Enum.ContextActionResult.Pass
+			end
 
-local function applyTracerLifetime(v)
-	CW.Settings.TRACER_LIFETIME = v
-end
-
-local function applyTracerApplyToOthers(s)
-	CW.Settings.TRACER_APPLY_TO_OTHERS = s
-end
-
-TracersTab:Toggle({
-	Title = "Custom Bullet Tracers",
-	Default = CW.Settings.CUSTOM_BULLET_TRACERS,
-	Flag = "Tracer_Enabled",
-	Callback = applyTracerEnabled,
-}):Colorpicker({
-	Default = CW.Settings.TRACER_COLOR,
-	Flag = "Tracer_Color",
-	Callback = applyTracerColor,
-})
-
-TracersTab:Colorpicker({
-	Title = "Glow Color",
-	Default = CW.Settings.TRACER_GLOW_COLOR,
-	Flag = "Tracer_GlowColor",
-	Callback = applyTracerGlowColor,
-})
-
-TracersTab:Slider({
-	Title = "Tracer Width",
-	Min = 0.01,
-	Max = 0.5,
-	Default = CW.Settings.TRACER_WIDTH,
-	Decimal = 2,
-	Flag = "Tracer_Width",
-	Callback = applyTracerWidth,
-})
-
-TracersTab:Slider({
-	Title = "Tracer Lifetime",
-	Min = 0.01,
-	Max = 1,
-	Default = CW.Settings.TRACER_LIFETIME,
-	Decimal = 2,
-	Suffix = "s",
-	Flag = "Tracer_Lifetime",
-	Callback = applyTracerLifetime,
-})
-
-TracersTab:Toggle({
-	Title = "Apply To Others",
-	Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
-	Flag = "Tracer_ApplyToOthers",
-	Callback = applyTracerApplyToOthers,
-})
-
-local UtilityTab = Window:Tab({
-	Title = "Utilities",
-	Icon = Icons.Visuals,
-})
-
-local StarterGui = game:GetService("StarterGui")
-local ContextActionService = game:GetService("ContextActionService")
-local chatHidden = false
-local sprinting = false
-local allowSprintRelease = false
-local heldShiftKeys = {}
-
-local function onSprintShift(_, inputState, inputObject)
-	local keyCode = inputObject and inputObject.KeyCode
-
-	if inputState == Enum.UserInputState.Begin then
-		if keyCode and heldShiftKeys[keyCode] then
+			if sprinting then
+				sprinting = false
+				allowSprintRelease = true
+			else
+				sprinting = true
+				allowSprintRelease = false
+			end
 			return Enum.ContextActionResult.Pass
 		end
 
-		local anotherShiftHeld = next(heldShiftKeys) ~= nil
-		if keyCode then heldShiftKeys[keyCode] = true end
-		if anotherShiftHeld or not CW.Settings.SHIFT_TOGGLE_ENABLED then
-			return Enum.ContextActionResult.Pass
+		if inputState == Enum.UserInputState.End or inputState == Enum.UserInputState.Cancel then
+			if keyCode then heldShiftKeys[keyCode] = nil end
+
+			if not CW.Settings.SHIFT_TOGGLE_ENABLED then
+				allowSprintRelease = false
+				return Enum.ContextActionResult.Pass
+			end
+
+			if allowSprintRelease then
+				allowSprintRelease = false
+				return Enum.ContextActionResult.Pass
+			elseif sprinting then
+				return Enum.ContextActionResult.Sink
+			end
+		end
+
+		return Enum.ContextActionResult.Pass
+	end
+
+	ContextActionService:UnbindAction("CycleWareSprintToggle")
+	ContextActionService:BindActionAtPriority(
+		"CycleWareSprintToggle",
+		onSprintShift,
+		false,
+		Enum.ContextActionPriority.High.Value,
+		Enum.KeyCode.LeftShift
+	)
+
+	local function onRightShiftAction(_, inputState)
+		if inputState == Enum.UserInputState.Begin then
+			Window:ToggleVisibility()
 		end
 
 		if sprinting then
-			sprinting = false
-			allowSprintRelease = true
-		else
-			sprinting = true
-			allowSprintRelease = false
+			return Enum.ContextActionResult.Sink
 		end
 		return Enum.ContextActionResult.Pass
 	end
 
-	if inputState == Enum.UserInputState.End or inputState == Enum.UserInputState.Cancel then
-		if keyCode then heldShiftKeys[keyCode] = nil end
+	ContextActionService:UnbindAction("CycleWareProtectSprint")
+	ContextActionService:BindActionAtPriority(
+		"CycleWareProtectSprint",
+		onRightShiftAction,
+		false,
+		Enum.ContextActionPriority.High.Value + 1,
+		Enum.KeyCode.RightShift
+	)
 
-		if not CW.Settings.SHIFT_TOGGLE_ENABLED then
-			allowSprintRelease = false
-			return Enum.ContextActionResult.Pass
-		end
-
-		if allowSprintRelease then
-			allowSprintRelease = false
-			return Enum.ContextActionResult.Pass
-		elseif sprinting then
-			return Enum.ContextActionResult.Sink
-		end
+	if CW.State.sprintCharacterConn then
+		CW.State.sprintCharacterConn:Disconnect()
 	end
-
-	return Enum.ContextActionResult.Pass
-end
-
-ContextActionService:UnbindAction("CycleWareSprintToggle")
-ContextActionService:BindActionAtPriority(
-	"CycleWareSprintToggle",
-	onSprintShift,
-	false,
-	Enum.ContextActionPriority.High.Value,
-	Enum.KeyCode.LeftShift
-)
-
-local function onRightShiftAction(_, inputState)
-	if inputState == Enum.UserInputState.Begin then
-		Window:ToggleVisibility()
-	end
-
-	if sprinting then
-		return Enum.ContextActionResult.Sink
-	end
-	return Enum.ContextActionResult.Pass
-end
-
-ContextActionService:UnbindAction("CycleWareProtectSprint")
-ContextActionService:BindActionAtPriority(
-	"CycleWareProtectSprint",
-	onRightShiftAction,
-	false,
-	Enum.ContextActionPriority.High.Value + 1,
-	Enum.KeyCode.RightShift
-)
-
-if CW.State.sprintCharacterConn then
-	CW.State.sprintCharacterConn:Disconnect()
-end
-CW.State.sprintCharacterConn = LocalPlayer.CharacterAdded:Connect(function()
-	sprinting = false
-	allowSprintRelease = false
-	table.clear(heldShiftKeys)
-end)
-
-local function applySprintToggle(enabled)
-	CW.Settings.SHIFT_TOGGLE_ENABLED = enabled == true
-	if not CW.Settings.SHIFT_TOGGLE_ENABLED then
-		allowSprintRelease = sprinting or allowSprintRelease
+	CW.State.sprintCharacterConn = LocalPlayer.CharacterAdded:Connect(function()
 		sprinting = false
-	end
-end
-
-UtilityTab:Toggle({
-	Title = "Toggle Sprint with Shift",
-	Default = CW.Settings.SHIFT_TOGGLE_ENABLED == true,
-	Flag = "Sprint_ToggleEnabled",
-	Callback = applySprintToggle,
-})
-
-local function setChatVisible(visible)
-	pcall(function()
-		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, visible)
+		allowSprintRelease = false
+		table.clear(heldShiftKeys)
 	end)
-	pcall(function()
-		StarterGui:SetCore("ChatActive", visible)
-	end)
-end
 
-task.spawn(function()
-	if not game:IsLoaded() then
-		game.Loaded:Wait()
-	end
-	setChatVisible(true)
-end)
-
-local function applyChatToggle(enabled)
-	CW.Settings.CHAT_TOGGLE_ENABLED = enabled == true
-	if not CW.Settings.CHAT_TOGGLE_ENABLED then
-		chatHidden = false
-		setChatVisible(true)
-	end
-end
-
-if CW.State.chatToggleConn then
-	CW.State.chatToggleConn:Disconnect()
-end
-CW.State.chatToggleConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed or not CW.Settings.CHAT_TOGGLE_ENABLED then return end
-	if input.KeyCode ~= Enum.KeyCode.Z then return end
-
-	chatHidden = not chatHidden
-	setChatVisible(not chatHidden)
-end)
-
-UtilityTab:Toggle({
-	Title = "Toggle Chat with Z",
-	Default = CW.Settings.CHAT_TOGGLE_ENABLED == true,
-	Flag = "Chat_ToggleEnabled",
-	Callback = applyChatToggle,
-})
-
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-local VirtualInputManager
-pcall(function()
-	VirtualInputManager = game:GetService("VirtualInputManager")
-end)
-
-local AMMO_LABEL_PATH = "Home.hud.BottomRightFrame.GunFrame.BulletsLabel"
-CW.Settings.AUTO_RELOAD_LABEL_PATH = AMMO_LABEL_PATH
-if CW.Settings.AUTO_RELOAD_ENABLED == nil then
-	CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED ~= false
-end
-
-if CW.State.clearAmmoLabelWatchers then
-	CW.State.clearAmmoLabelWatchers(true)
-end
-
-local ammoLabelConnections = {}
-local ammoLabelStates = setmetatable({}, { __mode = "k" })
-local autoReloadWarned = false
-local autoReloadLabelWarned = false
-local ammoScanGeneration = 0
-local rebuildAmmoLabelWatchers
-
-local function clearAmmoLabelWatchers(resetStates)
-	for _, connection in pairs(ammoLabelConnections) do
-		connection:Disconnect()
-	end
-	table.clear(ammoLabelConnections)
-	if resetStates then
-		table.clear(ammoLabelStates)
-	end
-end
-CW.State.clearAmmoLabelWatchers = clearAmmoLabelWatchers
-
-local function parseAmmoText(text)
-	local current, capacity = tostring(text):match("^%s*(%d+)%s*/%s*(%d+)%s*$")
-	return tonumber(current), tonumber(capacity)
-end
-
-local function isTextGui(instance)
-	return instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")
-end
-
-local function isNamedAmmoLabel(instance)
-	local name = instance.Name:lower()
-	return name:find("ammo", 1, true) ~= nil
-		or name:find("magazine", 1, true) ~= nil
-		or name:find("magcount", 1, true) ~= nil
-		or name:find("clipammo", 1, true) ~= nil
-		or name:find("bullet", 1, true) ~= nil
-end
-
-local function findConfiguredAmmoLabel()
-	local current = PlayerGui
-	for part in AMMO_LABEL_PATH:gmatch("[^%.]+") do
-		current = current and current:FindFirstChild(part)
-	end
-
-	if current and isTextGui(current) then return current end
-	return nil
-end
-
-local function findAmmoLabels()
-	local configured = findConfiguredAmmoLabel()
-	if configured then return { configured } end
-
-	local namedLabels = {}
-	local fractionLabels = {}
-	for _, instance in ipairs(PlayerGui:GetDescendants()) do
-		if isTextGui(instance) then
-			if isNamedAmmoLabel(instance) then
-				table.insert(namedLabels, instance)
-			elseif parseAmmoText(instance.Text) then
-				table.insert(fractionLabels, instance)
+	UtilityTab:Toggle({
+		Title = "Toggle Sprint with Shift",
+		Default = CW.Settings.SHIFT_TOGGLE_ENABLED == true,
+		Flag = "Sprint_ToggleEnabled",
+		Callback = function(enabled)
+			CW.Settings.SHIFT_TOGGLE_ENABLED = enabled == true
+			if not CW.Settings.SHIFT_TOGGLE_ENABLED then
+				allowSprintRelease = sprinting or allowSprintRelease
+				sprinting = false
 			end
-		end
-	end
+		end,
+	})
 
-	if #namedLabels == 1 then return namedLabels end
-	if #namedLabels > 1 then return {} end
-	if #fractionLabels == 1 then return fractionLabels end
-	return {}
-end
-
-local function pressReloadKey()
-	if VirtualInputManager then
-		local pressed = pcall(function()
-			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+	local function setChatVisible(visible)
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, visible)
 		end)
-		if pressed then
-			task.wait(0.02)
-			local released, releaseError = pcall(function()
-				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-			end)
-			if released then return true end
-			if not autoReloadWarned then
-				autoReloadWarned = true
-				CW.Warn("Auto Reload could not release the R key: " .. tostring(releaseError))
-			end
-			return false
-		end
+		pcall(function()
+			StarterGui:SetCore("ChatActive", visible)
+		end)
 	end
-
-	if type(keypress) == "function" and type(keyrelease) == "function" then
-		local pressed = pcall(keypress, 0x52)
-		if pressed then
-			task.wait(0.02)
-			local released, releaseError = pcall(keyrelease, 0x52)
-			if released then return true end
-			if not autoReloadWarned then
-				autoReloadWarned = true
-				CW.Warn("Auto Reload could not release the R key: " .. tostring(releaseError))
-			end
-			return false
-		end
-	end
-
-	if type(keytap) == "function" then
-		local ok = pcall(keytap, 0x52)
-		if ok then return true end
-	end
-	if type(keystroke) == "function" then
-		local ok = pcall(keystroke, 0x52)
-		if ok then return true end
-	end
-
-	if not autoReloadWarned then
-		autoReloadWarned = true
-		CW.Warn("Auto Reload requires VirtualInputManager or an executor key input function.")
-	end
-	return false
-end
-
-local function attemptReload(label)
-	if not CW.Settings.AUTO_RELOAD_ENABLED or UserInputService:GetFocusedTextBox() then return end
-	if UserInputService:IsKeyDown(Enum.KeyCode.R) then return end
-	local character = LocalPlayer.Character
-	if not character or not character:FindFirstChildOfClass("Tool") then return end
-
-	local state = ammoLabelStates[label]
-	local now = os.clock()
-	if state and now - state.lastReload < 0.3 then return end
-	state = state or { lastReload = 0 }
-	state.lastReload = now
-	ammoLabelStates[label] = state
 
 	task.spawn(function()
-		if not pressReloadKey() then return end
-		task.wait(0.15)
-		if not CW.Settings.AUTO_RELOAD_ENABLED or not label.Parent then return end
-		if UserInputService:GetFocusedTextBox() then return end
-		local current = parseAmmoText(label.Text)
-		if current == 0 then
-			pressReloadKey()
+		if not game:IsLoaded() then
+			game.Loaded:Wait()
 		end
+		setChatVisible(true)
 	end)
-end
 
-local function onAmmoLabelChanged(label)
-	if not CW.Settings.AUTO_RELOAD_ENABLED then return end
-	local current, capacity = parseAmmoText(label.Text)
-	if current == nil or capacity == nil then return end
+	if CW.State.chatToggleConn then
+		CW.State.chatToggleConn:Disconnect()
+	end
+	CW.State.chatToggleConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed or not CW.Settings.CHAT_TOGGLE_ENABLED then return end
+		if input.KeyCode ~= Enum.KeyCode.Z then return end
 
-	local state = ammoLabelStates[label]
-	if not state or state.capacity ~= capacity then
-		state = { capacity = capacity, lastReload = 0 }
-		ammoLabelStates[label] = state
+		chatHidden = not chatHidden
+		setChatVisible(not chatHidden)
+	end)
+
+	UtilityTab:Toggle({
+		Title = "Toggle Chat with Z",
+		Default = CW.Settings.CHAT_TOGGLE_ENABLED == true,
+		Flag = "Chat_ToggleEnabled",
+		Callback = function(enabled)
+			CW.Settings.CHAT_TOGGLE_ENABLED = enabled == true
+			if not CW.Settings.CHAT_TOGGLE_ENABLED then
+				chatHidden = false
+				setChatVisible(true)
+			end
+		end,
+	})
+
+	-- Auto reload
+	local PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		or LocalPlayer:WaitForChild("PlayerGui", 5)
+	assert(PlayerGui, "PlayerGui did not become available within 5 seconds")
+	local VirtualInputManager
+	pcall(function()
+		VirtualInputManager = game:GetService("VirtualInputManager")
+	end)
+
+	local AMMO_LABEL_PATH = "Home.hud.BottomRightFrame.GunFrame.BulletsLabel"
+	CW.Settings.AUTO_RELOAD_LABEL_PATH = AMMO_LABEL_PATH
+	if CW.Settings.AUTO_RELOAD_ENABLED == nil then
+		CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED ~= false
 	end
 
-	if current == 0 then
-		attemptReload(label)
-	else
-		state.lastReload = 0
+	if CW.State.clearAmmoLabelWatchers then
+		CW.State.clearAmmoLabelWatchers(true)
 	end
-end
 
-rebuildAmmoLabelWatchers = function()
-	clearAmmoLabelWatchers()
-	ammoScanGeneration = ammoScanGeneration + 1
-	local generation = ammoScanGeneration
-	if not CW.Settings.AUTO_RELOAD_ENABLED then return end
+	local ammoLabelConnections = {}
+	local ammoLabelStates = setmetatable({}, { __mode = "k" })
+	local autoReloadWarned = false
+	local autoReloadLabelWarned = false
+	local ammoScanGeneration = 0
+	local rebuildAmmoLabelWatchers
 
-	task.spawn(function()
-		for _ = 1, 20 do
-			if generation ~= ammoScanGeneration or not CW.Settings.AUTO_RELOAD_ENABLED then return end
+	local function clearAmmoLabelWatchers(resetStates)
+		for _, connection in pairs(ammoLabelConnections) do
+			connection:Disconnect()
+		end
+		table.clear(ammoLabelConnections)
+		if resetStates then
+			table.clear(ammoLabelStates)
+		end
+	end
+	CW.State.clearAmmoLabelWatchers = clearAmmoLabelWatchers
 
-			local labels = findAmmoLabels()
-			if #labels > 0 then
-				autoReloadLabelWarned = false
-				for _, label in ipairs(labels) do
-					ammoLabelConnections[label] = label:GetPropertyChangedSignal("Text"):Connect(function()
-						onAmmoLabelChanged(label)
-					end)
-					onAmmoLabelChanged(label)
+	local function parseAmmoText(text)
+		local current, capacity = tostring(text):match("^%s*(%d+)%s*/%s*(%d+)%s*$")
+		return tonumber(current), tonumber(capacity)
+	end
+
+	local function isTextGui(instance)
+		return instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")
+	end
+
+	local function isNamedAmmoLabel(instance)
+		local name = instance.Name:lower()
+		return name:find("ammo", 1, true) ~= nil
+			or name:find("magazine", 1, true) ~= nil
+			or name:find("magcount", 1, true) ~= nil
+			or name:find("clipammo", 1, true) ~= nil
+			or name:find("bullet", 1, true) ~= nil
+	end
+
+	local function findConfiguredAmmoLabel()
+		local current = PlayerGui
+		for part in AMMO_LABEL_PATH:gmatch("[^%.]+") do
+			current = current and current:FindFirstChild(part)
+		end
+
+		if current and isTextGui(current) then return current end
+		return nil
+	end
+
+	local function findAmmoLabels()
+		local configured = findConfiguredAmmoLabel()
+		if configured then return { configured } end
+
+		local namedLabels = {}
+		local fractionLabels = {}
+		for _, instance in ipairs(PlayerGui:GetDescendants()) do
+			if isTextGui(instance) then
+				if isNamedAmmoLabel(instance) then
+					table.insert(namedLabels, instance)
+				elseif parseAmmoText(instance.Text) then
+					table.insert(fractionLabels, instance)
 				end
-				return
+			end
+		end
+
+		if #namedLabels == 1 then return namedLabels end
+		if #namedLabels > 1 then return {} end
+		if #fractionLabels == 1 then return fractionLabels end
+		return {}
+	end
+
+	local function pressReloadKey()
+		if VirtualInputManager then
+			local pressed = pcall(function()
+				VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+			end)
+			if pressed then
+				task.wait(0.02)
+				local released, releaseError = pcall(function()
+					VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+				end)
+				if released then return true end
+				if not autoReloadWarned then
+					autoReloadWarned = true
+					CW.Warn("Auto Reload could not release the R key: " .. tostring(releaseError))
+				end
+				return false
+			end
+		end
+
+		if type(keypress) == "function" and type(keyrelease) == "function" then
+			local pressed = pcall(keypress, 0x52)
+			if pressed then
+				task.wait(0.02)
+				local released, releaseError = pcall(keyrelease, 0x52)
+				if released then return true end
+				if not autoReloadWarned then
+					autoReloadWarned = true
+					CW.Warn("Auto Reload could not release the R key: " .. tostring(releaseError))
+				end
+				return false
+			end
+		end
+
+		if type(keytap) == "function" then
+			local ok = pcall(keytap, 0x52)
+			if ok then return true end
+		end
+		if type(keystroke) == "function" then
+			local ok = pcall(keystroke, 0x52)
+			if ok then return true end
+		end
+
+		if not autoReloadWarned then
+			autoReloadWarned = true
+			CW.Warn("Auto Reload requires VirtualInputManager or an executor key input function.")
+		end
+		return false
+	end
+
+	local function attemptReload(label)
+		if not CW.Settings.AUTO_RELOAD_ENABLED or UserInputService:GetFocusedTextBox() then return end
+		if UserInputService:IsKeyDown(Enum.KeyCode.R) then return end
+		local character = LocalPlayer.Character
+		if not character or not character:FindFirstChildOfClass("Tool") then return end
+
+		local state = ammoLabelStates[label]
+		local now = os.clock()
+		if state and now - state.lastReload < 0.3 then return end
+		state = state or { lastReload = 0 }
+		state.lastReload = now
+		ammoLabelStates[label] = state
+
+		task.spawn(function()
+			if not pressReloadKey() then return end
+			task.wait(0.15)
+			if not CW.Settings.AUTO_RELOAD_ENABLED or not label.Parent then return end
+			if UserInputService:GetFocusedTextBox() then return end
+			local current = parseAmmoText(label.Text)
+			if current == 0 then
+				pressReloadKey()
+			end
+		end)
+	end
+
+	local function onAmmoLabelChanged(label)
+		if not CW.Settings.AUTO_RELOAD_ENABLED then return end
+		local current, capacity = parseAmmoText(label.Text)
+		if current == nil or capacity == nil then return end
+
+		local state = ammoLabelStates[label]
+		if not state or state.capacity ~= capacity then
+			state = { capacity = capacity, lastReload = 0 }
+			ammoLabelStates[label] = state
+		end
+
+		if current == 0 then
+			attemptReload(label)
+		else
+			state.lastReload = 0
+		end
+	end
+
+	rebuildAmmoLabelWatchers = function()
+		clearAmmoLabelWatchers()
+		ammoScanGeneration = ammoScanGeneration + 1
+		local generation = ammoScanGeneration
+		if not CW.Settings.AUTO_RELOAD_ENABLED then return end
+
+		task.spawn(function()
+			for _ = 1, 20 do
+				if generation ~= ammoScanGeneration or not CW.Settings.AUTO_RELOAD_ENABLED then return end
+
+				local labels = findAmmoLabels()
+				if #labels > 0 then
+					autoReloadLabelWarned = false
+					for _, label in ipairs(labels) do
+						ammoLabelConnections[label] = label:GetPropertyChangedSignal("Text"):Connect(function()
+							onAmmoLabelChanged(label)
+						end)
+						onAmmoLabelChanged(label)
+					end
+					return
+				end
+
+				task.wait(0.5)
 			end
 
-			task.wait(0.5)
-		end
+			if generation == ammoScanGeneration and not autoReloadLabelWarned then
+				autoReloadLabelWarned = true
+				CW.Warn("Auto Reload could not find the ammo label at PlayerGui." .. AMMO_LABEL_PATH)
+			end
+		end)
+	end
 
-		if generation == ammoScanGeneration and not autoReloadLabelWarned then
-			autoReloadLabelWarned = true
-			CW.Warn("Auto Reload could not find the ammo label at PlayerGui." .. AMMO_LABEL_PATH)
+	if CW.State.ammoGuiConn then
+		CW.State.ammoGuiConn:Disconnect()
+	end
+	CW.State.ammoGuiConn = PlayerGui.DescendantAdded:Connect(function(instance)
+		if not CW.Settings.AUTO_RELOAD_ENABLED or not isTextGui(instance) then return end
+		if not (isNamedAmmoLabel(instance) or parseAmmoText(instance.Text)) then return end
+		-- Already watching a live label: nothing to rebuild (avoids a full GUI scan per new text).
+		for label in pairs(ammoLabelConnections) do
+			if label.Parent then return end
+		end
+		task.defer(rebuildAmmoLabelWatchers)
+	end)
+
+	if CW.State.ammoCharacterConn then
+		CW.State.ammoCharacterConn:Disconnect()
+	end
+	CW.State.ammoCharacterConn = LocalPlayer.CharacterAdded:Connect(function()
+		task.wait(1)
+		if CW.Settings.AUTO_RELOAD_ENABLED then
+			rebuildAmmoLabelWatchers()
 		end
 	end)
-end
 
-local function applyAutoReload(enabled)
-	CW.Settings.AUTO_RELOAD_ENABLED = enabled == true
-	rebuildAmmoLabelWatchers()
-end
+	UtilityTab:Toggle({
+		Title = "Auto Reload at 0 Ammo",
+		Default = CW.Settings.AUTO_RELOAD_ENABLED == true,
+		Flag = "AutoReload_Enabled",
+		Callback = function(enabled)
+			CW.Settings.AUTO_RELOAD_ENABLED = enabled == true
+			rebuildAmmoLabelWatchers()
+		end,
+	})
 
-if CW.State.ammoGuiConn then
-	CW.State.ammoGuiConn:Disconnect()
-end
-CW.State.ammoGuiConn = PlayerGui.DescendantAdded:Connect(function(instance)
-	if not CW.Settings.AUTO_RELOAD_ENABLED or not isTextGui(instance) then return end
-	if isNamedAmmoLabel(instance) or parseAmmoText(instance.Text) then
-		task.defer(rebuildAmmoLabelWatchers)
-	end
-end)
-
-if CW.State.ammoCharacterConn then
-	CW.State.ammoCharacterConn:Disconnect()
-end
-CW.State.ammoCharacterConn = LocalPlayer.CharacterAdded:Connect(function()
-	task.wait(1)
-	if CW.Settings.AUTO_RELOAD_ENABLED then
+	if CW.Settings.AUTO_RELOAD_ENABLED and ammoScanGeneration == 0 then
 		rebuildAmmoLabelWatchers()
 	end
 end)
 
-UtilityTab:Toggle({
-	Title = "Auto Reload at 0 Ammo",
-	Default = CW.Settings.AUTO_RELOAD_ENABLED == true,
-	Flag = "AutoReload_Enabled",
-	Callback = applyAutoReload,
-})
+------------------------------------------------------------------------------
+-- Library <-> UI refresh
+------------------------------------------------------------------------------
+-- Rebuilds every library-backed control from disk. Core assets are reloaded separately
+-- by CW.reloadCoreAssets (so this never touches the cursor/texture pipeline).
+local function refreshUIFromLibrary()
+	if type(CWUI.ClearAssetCache) == "function" then CWUI.ClearAssetCache() end
+	hitSoundOptions = refreshHitSoundCatalog()
 
-local SettingsTab = Window.ConfigTab
+	local function syncGallery(gallery, category, weapon, selectedFile)
+		if not gallery then return end
+		gallery:SetItems(galleryItems(category, weapon))
+		if selectedFile then gallery:Set(selectedFile, true) else gallery:Clear() end
+	end
 
-do
-	local Theme = Elastic:GetTheme()
+	syncGallery(HitmarkerGallery, "Hitmarkers", nil, CW.Paths.HITMARKER_FILE)
+	syncGallery(CursorGallery, "Cursors", nil, CW.Paths.CURSOR_FILE)
+	for _, entry in ipairs(textureGalleries) do
+		syncGallery(entry.gallery, "Textures", entry.weapon, CW.Library.selectedPath("Textures", entry.weapon))
+	end
 
-	SettingsTab:Colorpicker({
-		Title = "Accent Color",
-		Default = Theme.Accent,
-		Flag = "Config_ThemeAccent",
-
-		Callback = function(color)
-			local currentTheme = Elastic:GetTheme()
-			currentTheme.Accent = color
-			Elastic:SetTheme(currentTheme)
-		end,
-	})
-end
-
-local function reloadAllSettingsAssets()
-	local reloaders = {
-		{ "hitmarker", CW.reloadHitmarkerAsset },
-		{ "cursor", CW.reloadCursor },
-		{ "textures", CW.reloadTextures },
-		{ "sound", CW.reloadSoundAsset },
-	}
-
-	for _, entry in ipairs(reloaders) do
-		if type(entry[2]) == "function" then
-			local ok, err = pcall(entry[2])
-			if not ok then
-				CW.Warn("Failed to reload " .. entry[1] .. ": " .. tostring(err))
-			end
-		end
+	if HitSoundDropdown then
+		HitSoundDropdown:Refresh(hitSoundOptions)
+		HitSoundDropdown:Set(hitSoundLabel(CW.Paths.SOUND_FILE) or "—", true)
+	end
+	for _, entry in ipairs(weaponSoundDropdowns) do
+		entry.control:Refresh(hitSoundOptions)
+		entry.control:Set(relativeLabel(weaponSoundOverrides[entry.weapon]) or "—", true)
 	end
 
 	refreshWeaponShootSoundOverrides()
-	CW.Log("Settings and local assets reloaded.")
 end
 
-SettingsTab:Button({
-	Title = "Reload Settings",
-	Action = "Reload",
-	Callback = reloadAllSettingsAssets,
-})
+------------------------------------------------------------------------------
+-- Settings tab (created last so it is also the last tab)
+------------------------------------------------------------------------------
+guarded("Settings", function()
+	local SettingsTab = createCompatTab({ Title = "Settings" })
+	Window.ConfigTab = SettingsTab
 
-local function serializeValue(componentType, value, component)
-	if componentType == "Keybind" then
-		if typeof(value) == "EnumItem" then
-			return {
-				EnumType = tostring(value.EnumType):gsub("^Enum%.", ""),
-				Name = value.Name,
-			}
+	SettingsTab:Button({
+		Title = "Refresh Asset Library",
+		Callback = function()
+			local syncOK, syncError = pcall(CW.Library.sync)
+			if not syncOK then CW.Warn("Library sync failed: " .. tostring(syncError)) end
+			CW.reloadCoreAssets()
+			guarded("Library refresh", refreshUIFromLibrary)
+			CW.Log("Asset library refreshed.")
+		end,
+	})
+
+	local function serializableValue(value)
+		local valueType = type(value)
+		if valueType == "string" or valueType == "number" or valueType == "boolean" then
+			return value
 		end
-		return nil
+		if valueType ~= "table" then return nil end
+
+		local result = {}
+		for key, entry in pairs(value) do
+			local keyType = type(key)
+			local entryType = type(entry)
+			if (keyType == "string" or keyType == "number")
+				and (entryType == "string" or entryType == "number" or entryType == "boolean") then
+				result[key] = entry
+			end
+		end
+		return result
 	end
 
-	if componentType == "Colorpicker" then
-		local ok, transparency = pcall(function()
-			return component:GetTransparency()
-		end)
+	local function saveSettings()
+		local savedSettings = {}
+		for key, value in pairs(CW.Settings) do
+			if key ~= "ASSET_SELECTIONS" and key ~= "SOUND_ID" and key ~= "AUTO_RELOAD_LABEL_PATH" then
+				local serialized = serializableValue(value)
+				if serialized ~= nil then savedSettings[key] = serialized end
+			end
+		end
 
-		return {
-			R = value.R,
-			G = value.G,
-			B = value.B,
-			Transparency = ok and transparency or 0,
+		-- Tracer colors are Color3 (not serialisable): store the palette name instead.
+		local nameOf = CW.State.tracerColorName
+		if nameOf then
+			savedSettings.TRACER_COLOR_NAME = nameOf(CW.Settings.TRACER_COLOR)
+			savedSettings.TRACER_GLOW_COLOR_NAME = nameOf(CW.Settings.TRACER_GLOW_COLOR)
+		end
+
+		local out = {
+			schemaVersion = 2,
+			Settings = savedSettings,
+			AssetSelections = CW.Settings.ASSET_SELECTIONS,
 		}
-	end
 
-	return value
-end
-
-local function deserializeValue(componentType, saved)
-	if componentType == "Keybind" then
-		if type(saved) == "table" and saved.EnumType and saved.Name then
-			local enumType = Enum[saved.EnumType]
-			if enumType then
-				local ok, item = pcall(function()
-					return enumType[saved.Name]
-				end)
-				if ok then return item end
-			end
+		local ok, encoded = pcall(HttpService.JSONEncode, HttpService, out)
+		if not ok then
+			CW.Warn("Failed to encode settings")
+			return
 		end
-		return nil
+
+		local saved, err = pcall(writefile, CW.Paths.SETTINGS_FILE, encoded)
+		if not saved then CW.Warn("Could not save settings: " .. tostring(err)) end
 	end
 
-	if componentType == "Colorpicker" then
-		if type(saved) ~= "table" then return nil end
-		return Color3.new(saved.R, saved.G, saved.B), saved.Transparency
+	-- Debounced autosave: every control callback schedules a save 1s after the last change.
+	local saveThread
+	scheduleSave = function()
+		if saveThread then task.cancel(saveThread) end
+		saveThread = task.delay(1, function()
+			saveThread = nil
+			saveSettings()
+		end)
 	end
 
-	return saved
-end
+	SettingsTab:Button({
+		Title = "Save Settings",
+		Action = "Save",
+		Callback = function()
+			saveSettings()
+			CW.Log("Settings saved.")
+		end,
+	})
+end)
 
-local SETTINGS_FILE = CW.Paths.CACHE_FOLDER.."/ui_settings.json"
-
-local function saveSettings()
-	local out = {}
-
-	for flag, component in pairs(Elastic.Flags) do
-		if not flag:find("^Config_") then
-			local ok, componentType = pcall(function()
-				return component:GetComponentType()
-			end)
-
-			if ok and componentType then
-				local ok2, value = pcall(function()
-					return component:GetValue()
-				end)
-
-				if ok2 and value ~= nil then
-					local serialized = serializeValue(componentType, value, component)
-					if serialized ~= nil then
-						out[flag] = { componentType, serialized }
-					end
-				end
-			end
-		end
-	end
-
-	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, out)
-	if not ok then
-		warn("[CW] Failed to encode settings")
-		return
-	end
-
-	pcall(writefile, SETTINGS_FILE, encoded)
-end
-
-local function loadSettings()
-	if not isfile(SETTINGS_FILE) then return end
-
-	local ok, raw = pcall(readfile, SETTINGS_FILE)
-	if not ok then return end
-
-	local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
-	if not ok2 or type(data) ~= "table" then return end
-
-	for flag, entry in pairs(data) do
-		local component = Elastic.Flags[flag]
-
-		if component and type(entry) == "table" and entry[1] then
-			local componentType, saved = entry[1], entry[2]
-
-			local ok3, currentType = pcall(function()
-				return component:GetComponentType()
-			end)
-
-			if ok3 and currentType == componentType then
-				pcall(function()
-					if componentType == "Colorpicker" then
-						local color, transparency = deserializeValue(componentType, saved)
-						if color then
-							component:SetValue(color)
-							if transparency ~= nil and component.SetTransparency then
-								component:SetTransparency(transparency)
-							end
-						end
-					else
-						local value = deserializeValue(componentType, saved)
-						if value ~= nil then
-							component:SetValue(value)
-						end
-					end
-				end)
-			end
-		end
-	end
-end
-
-SettingsTab:Button({
-	Title = "Save Settings",
-	Action = "Save",
-	Callback = function()
-		saveSettings()
-	end,
-})
-
-loadSettings()
 scheduleWeaponShootSoundRefresh()
-
-if CW.Settings.AUTO_RELOAD_ENABLED and ammoScanGeneration == 0 then
-	rebuildAmmoLabelWatchers()
-end
-
 print("[CW] UI loaded.")
+
+-- The asset sync runs independently (Sync module). When it finishes, rebuild the UI lists.
+if CW.State.syncFinished then
+	guarded("Library refresh", refreshUIFromLibrary)
+else
+	table.insert(CW.State.syncCallbacks, function()
+		guarded("Library refresh", refreshUIFromLibrary)
+	end)
+end
 end)
 
 if not uiOk then
