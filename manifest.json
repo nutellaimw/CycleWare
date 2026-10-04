@@ -42,13 +42,13 @@
     ],
     "Textures": {
       "AK-47": [
-        { "path": "Textures/AK-47/texture - cópia 2.png" }
+        { "path": "Textures/AK-47/texture.png" }
       ],
       "M4A1": [
-        { "path": "Textures/M4A1/texture - cópia 3.png" }
+        { "path": "Textures/M4A1/texture.png" }
       ],
       "M9": [
-        { "path": "Textures/M9/texture - cópia 4.png" }
+        { "path": "Textures/M9/texture.png" }
       ],
       "MP5": [
         { "path": "Textures/MP5/texture.png" }
