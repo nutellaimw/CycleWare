@@ -1412,27 +1412,74 @@ table.sort(WEAPON_LIST)
 CW.WeaponList          = WEAPON_LIST
 CW.normalizeTextureKey = normalizeKey
 CW.Assets.weaponTextures = {}
-CW.State.originalWeaponTextureIds = CW.State.originalWeaponTextureIds
-	or setmetatable({}, { __mode = "k" })
 CW.Settings.ASSET_SELECTIONS.Textures = CW.Settings.ASSET_SELECTIONS.Textures or {}
+
+local originals = CW.State.weaponTextureOriginals
+if not originals then
+	originals = {}
+	CW.State.weaponTextureOriginals = originals
+	local old = CW.State.originalWeaponTextureIds
+	if old then
+		for mesh, entry in pairs(old) do
+			originals[mesh] = type(entry) == "table" and entry or { value = entry }
+		end
+		CW.State.originalWeaponTextureIds = nil
+	end
+end
+
+local appliedIds = CW.State.appliedTextureIds
+if not appliedIds then
+	appliedIds = {}
+	CW.State.appliedTextureIds = appliedIds
+end
 
 for _, weaponName in ipairs(WEAPON_LIST) do
 	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName)
 	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 end
 
+
+local function isTextureTarget(instance)
+	return instance:IsA("MeshPart") or instance:IsA("SpecialMesh")
+end
+
 local function findWeaponMesh(tool, meshPath)
+	-- Some game assets keep the slash in the Instance.Name; try that exact name first.
+	local exact = tool:FindFirstChild(meshPath, true)
+	if exact and isTextureTarget(exact) then return exact end
+
 	local current = tool
 	for segment in meshPath:gmatch("[^/]+") do
 		current = current and current:FindFirstChild(segment)
 		if not current then break end
 	end
-	if current and current:IsA("MeshPart") then return current end
+	if current and isTextureTarget(current) then return current end
 
 	local meshName = meshPath:match("([^/]+)$")
 	local fallback = meshName and tool:FindFirstChild(meshName, true)
-	if fallback and fallback:IsA("MeshPart") then return fallback end
+	if fallback and isTextureTarget(fallback) then return fallback end
 	return nil
+end
+
+local function getTextureId(target)
+	if target:IsA("MeshPart") then return target.TextureID end
+	return target.TextureId
+end
+
+local function setTextureId(target, textureId)
+	if target:IsA("MeshPart") then
+		target.TextureID = textureId
+	else
+		target.TextureId = textureId
+	end
+end
+
+local function forgetOriginal(mesh)
+	local entry = originals[mesh]
+	originals[mesh] = nil
+	if entry and entry.conn then
+		pcall(function() entry.conn:Disconnect() end)
+	end
 end
 
 local function applyTexture(tool)
@@ -1441,16 +1488,52 @@ local function applyTexture(tool)
 	if not meshName then return end
 
 	local mesh = findWeaponMesh(tool, meshName)
-	if mesh then
-		local originals = CW.State.originalWeaponTextureIds
-		if originals[mesh] == nil then originals[mesh] = mesh.TextureID end
-		local textureId = CW.Assets.weaponTextures[tool.Name]
-		if textureId then
-			mesh.TextureID = textureId
-		elseif originals[mesh] ~= nil then
-			mesh.TextureID = originals[mesh]
-			originals[mesh] = nil
+	if not mesh then
+		CW.State.textureLookupWarnings = CW.State.textureLookupWarnings or {}
+		if not CW.State.textureLookupWarnings[tool.Name] then
+			CW.State.textureLookupWarnings[tool.Name] = true
+			CW.Warn("Texture target not found for " .. tool.Name .. " (mapped path: " .. meshName .. ")")
 		end
+		return
+	end
+
+	local textureId = CW.Assets.weaponTextures[tool.Name]
+	local entry = originals[mesh]
+	local current = getTextureId(mesh) or ""
+	if textureId then
+		if not entry then
+			entry = { value = not appliedIds[current] and current or nil }
+			entry.conn = mesh.Destroying:Connect(function() forgetOriginal(mesh) end)
+			originals[mesh] = entry
+		end
+		appliedIds[textureId] = true
+		local ok, err = pcall(setTextureId, mesh, textureId)
+		if not ok then CW.Warn("Could not apply texture to " .. tool.Name .. ": " .. tostring(err)) end
+		return
+	end
+
+	if not entry then
+		if appliedIds[current] then
+			CW.State.textureRestoreWarnings = CW.State.textureRestoreWarnings or {}
+			if not CW.State.textureRestoreWarnings[tool.Name] then
+				CW.State.textureRestoreWarnings[tool.Name] = true
+				CW.Warn("Original texture of " .. tool.Name .. " is unknown (it was customized before this run); respawn to restore it")
+			end
+		end
+		return
+	end
+
+	if entry.value == nil or appliedIds[entry.value] then
+		CW.Warn("Original texture of " .. tool.Name .. " is unknown; respawn to restore it")
+		forgetOriginal(mesh)
+		return
+	end
+
+	local restored, err = pcall(setTextureId, mesh, entry.value)
+	if restored then
+		forgetOriginal(mesh)
+	else
+		CW.Warn("Could not restore original texture for " .. tool.Name .. ": " .. tostring(err))
 	end
 end
 CW.applyWeaponTexture = applyTexture
