@@ -205,6 +205,10 @@
         {
           "crc32": "7ac1155d",
           "path": "WeaponSounds/Remington 870/plublub.mp3"
+        },
+        {
+          "crc32": "cccf978f",
+          "path": "WeaponSounds/Remington 870/remington-2.mp3"
         }
       ],
       "Revolver": [
@@ -215,6 +219,6 @@
       ]
     }
   },
-  "revision": "7d1f8e0fd742",
+  "revision": "5af3f9c363a4",
   "schemaVersion": 1
 }
