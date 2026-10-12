@@ -1,63 +1,185 @@
 {
   "schemaVersion": 1,
-  "revision": "28fbae543e7f914fbd637b85cf1f2a355565e66b",
+  "revision": "e69dc92523a625d7eb3579f5278ce9cb65b8008b",
   "assets": {
     "Cursors": [
-      { "path": "Cursors/animegirl.png" },
-      { "path": "Cursors/bluedot.png" },
-      { "path": "Cursors/bluexhair.png" },
-      { "path": "Cursors/circunferece.png" },
-      { "path": "Cursors/greendot.png" },
-      { "path": "Cursors/greenxhair.png" },
-      { "path": "Cursors/heart.png" },
-      { "path": "Cursors/heartcrosshair.png" },
-      { "path": "Cursors/kuromimaid.png" },
-      { "path": "Cursors/pc.png" },
-      { "path": "Cursors/pluscursor.png" },
-      { "path": "Cursors/purpledot.png" },
-      { "path": "Cursors/purplepluscursor.png" },
-      { "path": "Cursors/reddotwdiagonalcrosshairs.png" },
-      { "path": "Cursors/reverscursor.png" },
-      { "path": "Cursors/scoop.png" },
-      { "path": "Cursors/trianglecrosshair.png" },
-      { "path": "Cursors/whitedot.png" }
+      {
+        "path": "Cursors/animegirl.png"
+      },
+      {
+        "path": "Cursors/bluedot.png"
+      },
+      {
+        "path": "Cursors/bluexhair.png"
+      },
+      {
+        "path": "Cursors/circunferece.png"
+      },
+      {
+        "path": "Cursors/greendot.png"
+      },
+      {
+        "path": "Cursors/greenxhair.png"
+      },
+      {
+        "path": "Cursors/heart.png"
+      },
+      {
+        "path": "Cursors/heartcrosshair.png"
+      },
+      {
+        "path": "Cursors/kuromimaid.png"
+      },
+      {
+        "path": "Cursors/pc.png"
+      },
+      {
+        "path": "Cursors/pluscursor.png"
+      },
+      {
+        "path": "Cursors/purpledot.png"
+      },
+      {
+        "path": "Cursors/purplepluscursor.png"
+      },
+      {
+        "path": "Cursors/reddotwdiagonalcrosshairs.png"
+      },
+      {
+        "path": "Cursors/reverscursor.png"
+      },
+      {
+        "path": "Cursors/scoop.png"
+      },
+      {
+        "path": "Cursors/trianglecrosshair.png"
+      },
+      {
+        "path": "Cursors/whitedot.png"
+      }
     ],
     "Hitmarkers": [
-      { "path": "Hitmarkers/default.png" },
-      { "path": "Hitmarkers/hitmarker2.png" },
-      { "path": "Hitmarkers/purplehitmarker.png" },
-      { "path": "Hitmarkers/redhitmarker.png" }
+      {
+        "path": "Hitmarkers/default.png"
+      },
+      {
+        "path": "Hitmarkers/hitmarker2.png"
+      },
+      {
+        "path": "Hitmarkers/purplehitmarker.png"
+      },
+      {
+        "path": "Hitmarkers/redhitmarker.png"
+      }
     ],
     "HitSounds": [
-      { "path": "HitSounds/bip.mp3" },
-      { "path": "HitSounds/bipsfx.mp3" },
-      { "path": "HitSounds/bubble.mp3" },
-      { "path": "HitSounds/default.mp3" },
-      { "path": "HitSounds/plublub.mp3" },
-      { "path": "HitSounds/plubsfx.mp3" },
-      { "path": "HitSounds/pluc.mp3" },
-      { "path": "HitSounds/sfx.mp3" },
-      { "path": "HitSounds/sfxabu.mp3" },
-      { "path": "HitSounds/sfxblurred.mp3" }
+      {
+        "path": "HitSounds/bip.mp3"
+      },
+      {
+        "path": "HitSounds/bipsfx.mp3"
+      },
+      {
+        "path": "HitSounds/bubble.mp3"
+      },
+      {
+        "path": "HitSounds/default.mp3"
+      },
+      {
+        "path": "HitSounds/plublub.mp3"
+      },
+      {
+        "path": "HitSounds/plubsfx.mp3"
+      },
+      {
+        "path": "HitSounds/pluc.mp3"
+      },
+      {
+        "path": "HitSounds/sfx.mp3"
+      },
+      {
+        "path": "HitSounds/sfxabu.mp3"
+      },
+      {
+        "path": "HitSounds/sfxblurred.mp3"
+      }
     ],
     "Textures": {
       "AK-47": [
-        { "path": "Textures/AK-47/texture.png" }
+        {
+          "path": "Textures/AK-47/texture.png"
+        }
       ],
       "M4A1": [
-        { "path": "Textures/M4A1/texture.png" }
+        {
+          "path": "Textures/M4A1/texture.png"
+        }
       ],
       "M9": [
-        { "path": "Textures/M9/texture.png" }
+        {
+          "path": "Textures/M9/texture.png"
+        }
       ],
       "MP5": [
-        { "path": "Textures/MP5/texture.png" }
+        {
+          "path": "Textures/MP5/texture.png"
+        }
       ],
       "Remington 870": [
-        { "path": "Textures/Remington 870/texture.png" }
+        {
+          "path": "Textures/Remington 870/texture.png"
+        }
       ],
       "Revolver": [
-        { "path": "Textures/Revolver/texture.png" }
+        {
+          "path": "Textures/Revolver/texture.png"
+        }
+      ]
+    },
+    "WeaponSounds": {
+      "AK-47": [
+        {
+          "path": "WeaponSounds/AK-47/plublub.mp3",
+          "crc32": "51f1a824"
+        },
+        {
+          "path": "WeaponSounds/AK-47/plublub.mp3",
+          "crc32": "f6a3d524"
+        }
+      ],
+      "M4A1": [
+        {
+          "path": "WeaponSounds/M4A1/plublub.mp3",
+          "crc32": "8153d583"
+        }
+      ],
+      "M9": [
+        {
+          "path": "WeaponSounds/M9/plublub.mp3",
+          "crc32": "42ef78ce"
+        },
+        {
+          "path": "WeaponSounds/M9/plublub.mp3",
+          "crc32": "05909503"
+        }
+      ],
+      "MP5": [
+        {
+          "path": "WeaponSounds/MP5/plublub.mp3",
+          "crc32": "a786a1c7"
+        }
+      ],
+      "Remington 870": [
+        {
+          "path": "WeaponSounds/Remington 870/plublub.mp3",
+          "crc32": "e82f6c1f"
+        }
+      ],
+      "Revolver": [
+        {
+          "path": "WeaponSounds/Revolver/plublub.mp3",
+          "crc32": "f5e7b9cf"
+        }
       ]
     }
   }
