@@ -181,6 +181,10 @@
       ],
       "M4A1": [
         {
+          "crc32": "663843af",
+          "path": "WeaponSounds/M4A1/m4a1-2.mp3"
+        },
+        {
           "crc32": "7ac1155d",
           "path": "WeaponSounds/M4A1/plublub.mp3"
         }
@@ -211,6 +215,6 @@
       ]
     }
   },
-  "revision": "36de6d3af919",
+  "revision": "7d1f8e0fd742",
   "schemaVersion": 1
 }
