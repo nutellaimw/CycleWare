@@ -140,45 +140,45 @@
       "AK-47": [
         {
           "path": "WeaponSounds/AK-47/plublub.mp3",
-          "crc32": "51f1a824"
+          "crc32": "7ac1155d"
         },
         {
           "path": "WeaponSounds/AK-47/plublub.mp3",
-          "crc32": "f6a3d524"
+          "crc32": "7ac1155d"
         }
       ],
       "M4A1": [
         {
           "path": "WeaponSounds/M4A1/plublub.mp3",
-          "crc32": "8153d583"
+          "crc32": "7ac1155d"
         }
       ],
       "M9": [
         {
           "path": "WeaponSounds/M9/plublub.mp3",
-          "crc32": "42ef78ce"
+          "crc32": "7ac1155d"
         },
         {
           "path": "WeaponSounds/M9/plublub.mp3",
-          "crc32": "05909503"
+          "crc32": "7ac1155d"
         }
       ],
       "MP5": [
         {
           "path": "WeaponSounds/MP5/plublub.mp3",
-          "crc32": "a786a1c7"
+          "crc32": "7ac1155d"
         }
       ],
       "Remington 870": [
         {
           "path": "WeaponSounds/Remington 870/plublub.mp3",
-          "crc32": "e82f6c1f"
+          "crc32": "7ac1155d"
         }
       ],
       "Revolver": [
         {
           "path": "WeaponSounds/Revolver/plublub.mp3",
-          "crc32": "f5e7b9cf"
+          "crc32": "7ac1155d"
         }
       ]
     }
