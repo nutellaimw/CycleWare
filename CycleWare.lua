@@ -1,4 +1,62 @@
 -- Standalone entry point; module bodies below are kept in isolated scopes.
+
+--=============================================================================
+-- Preflight
+--   Executor functions this script depends on. Whatever is missing is replaced here by a
+--   safe stand-in, so a single missing function disables one feature instead of aborting
+--   the whole script. What was found is stored in CW.Caps and reported once at startup.
+--=============================================================================
+local SCRIPT_VERSION = "phase-2"
+
+local CAPS = {
+	files = type(isfile) == "function" and type(isfolder) == "function"
+		and type(makefolder) == "function" and type(readfile) == "function"
+		and type(writefile) == "function" and type(listfiles) == "function",
+	customAsset = type(getcustomasset) == "function" or type(getsynasset) == "function",
+	getgenv = type(getgenv) == "function",
+	gethui = type(gethui) == "function",
+	hook = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function",
+	request = (type(request) == "function" and request)
+		or (type(http_request) == "function" and http_request)
+		or (syn and type(syn.request) == "function" and syn.request)
+		or (http and type(http.request) == "function" and http.request)
+		or nil,
+}
+do
+	-- Only used for the startup report: game:HttpGet itself is always tried first.
+	local indexed, value = pcall(function() return game.HttpGet end)
+	CAPS.httpGet = indexed and type(value) == "function"
+end
+
+local getgenv = getgenv
+if not CAPS.getgenv then
+	-- No shared environment: state lives in a private table, so re-running the script
+	-- without rejoining cannot reuse the previous run's state.
+	local privateEnv = {}
+	getgenv = function() return privateEnv end
+end
+local isfile         = isfile or function() return false end
+local isfolder       = isfolder or function() return false end
+local makefolder     = makefolder or function() end
+local readfile       = readfile or function() error("readfile is unavailable", 0) end
+local writefile      = writefile or function() error("writefile is unavailable", 0) end
+local delfile        = delfile or function() error("delfile is unavailable", 0) end
+local listfiles      = listfiles or function() return {} end
+local getcustomasset = getcustomasset or getsynasset
+	or function() error("getcustomasset is unavailable", 0) end
+
+-- Runs one module in isolation: if it throws, the error is reported and the modules after it
+-- still load (the UI, for example, no longer disappears because one earlier module failed).
+local function runModule(name, fn)
+	local ok, err = xpcall(fn, function(message)
+		return debug.traceback(tostring(message), 2)
+	end)
+	if not ok then
+		warn("[CW] Module '" .. name .. "' failed: " .. tostring(err))
+	end
+	return ok
+end
+
 local _env = getgenv()
 local _cfg = _env.CW_CONFIG
 if type(_cfg) ~= "table" then
@@ -59,6 +117,10 @@ CW.IsFirstRun  = isFirstRun
 CW.LocalPlayer = LocalPlayer
 CW.Mouse       = Mouse
 
+CW.PreviousVersion = CW.Version
+CW.Version         = SCRIPT_VERSION
+CW.Caps            = CAPS
+
 if CW.Debug == nil then CW.Debug = true end
 CW.Debug = boolOr(_cfg.DEBUG, CW.Debug)
 
@@ -72,7 +134,78 @@ function CW.Warn(msg)
 	warn("[CW] " .. msg)
 end
 
-CW.Log(isFirstRun and "First run — initializing." or "Re-run detected — updating settings only.")
+--// Connection registry -------------------------------------------------------------
+-- Every long-lived connection is registered under a key. Registering again under the same
+-- key disconnects the previous one, so a re-run REPLACES the old code instead of leaving it
+-- active next to the new one, and CW.untrackAll() can release everything on cleanup.
+CW.State.conns = CW.State.conns or {}
+
+function CW.track(key, connection)
+	local conns = CW.State.conns
+	local previous = conns[key]
+	if previous then
+		pcall(function() previous:Disconnect() end)
+	end
+	conns[key] = connection
+	return connection
+end
+
+function CW.untrack(key)
+	local conns = CW.State.conns
+	local previous = conns[key]
+	conns[key] = nil
+	if previous then
+		pcall(function() previous:Disconnect() end)
+	end
+end
+
+function CW.untrackAll()
+	for key in pairs(CW.State.conns) do
+		CW.untrack(key)
+	end
+end
+
+--// HTTP -----------------------------------------------------------------------------
+-- game:HttpGet first (as before), then the executor's request function. Raises an error when
+-- nothing works; callers already wrap it in pcall.
+function CW.httpGet(url)
+	local ok, result = pcall(function() return game:HttpGet(url) end)
+	if ok and type(result) == "string" then return result end
+	local lastError = result
+
+	local requestFn = CW.Caps.request
+	if requestFn then
+		local sent, response = pcall(requestFn, { Url = url, Method = "GET" })
+		if sent and type(response) == "table" then
+			local status = tonumber(response.StatusCode)
+			local success = response.Success == true or (status ~= nil and status >= 200 and status < 300)
+			if success and type(response.Body) == "string" then return response.Body end
+			lastError = "HTTP " .. tostring(response.StatusCode or "?") .. " " .. tostring(response.StatusMessage or "")
+		else
+			lastError = response
+		end
+	end
+	error(tostring(lastError or "no HTTP function available"), 0)
+end
+
+--// Startup report -------------------------------------------------------------------
+do
+	local missing = {}
+	if not CAPS.getgenv then table.insert(missing, "getgenv (re-running without rejoining will not be clean)") end
+	if not CAPS.files then table.insert(missing, "file functions (asset library, cursor, textures, sounds and saved settings are disabled)") end
+	if not CAPS.customAsset then table.insert(missing, "getcustomasset (custom images and sounds are disabled)") end
+	if not CAPS.hook then table.insert(missing, "hookmetamethod/getnamecallmethod (hitmarker and hit sound detection is disabled)") end
+	if not CAPS.gethui then table.insert(missing, "gethui (using CoreGui instead)") end
+	if not CAPS.httpGet and not CAPS.request then table.insert(missing, "HTTP (asset sync and the UI download are disabled)") end
+	if #missing > 0 then
+		CW.Warn("Missing executor functions: " .. table.concat(missing, "; "))
+	end
+end
+
+CW.Log(isFirstRun and "First run — initializing." or "Re-run detected — reloading modules and replacing the previous run's connections.")
+if not isFirstRun and CW.PreviousVersion == nil then
+	CW.Warn("State from an older script version was found. Connections made by that version stay active until you rejoin, so rejoin once for a fully clean update.")
+end
 
 CW.Paths.CURSOR_ROOT = "CycleWare"
 CW.Paths.LIBRARY_ROOT = CW.Paths.CURSOR_ROOT .. "/Library"
@@ -201,12 +334,15 @@ do
 	CW.State.mouseX, CW.State.mouseY = loc.X, loc.Y
 end
 
-if isFirstRun then
-	LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
+-- Created on every run and registered with CW.track: a re-run replaces the previous
+-- connections, so updated code takes effect without rejoining.
+do
+	CW.State.cachedTeamColor = LocalPlayer.TeamColor
+	CW.track("teamColor", LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
 		CW.State.cachedTeamColor = LocalPlayer.TeamColor
-	end)
+	end))
 
-	UserInputService.InputChanged:Connect(function(input)
+	CW.track("mouseMove", UserInputService.InputChanged:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseMovement then
 			return
 		end
@@ -228,10 +364,10 @@ if isFirstRun then
 				CW.ActiveFollowClones[clone] = nil
 			end
 		end
-	end)
+	end))
 end
 
-do
+runModule("Cache", function()
 -- Cache.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -346,10 +482,10 @@ function CW.loadLibraryAsset(cfg)
 	CW.Log(cfg.label .. " loaded from " .. cfg.file)
 	return asset, nil
 end
-end
+end)
 
 
-do
+runModule("AssetLibrary", function()
 -- AssetLibrary.lua
 local CW = getgenv().__CW_CORE_STATE
 local HttpService = game:GetService("HttpService")
@@ -583,13 +719,17 @@ local function syncImpl()
 		CW.Log("Asset manifest URL is unset; using files already in Library")
 		return false
 	end
+	if not CW.Caps.files then
+		CW.Warn("File functions unavailable; skipping the asset sync")
+		return false
+	end
 	CW.Log("Fetching asset manifest")
-	if type(game.HttpGet) ~= "function" then
-		CW.Warn("HttpGet unavailable; using files already in Library")
+	if not (CW.Caps.httpGet or CW.Caps.request) then
+		CW.Warn("HTTP unavailable; using files already in Library")
 		return false
 	end
 
-	local fetched, raw = pcall(function() return game:HttpGet(manifestURL) end)
+	local fetched, raw = pcall(CW.httpGet, manifestURL)
 	if not fetched or type(raw) ~= "string" then
 		CW.Warn("Could not download the asset manifest: " .. tostring(raw))
 		return false
@@ -684,7 +824,7 @@ local function syncImpl()
 
 			if needsDownload then
 				local remotePath = encodeURLPath(entry.path)
-				local downloaded, bytes = pcall(function() return game:HttpGet(baseURL .. "/" .. remotePath) end)
+				local downloaded, bytes = pcall(CW.httpGet, baseURL .. "/" .. remotePath)
 				if downloaded and type(bytes) == "string" then
 					local actualFormat = detectAssetFormat(entry.path, bytes)
 					local expectedFormat = entry.path:match("%.([%w]+)$"):lower()
@@ -746,10 +886,10 @@ end
 CW.Paths.CURSOR_FILE = CW.Library.selectedPath("Cursors")
 CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
 CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
-end
+end)
 
 
-do
+runModule("PNG", function()
 -- PNG.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1083,10 +1223,10 @@ function CW.applyTint(px, w, h, tR, tG, tB)
 	end
 	return out
 end
-end
+end)
 
 
-do
+runModule("Cursor", function()
 -- Cursor.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1275,8 +1415,9 @@ end
 CW.reloadCursor = generateCursors
 task.spawn(generateCursors)
 
-if CW.IsFirstRun then
-	RunService.PreRender:Connect(function()
+-- Registered with CW.track: a re-run replaces the loop with this version's code.
+do
+	CW.track("cursorLoop", RunService.PreRender:Connect(function()
 		if not CW.State.cursorsReady then return end
 		local Target = Mouse.Target
 		if Target == CW.State.lastTarget then return end
@@ -1291,24 +1432,52 @@ if CW.IsFirstRun then
 		else
 			setOSCursor("white")
 		end
-	end)
+	end))
 end
-end
+end)
 
 
-do
+runModule("Hitmarker", function()
 -- Hitmarker.lua
 local CW = getgenv().__CW_CORE_STATE
 
-if CW.IsFirstRun then
-	CW.IAPortable = Instance.new("ScreenGui")
-	CW.IAPortable.Name           = "CW_SA"
-	CW.IAPortable.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	CW.IAPortable.ResetOnSpawn   = false
-	CW.IAPortable.IgnoreGuiInset = true
-	CW.IAPortable.DisplayOrder   = 9998
-	CW.IAPortable.Parent         = gethui()
+-- Parents the GUI to the first container that accepts it: gethui() when the executor has it,
+-- otherwise CoreGui, otherwise PlayerGui.
+local function attachGui(gui)
+	local candidates = {}
+	if type(gethui) == "function" then
+		local ok, container = pcall(gethui)
+		if ok and typeof(container) == "Instance" then table.insert(candidates, container) end
+	end
+	local okCore, coreGui = pcall(function() return game:GetService("CoreGui") end)
+	if okCore and coreGui then table.insert(candidates, coreGui) end
+	local playerGui = CW.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if playerGui then table.insert(candidates, playerGui) end
 
+	for _, container in ipairs(candidates) do
+		local attached = pcall(function() gui.Parent = container end)
+		if attached and gui.Parent == container then return true end
+	end
+	return false
+end
+
+-- Created on the first run, and again on a later run if the GUI is missing or was destroyed.
+if not CW.IAPortable or not CW.IAPortable.Parent then
+	if CW.IAPortable then pcall(function() CW.IAPortable:Destroy() end) end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name           = "CW_SA"
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.ResetOnSpawn   = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder   = 9998
+	if not attachGui(gui) then
+		CW.Warn("Could not parent the hitmarker GUI; hitmarkers will not be displayed")
+	end
+	CW.IAPortable = gui
+end
+
+if not CW.HMTemplate then
 	CW.HMTemplate = Instance.new("ImageLabel")
 	CW.HMTemplate.AnchorPoint            = Vector2.new(0.5,0.5)
 	CW.HMTemplate.BackgroundTransparency = 1
@@ -1328,11 +1497,10 @@ end
 
 CW.reloadHitmarkerAsset = reloadHitmarker
 reloadHitmarker()
-end
+end)
 
 
-do
-do
+runModule("Sound", function()
 -- Sound.lua  (replace the whole existing Sound.lua block with this one)
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1451,8 +1619,10 @@ function CW.playHitSound()
 
 	playOnDemand()
 end
-end
+end)
 
+
+runModule("Texture", function()
 -- Texture.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1621,11 +1791,14 @@ local function applyToContainer(container)
 	end
 end
 
-local function monitor(container)
-	container.ChildAdded:Connect(function(child)
+-- The ChildAdded connection is registered under `key` (replacing the previous one) and calls
+-- CW.applyWeaponTexture at call time, so the latest run's code is the one that runs.
+local function monitor(container, key)
+	CW.track(key, container.ChildAdded:Connect(function(child)
 		task.wait(0.1)
-		applyTexture(child)
-	end)
+		local apply = CW.applyWeaponTexture
+		if apply then apply(child) end
+	end))
 	applyToContainer(container)
 end
 
@@ -1651,31 +1824,37 @@ end
 CW.reloadTextures = reloadTexturesAndApply
 reloadTexturesAndApply()
 
-if CW.IsFirstRun then
+-- Monitors are (re)created on every run, so a re-run replaces the old ones.
+do
+	-- Connection stored by the previous script version.
+	if CW.State.backpackMonitorConn then
+		pcall(function() CW.State.backpackMonitorConn:Disconnect() end)
+		CW.State.backpackMonitorConn = nil
+	end
+
 	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
 	if backpack then
-		monitor(backpack)
+		monitor(backpack, "textureBackpack")
 	else
-		CW.State.backpackMonitorConn = LocalPlayer.ChildAdded:Connect(function(child)
+		CW.track("textureBackpackWait", LocalPlayer.ChildAdded:Connect(function(child)
 			if not child:IsA("Backpack") then return end
-			CW.State.backpackMonitorConn:Disconnect()
-			CW.State.backpackMonitorConn = nil
-			monitor(child)
-		end)
+			CW.untrack("textureBackpackWait")
+			monitor(child, "textureBackpack")
+		end))
 	end
 
-	LocalPlayer.CharacterAdded:Connect(function(character)
-		monitor(character)
-	end)
+	CW.track("textureCharacterAdded", LocalPlayer.CharacterAdded:Connect(function(character)
+		monitor(character, "textureCharacter")
+	end))
 
 	if LocalPlayer.Character then
-		monitor(LocalPlayer.Character)
+		monitor(LocalPlayer.Character, "textureCharacter")
 	end
 end
-end
+end)
 
 
-do
+runModule("Tracers", function()
 -- Tracers.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1766,44 +1945,55 @@ local function shouldUseCustom()
 	return isLocalPlayerShot()
 end
 
--- Installs the override once; returns false (so we can retry) if the game module isn't ready yet.
+local function warnTracerFailure(err)
+	if CW.State.tracerFailureWarned then return end
+	CW.State.tracerFailureWarned = true
+	CW.Warn("Custom tracer failed; using the game's tracer instead: " .. tostring(err))
+end
+
+-- The wrappers run on the game's own thread, so they must never throw into the game's gun
+-- code: a failing custom tracer falls back to the original function, every argument is passed
+-- through, and the original's result is returned unchanged.
+local function makeTracerWrapper(originalKey)
+	return function(...)
+		local okUse, useCustom = pcall(shouldUseCustom)
+		if okUse and useCustom then
+			local okDraw, err = pcall(createEnergyTracer, ...)
+			if okDraw then return end
+			warnTracerFailure(err)
+		end
+		local original = CW[originalKey]
+		if original then return original(...) end
+	end
+end
+
+-- Installs the wrappers; returns false (so we can retry) if the game module isn't ready yet.
+-- The game's own functions are captured once and kept in CW, so installing again on a re-run
+-- replaces our wrappers with the new ones instead of stacking them.
 local function installTracers()
-	if CW.State.tracersHooked then return true end
+	if not CW.TracersModule then
+		local shared = ReplicatedStorage:FindFirstChild("SharedModules")
+		local moduleScript = shared and shared:FindFirstChild("GunTracers")
+		if not moduleScript then return false end
 
-	local shared = ReplicatedStorage:FindFirstChild("SharedModules")
-	local moduleScript = shared and shared:FindFirstChild("GunTracers")
-	if not moduleScript then return false end
+		local ok, TracersModule = pcall(require, moduleScript)
+		if not ok or type(TracersModule) ~= "table" then return false end
 
-	local ok, TracersModule = pcall(require, moduleScript)
-	if not ok or type(TracersModule) ~= "table" then return false end
-
-	CW.TracersModule          = TracersModule
-	CW._originalCreateBullet  = TracersModule.createBullet
-	CW._originalCreateTaser   = TracersModule.createTaser
-	CW._originalCreateSniper  = TracersModule.createSniper
-
-	TracersModule.createBullet = function(startPos, endPos)
-		if shouldUseCustom() then
-			createEnergyTracer(startPos, endPos)
-		else
-			CW._originalCreateBullet(startPos, endPos)
-		end
+		CW.TracersModule          = TracersModule
+		CW._originalCreateBullet  = TracersModule.createBullet
+		CW._originalCreateTaser   = TracersModule.createTaser
+		CW._originalCreateSniper  = TracersModule.createSniper
 	end
 
-	TracersModule.createTaser = function(startPos, endPos)
-		if shouldUseCustom() then
-			createEnergyTracer(startPos, endPos)
-		else
-			CW._originalCreateTaser(startPos, endPos)
-		end
+	local TracersModule = CW.TracersModule
+	if type(CW._originalCreateBullet) == "function" then
+		TracersModule.createBullet = makeTracerWrapper("_originalCreateBullet")
 	end
-
-	TracersModule.createSniper = function(startPos, endPos)
-		if shouldUseCustom() then
-			createEnergyTracer(startPos, endPos)
-		else
-			CW._originalCreateSniper(startPos, endPos)
-		end
+	if type(CW._originalCreateTaser) == "function" then
+		TracersModule.createTaser = makeTracerWrapper("_originalCreateTaser")
+	end
+	if type(CW._originalCreateSniper) == "function" then
+		TracersModule.createSniper = makeTracerWrapper("_originalCreateSniper")
 	end
 
 	CW.State.tracersHooked = true
@@ -1826,11 +2016,10 @@ if not installTracers() and not CW.State.tracersRetrying then
 		CW.Warn("GunTracers module not found — custom tracers disabled.")
 	end)
 end
-end
+end)
 
 
-do
-do
+runModule("Hook", function()
 -- Hook.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1897,6 +2086,7 @@ function CW.processShot(hits)
 	end
 	if not shotHit then return end
 	CW.playHitSound()
+	if not CW.HMTemplate or not CW.IAPortable then return end
 
 	-- Read the real mouse position now; mouseX/Y only update on MouseMovement.
 	local loc = UserInputService:GetMouseLocation()
@@ -1974,14 +2164,16 @@ function CW.drainShots()
 	end
 end
 
--- Created once per session. It looks CW.drainShots up on every frame, so a re-run that
--- redefines the function takes effect without a second connection.
-if not CW.State.shotDrainConn then
-	CW.State.shotDrainConn = RunService.PreRender:Connect(function()
-		local drain = CW.drainShots
-		if drain then drain() end
-	end)
+-- Registered with CW.track, so a re-run replaces it. It looks CW.drainShots up on every
+-- frame, so a re-run that redefines the function takes effect immediately.
+if CW.State.shotDrainConn then -- connection stored by the previous script version
+	pcall(function() CW.State.shotDrainConn:Disconnect() end)
+	CW.State.shotDrainConn = nil
 end
+CW.track("shotDrain", RunService.PreRender:Connect(function()
+	local drain = CW.drainShots
+	if drain then drain() end
+end))
 
 -- The hook only forwards the call: it copies the hit parts into the queue and returns the
 -- game's own result untouched, so it can never break or delay the game's FireServer.
@@ -1989,14 +2181,26 @@ end
 local function installShootHook()
 	if CW.State.shootHooked then return true end
 
+	if not CW.Caps.hook then
+		if not CW.State.hookCapabilityWarned then
+			CW.State.hookCapabilityWarned = true
+			CW.Warn("hookmetamethod/getnamecallmethod unavailable; hitmarker and hit sound detection is disabled")
+		end
+		return true -- nothing to wait for
+	end
+
 	local remotes = ReplicatedStorage:FindFirstChild("GunRemotes")
 	local shootEvent = remotes and remotes:FindFirstChild("ShootEvent")
 	if not shootEvent then return false end
 	CW.ShootEvent = shootEvent
 
+	-- Resolved once, so the hook itself can never throw because a function is missing.
+	local isExecutorCall = type(checkcaller) == "function" and checkcaller or function() return false end
+	local wrap = type(newcclosure) == "function" and newcclosure or function(fn) return fn end
+
 	local OldNameCall
-	OldNameCall = hookmetamethod(shootEvent, "__namecall", newcclosure(function(self, ...)
-		if getnamecallmethod() == "FireServer" and not checkcaller() and self == CW.ShootEvent then
+	OldNameCall = hookmetamethod(shootEvent, "__namecall", wrap(function(self, ...)
+		if getnamecallmethod() == "FireServer" and not isExecutorCall() and self == CW.ShootEvent then
 			local enqueue = CW.onShot
 			if enqueue then pcall(enqueue, (...)) end
 		end
@@ -2008,18 +2212,27 @@ local function installShootHook()
 	return true
 end
 
-if not installShootHook() and not CW.State.shootHookRetrying then
+local installed, installResult = pcall(installShootHook)
+if not installed then
+	CW.Warn("Could not install the ShootEvent hook: " .. tostring(installResult))
+elseif not installResult and not CW.State.shootHookRetrying then
 	CW.State.shootHookRetrying = true
 	task.spawn(function()
 		local remotes = ReplicatedStorage:WaitForChild("GunRemotes", 60)
 		if remotes then remotes:WaitForChild("ShootEvent", 60) end
 		CW.State.shootHookRetrying = false
-		if not installShootHook() then
+		local ok, result = pcall(installShootHook)
+		if not ok then
+			CW.Warn("Could not install the ShootEvent hook: " .. tostring(result))
+		elseif not result then
 			CW.Warn("GunRemotes.ShootEvent not found; hitmarker detection unavailable")
 		end
 	end)
 end
-end
+end)
+
+
+runModule("Cleanup", function()
 -- Cleanup.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -2027,36 +2240,43 @@ local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = CW.LocalPlayer
 
-if CW.IsFirstRun then
-	LocalPlayer.AncestryChanged:Connect(function()
-		if LocalPlayer:IsDescendantOf(game) then return end
-		pcall(function() UserInputService.MouseIconEnabled=true end)
-		pcall(function() UserInputService.MouseIcon="" end)
-		pcall(function() CW.IAPortable:Destroy() end)
-		pcall(function() if CW.UIWindow then CW.UIWindow:Destroy() end end)
-		pcall(function() if CW.State.enforcerConn then CW.State.enforcerConn:Disconnect() end end)
-		pcall(function() if CW.State.enableConn   then CW.State.enableConn:Disconnect()   end end)
-		pcall(function() if CW.State.sprintCharacterConn then CW.State.sprintCharacterConn:Disconnect() end end)
-		pcall(function() if CW.State.chatToggleConn then CW.State.chatToggleConn:Disconnect() end end)
-		pcall(function() if CW.State.ammoGuiConn then CW.State.ammoGuiConn:Disconnect() end end)
-		pcall(function() if CW.State.ammoCharacterConn then CW.State.ammoCharacterConn:Disconnect() end end)
-		pcall(function() if CW.State.backpackMonitorConn then CW.State.backpackMonitorConn:Disconnect() end end)
-		pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
-		pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
-		pcall(function() if CW.State.stopWeaponShootSoundOverrides then CW.State.stopWeaponShootSoundOverrides() end end)
-		pcall(function() if CW.State.shotDrainConn then CW.State.shotDrainConn:Disconnect() end end)
-		pcall(function()
-			local contextActions = game:GetService("ContextActionService")
-			contextActions:UnbindAction("CycleWareSprintToggle")
-			contextActions:UnbindAction("CycleWareProtectSprint")
-		end)
-		CW.ActiveFollowClones = {}
+-- Runs when the player leaves the game. It is looked up through CW when it fires, so a
+-- re-run's version is the one that runs.
+function CW.cleanup()
+	pcall(function() UserInputService.MouseIconEnabled=true end)
+	pcall(function() UserInputService.MouseIcon="" end)
+	pcall(function() CW.IAPortable:Destroy() end)
+	pcall(function() if CW.UIWindow then CW.UIWindow:Destroy() end end)
+	pcall(function() if CW.State.enforcerConn then CW.State.enforcerConn:Disconnect() end end)
+	pcall(function() if CW.State.enableConn   then CW.State.enableConn:Disconnect()   end end)
+	pcall(function() if CW.State.sprintCharacterConn then CW.State.sprintCharacterConn:Disconnect() end end)
+	pcall(function() if CW.State.chatToggleConn then CW.State.chatToggleConn:Disconnect() end end)
+	pcall(function() if CW.State.ammoGuiConn then CW.State.ammoGuiConn:Disconnect() end end)
+	pcall(function() if CW.State.ammoCharacterConn then CW.State.ammoCharacterConn:Disconnect() end end)
+	pcall(function() if CW.State.backpackMonitorConn then CW.State.backpackMonitorConn:Disconnect() end end)
+	pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
+	pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
+	pcall(function() if CW.State.stopWeaponShootSoundOverrides then CW.State.stopWeaponShootSoundOverrides() end end)
+	pcall(function() if CW.State.shotDrainConn then CW.State.shotDrainConn:Disconnect() end end)
+	pcall(function() if CW.State.destroyHitSoundPool then CW.State.destroyHitSoundPool() end end)
+	pcall(function()
+		local contextActions = game:GetService("ContextActionService")
+		contextActions:UnbindAction("CycleWareSprintToggle")
+		contextActions:UnbindAction("CycleWareProtectSprint")
 	end)
-end
+	pcall(CW.untrackAll)
+	CW.ActiveFollowClones = {}
 end
 
+CW.track("cleanup", LocalPlayer.AncestryChanged:Connect(function()
+	if LocalPlayer:IsDescendantOf(game) then return end
+	local cleanup = CW.cleanup
+	if cleanup then pcall(cleanup) end
+end))
+end)
 
-do
+
+runModule("Sync", function()
 -- Sync.lua
 -- Runs independently of the UI: official assets are downloaded even if the UI fails to load,
 -- and everything that consumes assets is reloaded as soon as the download finishes.
@@ -2067,11 +2287,13 @@ function CW.reloadCoreAssets()
 	CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
 	CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
 
+	-- The cursor goes last: generating it yields for a while (PNG codec), and it no longer
+	-- delays the textures and the hit sound.
 	local reloaders = {
 		{ "hitmarker", CW.reloadHitmarkerAsset },
-		{ "cursor", CW.reloadCursor },
 		{ "textures", CW.reloadTextures },
 		{ "sound", CW.reloadSoundAsset },
+		{ "cursor", CW.reloadCursor },
 	}
 	for _, entry in ipairs(reloaders) do
 		if type(entry[2]) == "function" then
@@ -2104,7 +2326,7 @@ task.spawn(function()
 		pcall(callback)
 	end
 end)
-end
+end)
 
 
 do
@@ -2136,9 +2358,7 @@ local scheduleSave = function() end
 
 local UI_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CWUI.lua"
 CW.Log("Downloading CycleWare UI from GitHub")
-local fetchOK, uiSource = pcall(function()
-	return game:HttpGet(UI_URL)
-end)
+local fetchOK, uiSource = pcall(CW.httpGet, UI_URL)
 assert(fetchOK and type(uiSource) == "string" and uiSource ~= "", "Could not download CycleWareUI.lua from GitHub: " .. tostring(uiSource))
 CW.Log("CycleWare UI source downloaded")
 
@@ -3185,11 +3405,12 @@ guarded("Utilities", function()
 	end
 	CW.State.ammoGuiConn = PlayerGui.DescendantAdded:Connect(function(instance)
 		if not CW.Settings.AUTO_RELOAD_ENABLED or not isTextGui(instance) then return end
-		if not (isNamedAmmoLabel(instance) or parseAmmoText(instance.Text)) then return end
-		-- Already watching a live label: nothing to rebuild (avoids a full GUI scan per new text).
+		-- Already watching a live label: nothing to rebuild. Checked before the string work
+		-- below, so a new text label costs almost nothing in the common case.
 		for label in pairs(ammoLabelConnections) do
 			if label.Parent then return end
 		end
+		if not (isNamedAmmoLabel(instance) or parseAmmoText(instance.Text)) then return end
 		task.defer(rebuildAmmoLabelWatchers)
 	end)
 
