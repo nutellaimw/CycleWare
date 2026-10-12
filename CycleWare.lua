@@ -1332,11 +1332,69 @@ end
 
 
 do
--- Sound.lua
+do
+-- Sound.lua  (replace the whole existing Sound.lua block with this one)
 local CW = getgenv().__CW_CORE_STATE
 
-local SoundService = game:GetService("SoundService")
-local Debris       = game:GetService("Debris")
+local SoundService    = game:GetService("SoundService")
+local ContentProvider = game:GetService("ContentProvider")
+local Debris          = game:GetService("Debris")
+
+-- Why the old version was late
+--   Every hit created a brand-new Sound from a local file, so Roblox had to load and decode
+--   the audio at that moment. The hitmarker image is already loaded, which is why it appeared
+--   instantly while the sound lagged behind.
+--
+-- How this works
+--   A few Sound objects are created ONCE when the hit sound is (re)loaded and preloaded with
+--   ContentProvider. A hit then only rewinds one of them and calls :Play(), which is
+--   immediate. They are used round-robin so rapid hits (automatic weapons, shotgun pellets)
+--   overlap instead of cutting each other off.
+--   If the pool is unavailable for any reason, the previous behaviour is used as a fallback.
+
+local POOL_SIZE = 4
+
+local function destroyPool()
+	local pool = CW.State.hitSoundPool
+	CW.State.hitSoundPool = nil
+	CW.State.hitSoundIndex = 0
+	if pool then
+		for _, sound in ipairs(pool) do
+			pcall(function() sound:Destroy() end)
+		end
+	end
+end
+CW.State.destroyHitSoundPool = destroyPool
+
+local function buildPool(assetId)
+	destroyPool()
+
+	local pool = {}
+	for _ = 1, POOL_SIZE do
+		local ok, sound = pcall(function()
+			local snd = Instance.new("Sound")
+			snd.Name     = "CW_HitSound"
+			snd.SoundId  = assetId
+			snd.Volume   = CW.Settings.SOUND_VOLUME
+			snd.Parent   = SoundService
+			return snd
+		end)
+		if ok and sound then pool[#pool + 1] = sound end
+	end
+	if #pool == 0 then
+		CW.Warn("Could not create the hit sound pool; falling back to on-demand sounds")
+		return
+	end
+
+	CW.State.hitSoundPool = pool
+
+	-- Preload in the background so even the first hit is instant. A failure here is harmless:
+	-- the sounds still play, they just load on first use.
+	task.spawn(function()
+		local ok, err = pcall(function() ContentProvider:PreloadAsync(pool) end)
+		if not ok then CW.Log("Hit sound preload skipped: " .. tostring(err)) end
+	end)
+end
 
 local function reloadSound()
 	local asset, failReason = CW.loadLibraryAsset({
@@ -1345,16 +1403,18 @@ local function reloadSound()
 	})
 	if asset then
 		CW.Settings.SOUND_ID = asset
+		buildPool(asset)
 	elseif failReason == "missing" or failReason == "error" then
 		CW.Settings.SOUND_ID = nil
+		destroyPool()
 	end
 end
 
 CW.reloadSoundAsset = reloadSound
 reloadSound()
 
-function CW.playHitSound()
-	if not CW.Settings.SOUND_ID then return end
+-- Previous behaviour: a fresh Sound per hit. Only used when the pool cannot play.
+local function playOnDemand()
 	local ok, s = pcall(function()
 		local snd = Instance.new("Sound")
 		snd.SoundId = CW.Settings.SOUND_ID
@@ -1372,10 +1432,27 @@ function CW.playHitSound()
 	s.Ended:Connect(cleanup)
 	Debris:AddItem(s, 10)
 end
+
+function CW.playHitSound()
+	if not CW.Settings.SOUND_ID then return end
+
+	local pool = CW.State.hitSoundPool
+	if pool and #pool > 0 then
+		local index = ((CW.State.hitSoundIndex or 0) % #pool) + 1
+		CW.State.hitSoundIndex = index
+		local sound = pool[index]
+		local ok = pcall(function()
+			sound.Volume       = CW.Settings.SOUND_VOLUME
+			sound.TimePosition = 0
+			sound:Play()
+		end)
+		if ok then return end
+	end
+
+	playOnDemand()
+end
 end
 
-
-do
 -- Texture.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1753,6 +1830,7 @@ end
 
 
 do
+do
 -- Hook.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1760,25 +1838,60 @@ local Players           = game:GetService("Players")
 local TweenService      = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService  = game:GetService("UserInputService")
+local RunService        = game:GetService("RunService")
 
 local LocalPlayer = CW.LocalPlayer
 
--- Shot handler. Stored on CW so a re-run updates the logic without re-hooking.
+-- How it works
+--   The __namecall hook runs on the GAME's thread, which lacks the capabilities needed to
+--   parent GUI into gethui() ("lacking capability Plugin"). So the hook does nothing but
+--   copy the hit parts into a small queue (plain tables only, no Instance method calls, so
+--   the namecall state stays intact for OldNameCall). A PreRender connection created from
+--   this script's own thread drains the queue and does the real work (hit sound + hitmarker).
+--
+--   CW.onShot is what the hook calls. Both the hook installed by an earlier run and the one
+--   below call it through the CW table, so re-running the script is enough to update it.
+
+local MAX_QUEUE   = 32   -- shots waiting for the next frame (oldest dropped beyond this)
+local MAX_BULLETS = 64   -- bullets copied per shot
+local MAX_AGE     = 1    -- seconds; older queued shots are discarded instead of drawn late
+
+CW.State.shotQueue = CW.State.shotQueue or {}
+
+-- Called from the game's thread: ONLY table work here. No :Method() calls on Instances.
 function CW.onShot(bullets)
 	if type(bullets) ~= "table" then return end
 
-	local shotHit = false
+	local hits, n = {}, 0
 	for _, bullet in pairs(bullets) do
+		if n >= MAX_BULLETS then break end
 		if type(bullet) == "table" then
 			local hit = bullet[3]
-			if typeof(hit) == "Instance" and hit:IsA("BasePart") and hit.Parent then
-				local character = hit.Parent
-				local player = Players:GetPlayerFromCharacter(character)
-					or (character.Parent and Players:GetPlayerFromCharacter(character.Parent))
-				if player and player ~= LocalPlayer and player.TeamColor ~= CW.State.cachedTeamColor then
-					shotHit = true
-					break
-				end
+			if hit ~= nil then
+				n = n + 1
+				hits[n] = hit
+			end
+		end
+	end
+	if n == 0 then return end
+
+	local queue = CW.State.shotQueue
+	if #queue >= MAX_QUEUE then table.remove(queue, 1) end
+	queue[#queue + 1] = { hits = hits, time = os.clock() }
+end
+
+-- Runs on this script's thread (from the PreRender drain): the real shot logic.
+function CW.processShot(hits)
+	local shotHit = false
+	for i = 1, #hits do
+		local hit = hits[i]
+		if typeof(hit) == "Instance" and hit:IsA("BasePart") and hit.Parent then
+			local character = hit.Parent
+			local player = Players:GetPlayerFromCharacter(character)
+				or (character.Parent and Players:GetPlayerFromCharacter(character.Parent))
+			if player and player ~= LocalPlayer and player.TeamColor ~= CW.State.cachedTeamColor then
+				shotHit = true
+				break
 			end
 		end
 	end
@@ -1835,8 +1948,44 @@ function CW.onShot(bullets)
 	end)
 end
 
--- The hook only forwards the call: our logic runs deferred and protected,
--- so it can never break or delay the game's own FireServer.
+local function traceHandler(err)
+	return debug.traceback(tostring(err), 2)
+end
+
+-- Empties the queue. Errors are caught per shot and printed with a traceback (first 5 only,
+-- so a persistent failure cannot flood the console).
+function CW.drainShots()
+	local queue = CW.State.shotQueue
+	if not queue or #queue == 0 then return end
+	CW.State.shotQueue = {}
+
+	local now = os.clock()
+	for i = 1, #queue do
+		local entry = queue[i]
+		if now - entry.time <= MAX_AGE then
+			local ok, err = xpcall(CW.processShot, traceHandler, entry.hits)
+			if not ok then
+				CW.State.shotErrors = (CW.State.shotErrors or 0) + 1
+				if CW.State.shotErrors <= 5 then
+					CW.Warn("Shot handler error: " .. tostring(err))
+				end
+			end
+		end
+	end
+end
+
+-- Created once per session. It looks CW.drainShots up on every frame, so a re-run that
+-- redefines the function takes effect without a second connection.
+if not CW.State.shotDrainConn then
+	CW.State.shotDrainConn = RunService.PreRender:Connect(function()
+		local drain = CW.drainShots
+		if drain then drain() end
+	end)
+end
+
+-- The hook only forwards the call: it copies the hit parts into the queue and returns the
+-- game's own result untouched, so it can never break or delay the game's FireServer.
+-- getnamecallmethod() is read first, before anything that could alter the namecall state.
 local function installShootHook()
 	if CW.State.shootHooked then return true end
 
@@ -1847,13 +1996,9 @@ local function installShootHook()
 
 	local OldNameCall
 	OldNameCall = hookmetamethod(shootEvent, "__namecall", newcclosure(function(self, ...)
-		if checkcaller() then return OldNameCall(self, ...) end
-		if getnamecallmethod() == "FireServer" and self == CW.ShootEvent then
-			local bullets = ...
-			task.defer(function()
-				local ok, err = pcall(CW.onShot, bullets)
-				if not ok then CW.Warn("Shot handler error: " .. tostring(err)) end
-			end)
+		if getnamecallmethod() == "FireServer" and not checkcaller() and self == CW.ShootEvent then
+			local enqueue = CW.onShot
+			if enqueue then pcall(enqueue, (...)) end
 		end
 		return OldNameCall(self, ...)
 	end))
@@ -1875,9 +2020,6 @@ if not installShootHook() and not CW.State.shootHookRetrying then
 	end)
 end
 end
-
-
-do
 -- Cleanup.lua
 local CW = getgenv().__CW_CORE_STATE
 
@@ -1902,6 +2044,7 @@ if CW.IsFirstRun then
 		pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
 		pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
 		pcall(function() if CW.State.stopWeaponShootSoundOverrides then CW.State.stopWeaponShootSoundOverrides() end end)
+		pcall(function() if CW.State.shotDrainConn then CW.State.shotDrainConn:Disconnect() end end)
 		pcall(function()
 			local contextActions = game:GetService("ContextActionService")
 			contextActions:UnbindAction("CycleWareSprintToggle")
