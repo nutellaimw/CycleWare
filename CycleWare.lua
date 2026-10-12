@@ -1,4 +1,22 @@
-local SCRIPT_VERSION = "phase-2"
+-- CycleWare (phase-4). Standalone entry point; module bodies below are kept in isolated scopes.
+--
+-- Optional, to pin the UI library (see the notes next to UI_PIN_*):
+--   getgenv().CW_CONFIG = { UI_COMMIT = "<commit hash of CWUI.lua>", UI_CRC32 = "<8 hex chars>" }
+
+--=============================================================================
+-- Preflight
+--   Executor functions this script depends on. Whatever is missing is replaced by a safe
+--   stand-in, so a single missing function disables one feature instead of aborting the
+--   whole script. What was found is stored in CW.Caps and reported once at startup.
+--=============================================================================
+local SCRIPT_VERSION = "phase-4"
+
+-- UI pinning. Fill both after you upload CWUI.lua:
+--   UI_PIN_COMMIT: the commit hash that contains the CWUI.lua you want (7 to 40 hex chars).
+--   UI_PIN_CRC32:  the crc32 of that file as 8 lowercase hex chars; the UI is refused if it differs.
+-- Left empty, the UI is loaded from the main branch without any check (a warning is shown once).
+local UI_PIN_COMMIT = ""
+local UI_PIN_CRC32  = ""
 
 local CAPS = {
 	files = type(isfile) == "function" and type(isfolder) == "function"
@@ -15,15 +33,12 @@ local CAPS = {
 		or nil,
 }
 do
-	-- Only used for the startup report: game:HttpGet itself is always tried first.
 	local indexed, value = pcall(function() return game.HttpGet end)
 	CAPS.httpGet = indexed and type(value) == "function"
 end
 
 local getgenv = getgenv
 if not CAPS.getgenv then
-	-- No shared environment: state lives in a private table, so re-running the script
-	-- without rejoining cannot reuse the previous run's state.
 	local privateEnv = {}
 	getgenv = function() return privateEnv end
 end
@@ -37,8 +52,7 @@ local listfiles      = listfiles or function() return {} end
 local getcustomasset = getcustomasset or getsynasset
 	or function() error("getcustomasset is unavailable", 0) end
 
--- Runs one module in isolation: if it throws, the error is reported and the modules after it
--- still load (the UI, for example, no longer disappears because one earlier module failed).
+-- Runs one module in isolation: if it throws, the error is reported and the modules after it still load.
 local function runModule(name, fn)
 	local ok, err = xpcall(fn, function(message)
 		return debug.traceback(tostring(message), 2)
@@ -127,9 +141,8 @@ function CW.Warn(msg)
 end
 
 --// Connection registry -------------------------------------------------------------
--- Every long-lived connection is registered under a key. Registering again under the same
--- key disconnects the previous one, so a re-run REPLACES the old code instead of leaving it
--- active next to the new one, and CW.untrackAll() can release everything on cleanup.
+-- Registering again under the same key disconnects the previous connection, so a re-run
+-- REPLACES the old code instead of leaving it active next to the new one.
 CW.State.conns = CW.State.conns or {}
 
 function CW.track(key, connection)
@@ -157,14 +170,19 @@ function CW.untrackAll()
 	end
 end
 
---// HTTP -----------------------------------------------------------------------------
--- game:HttpGet first (as before), then the executor's request function. Raises an error when
--- nothing works; callers already wrap it in pcall.
-function CW.httpGet(url)
-	local ok, result = pcall(function() return game:HttpGet(url) end)
-	if ok and type(result) == "string" then return result end
-	local lastError = result
+--// Teams ----------------------------------------------------------------------------
+-- Neutral players (no team, free-for-all) count as enemies; otherwise teams are compared.
+function CW.isEnemy(player)
+	if not player or player == LocalPlayer then return false end
+	if LocalPlayer.Neutral or player.Neutral then return true end
+	return player.TeamColor ~= CW.State.cachedTeamColor
+end
 
+--// HTTP -----------------------------------------------------------------------------
+-- The executor's request function goes first: game:HttpGet blocks the main thread on many
+-- executors, so it is only the fallback. Raises an error when nothing works.
+function CW.httpGet(url)
+	local lastError
 	local requestFn = CW.Caps.request
 	if requestFn then
 		local sent, response = pcall(requestFn, { Url = url, Method = "GET" })
@@ -177,7 +195,10 @@ function CW.httpGet(url)
 			lastError = response
 		end
 	end
-	error(tostring(lastError or "no HTTP function available"), 0)
+
+	local ok, result = pcall(function() return game:HttpGet(url) end)
+	if ok and type(result) == "string" then return result end
+	error(tostring(lastError or result or "no HTTP function available"), 0)
 end
 
 --// Startup report -------------------------------------------------------------------
@@ -204,6 +225,7 @@ CW.Paths.LIBRARY_ROOT = CW.Paths.CURSOR_ROOT .. "/Library"
 CW.Paths.CURSORS_FOLDER = CW.Paths.LIBRARY_ROOT .. "/Cursors"
 CW.Paths.HITMARKERS_FOLDER = CW.Paths.LIBRARY_ROOT .. "/Hitmarkers"
 CW.Paths.HIT_SOUNDS_FOLDER = CW.Paths.LIBRARY_ROOT .. "/HitSounds"
+CW.Paths.WEAPON_SOUNDS_FOLDER = CW.Paths.LIBRARY_ROOT .. "/WeaponSounds"
 CW.Paths.TEXTURES_FOLDER = CW.Paths.LIBRARY_ROOT .. "/Textures"
 CW.Paths.OFFICIAL_FOLDER = "_Official"
 CW.Paths.CACHE_FOLDER = CW.Paths.CURSOR_ROOT .. "/Cache"
@@ -217,17 +239,27 @@ CW.Paths.SETTINGS_FILE = CW.Paths.CACHE_FOLDER .. "/ui_settings.json"
 CW.Paths.CURSOR_FILE = nil
 CW.Paths.HITMARKER_FILE = nil
 CW.Paths.SOUND_FILE = nil
-CW.Paths.TEXTURE_FILE = nil
 
+-- Everything is off by default; only what the player changes is saved (see saveSettings).
 CW.Settings.HITMARKER_SIZE             = numOr(_cfg.HITMARKER_SIZE, 50, 1)
 CW.Settings.SOUND_VOLUME               = numOr(_cfg.SOUND_VOLUME, 1, 0)
 CW.Settings.CURSOR_TARGET_SIZE         = numOr(_cfg.CURSOR_TARGET_SIZE, 82, 1)
 CW.Settings.HITMARKER_VISIBLE_DURATION = numOr(_cfg.HITMARKER_VISIBLE_DURATION, 0.05, 0)
 CW.Settings.HITMARKER_FADEOUT_DURATION = numOr(_cfg.HITMARKER_FADEOUT_DURATION, 0.15, 0)
 
-CW.Settings.HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, true)
-CW.Settings.HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, true)
-CW.Settings.HITMARKER_FADEOUT         = boolOr(_cfg.HITMARKER_FADEOUT, true)
+CW.Settings.HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, false)
+CW.Settings.HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, false)
+CW.Settings.HITMARKER_FADEOUT         = boolOr(_cfg.HITMARKER_FADEOUT, false)
+
+-- Snapshot of the defaults, taken before any saved value is applied. The save routine
+-- writes only the settings whose value differs from these.
+CW.Defaults = {}
+for _, key in ipairs({
+	"HITMARKER_SIZE", "SOUND_VOLUME", "CURSOR_TARGET_SIZE", "HITMARKER_VISIBLE_DURATION",
+	"HITMARKER_FADEOUT_DURATION", "HITMARKER_RANDOM_ROTATION", "HITMARKER_FOLLOW_MOUSE", "HITMARKER_FADEOUT",
+}) do
+	CW.Defaults[key] = CW.Settings[key]
+end
 
 CW.Settings.ASSET_SELECTIONS = CW.Settings.ASSET_SELECTIONS or {
 	Cursor = nil,
@@ -249,6 +281,7 @@ if settingsFileExists then
 		local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
 
 		if ok2 and type(data) == "table" then
+			local savedVersion = tonumber(data.schemaVersion) or 1
 			local values = data.Settings
 			if type(values) ~= "table" then
 				values = {}
@@ -288,6 +321,25 @@ if settingsFileExists then
 					end
 				end
 			end
+
+			-- Files written before schema 3 stored every setting, including toggles that used to be
+			-- ON by default. Those toggles are now OFF by default, so the old values are dropped once.
+			if savedVersion < 3 then
+				local reset = {}
+				for _, key in ipairs({
+					"AUTO_RELOAD_ENABLED", "WEAPON_SOUND_OVERRIDE_ENABLED", "HITMARKER_RANDOM_ROTATION",
+					"HITMARKER_FOLLOW_MOUSE", "HITMARKER_FADEOUT",
+				}) do
+					if values[key] ~= nil then
+						values[key] = nil
+						table.insert(reset, key)
+					end
+				end
+				if #reset > 0 then
+					CW.Warn("Settings are now off by default. Reset once from the old save: " .. table.concat(reset, ", ") .. ". Turn on what you want; it will be saved.")
+				end
+			end
+
 			CW._SavedSettings = values
 			for key, value in pairs(values) do
 				local current = CW.Settings[key]
@@ -326,8 +378,7 @@ do
 	CW.State.mouseX, CW.State.mouseY = loc.X, loc.Y
 end
 
--- Created on every run and registered with CW.track: a re-run replaces the previous
--- connections, so updated code takes effect without rejoining.
+-- Created on every run and registered with CW.track: a re-run replaces the previous connections.
 do
 	CW.State.cachedTeamColor = LocalPlayer.TeamColor
 	CW.track("teamColor", LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
@@ -378,6 +429,7 @@ local ALL_FOLDERS = {
 	CW.Paths.HITMARKERS_FOLDER.."/"..CW.Paths.OFFICIAL_FOLDER,
 	CW.Paths.HIT_SOUNDS_FOLDER,
 	CW.Paths.HIT_SOUNDS_FOLDER.."/"..CW.Paths.OFFICIAL_FOLDER,
+	CW.Paths.WEAPON_SOUNDS_FOLDER,
 	CW.Paths.TEXTURES_FOLDER,
 	CW.Paths.CACHE_FOLDER,
 	CW.Paths.GENERATED_FOLDER,
@@ -393,7 +445,7 @@ function CW.ensureFolders()
 end
 CW.ensureFolders()
 
--- Cooperative yielding for heavy loops (PNG codec) so the game never freezes.
+-- Cooperative yielding for heavy loops (PNG codec, checksums) so the game never freezes.
 local lastYield = os.clock()
 function CW.yieldBudget()
 	if os.clock() - lastYield > 0.008 then
@@ -447,6 +499,18 @@ function CW.crc32(s)
 	return bxor(c, 0xFFFFFFFF)
 end
 
+-- Same result as CW.crc32, but hands the thread back to the game now and then. Only call it
+-- from a thread that is allowed to yield (the sync thread, a task.spawn, the executor thread).
+function CW.crc32Yielding(s)
+	local c = 0xFFFFFFFF
+	local length = #s
+	for i = 1, length do
+		c = bxor(_crcT[band(bxor(c, sbyte(s, i)), 0xFF)], rshift(c, 8))
+		if i % 65536 == 0 then CW.yieldBudget() end
+	end
+	return bxor(c, 0xFFFFFFFF)
+end
+
 function CW.computeFileSignature(path, prefix, extra)
 	extra = extra or ""
 	if not path or not isfile(path) then
@@ -485,13 +549,18 @@ local HttpService = game:GetService("HttpService")
 local CATEGORY_INFO = {
 	Cursors = { folder = CW.Paths.CURSORS_FOLDER, extensions = { png = true } },
 	Hitmarkers = { folder = CW.Paths.HITMARKERS_FOLDER, extensions = { png = true } },
-	-- Roblox only decodes mp3/ogg for audio; wav is not supported.
 	HitSounds = { folder = CW.Paths.HIT_SOUNDS_FOLDER, extensions = { mp3 = true, ogg = true } },
 }
 local SELECTION_KEYS = {
 	Cursors = "Cursor",
 	Hitmarkers = "Hitmarker",
 	HitSounds = "HitSound",
+}
+-- Categories stored per weapon: <category>/<Weapon>/<file>. The weapon names are the same
+-- ones the Textures folders use.
+local WEAPON_CATEGORIES = {
+	Textures = { folder = CW.Paths.TEXTURES_FOLDER, extensions = { png = true } },
+	WeaponSounds = { folder = CW.Paths.WEAPON_SOUNDS_FOLDER, extensions = { mp3 = true, ogg = true } },
 }
 local ASSET_EXTENSIONS = { png = true, mp3 = true, ogg = true }
 
@@ -524,9 +593,10 @@ local function validManifestPath(category, path)
 		return path:match("^" .. category .. "/[^/]+$") ~= nil
 			and info.extensions[extension] == true
 	end
-	if category == "Textures" then
-		return path:match("^Textures/[^/]+/[^/]+$") ~= nil
-			and extension == "png"
+	local weaponInfo = WEAPON_CATEGORIES[category]
+	if weaponInfo then
+		return path:match("^" .. category .. "/[^/]+/[^/]+$") ~= nil
+			and weaponInfo.extensions[extension] == true
 	end
 	return false
 end
@@ -566,21 +636,30 @@ end
 CW.Library = {}
 CW.Library.ensureFolder = ensureFolderPath
 
-function CW.Library.list(category, weapon)
+-- Directory scans read and validate every file, so the result is cached per category/weapon.
+-- The cache is cleared whenever the library can have changed (CW.Library.sync).
+local listCache = {}
+
+function CW.Library.invalidate()
+	table.clear(listCache)
+end
+
+local function scanLibrary(category, weapon)
 	local info = CATEGORY_INFO[category]
+	local weaponInfo = WEAPON_CATEGORIES[category]
 	local directories = {}
 	if info then
 		table.insert(directories, info.folder .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 		table.insert(directories, info.folder)
-	elseif category == "Textures" and type(weapon) == "string" then
-		local weaponFolder = CW.Paths.TEXTURES_FOLDER .. "/" .. weapon
+	elseif weaponInfo and type(weapon) == "string" then
+		local weaponFolder = weaponInfo.folder .. "/" .. weapon
 		table.insert(directories, weaponFolder .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 		table.insert(directories, weaponFolder)
 	else
-		return {}
+		return nil
 	end
 
-	local extensions = info and info.extensions or { png = true }
+	local extensions = (info or weaponInfo).extensions
 	local result = {}
 	for _, directory in ipairs(directories) do
 		local ok, files = pcall(listfiles, directory)
@@ -615,6 +694,21 @@ function CW.Library.list(category, weapon)
 	return result
 end
 
+function CW.Library.list(category, weapon)
+	local key = tostring(category) .. "|" .. tostring(weapon)
+	local cached = listCache[key]
+	if not cached then
+		cached = scanLibrary(category, weapon)
+		if not cached then return {} end
+		listCache[key] = cached
+	end
+	local copy = table.create and table.create(#cached) or {}
+	for index, item in ipairs(cached) do
+		copy[index] = { Name = item.Name, Path = item.Path, Relative = item.Relative }
+	end
+	return copy
+end
+
 function CW.Library.relative(path)
 	return libraryRelative(path)
 end
@@ -630,6 +724,10 @@ function CW.Library.setSelection(category, weapon, relative)
 	end
 end
 
+-- Returns the file to use for a category (and weapon) plus its relative path.
+-- A saved selection whose file is not on disk yet is NOT overwritten: it stays saved and is
+-- used again as soon as the file exists. Meanwhile the first file (or nothing, for textures)
+-- is used without being persisted.
 function CW.Library.selectedPath(category, weapon)
 	local selections = CW.Settings.ASSET_SELECTIONS
 	local selected
@@ -643,24 +741,22 @@ function CW.Library.selectedPath(category, weapon)
 	for _, item in ipairs(files) do
 		if item.Relative == selected then return item.Path, item.Relative end
 	end
+	if category == "Textures" then return nil, nil end
+
 	local first = files[1]
-	if category == "Textures" then
-		CW.Library.setSelection(category, weapon, nil)
-		return nil, nil
-	end
-	if first then
+	if not first then return nil, nil end
+	if selected == nil then
 		CW.Library.setSelection(category, weapon, first.Relative)
-		return first.Path, first.Relative
 	end
-	CW.Library.setSelection(category, weapon, nil)
-	return nil, nil
+	return first.Path, first.Relative
 end
 
 local function officialDestination(category, relativePath)
-	if category == "Textures" then
-		local weapon, filename = relativePath:match("^Textures/([^/]+)/([^/]+)$")
+	local weaponInfo = WEAPON_CATEGORIES[category]
+	if weaponInfo then
+		local weapon, filename = relativePath:match("^" .. category .. "/([^/]+)/([^/]+)$")
 		if not validWeaponName(weapon) then return nil end
-		return CW.Paths.TEXTURES_FOLDER .. "/" .. weapon .. "/" .. CW.Paths.OFFICIAL_FOLDER .. "/" .. filename
+		return weaponInfo.folder .. "/" .. weapon .. "/" .. CW.Paths.OFFICIAL_FOLDER .. "/" .. filename
 	end
 	local info = CATEGORY_INFO[category]
 	if not info then return nil end
@@ -697,10 +793,12 @@ local function pruneOfficial(expected)
 	for _, info in pairs(CATEGORY_INFO) do
 		pruneFolder(info.folder .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 	end
-	local ok, weaponFolders = pcall(listfiles, CW.Paths.TEXTURES_FOLDER)
-	if ok and type(weaponFolders) == "table" then
-		for _, weaponFolder in ipairs(weaponFolders) do
-			pruneFolder((tostring(weaponFolder):gsub("\\", "/")) .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+	for _, info in pairs(WEAPON_CATEGORIES) do
+		local ok, weaponFolders = pcall(listfiles, info.folder)
+		if ok and type(weaponFolders) == "table" then
+			for _, weaponFolder in ipairs(weaponFolders) do
+				pruneFolder((tostring(weaponFolder):gsub("\\", "/")) .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+			end
 		end
 	end
 end
@@ -745,20 +843,22 @@ local function syncImpl()
 	local pending = {}
 
 	for category, entries in pairs(manifest.assets) do
-		if category == "Textures" and type(entries) == "table" then
+		local weaponInfo = WEAPON_CATEGORIES[category]
+		if weaponInfo and type(entries) == "table" then
+			-- assets.<Category>[Weapon] = { { path = "<Category>/<Weapon>/<file>", crc32 = "..." }, ... }
 			for weapon, weaponEntries in pairs(entries) do
 				if validWeaponName(weapon) and type(weaponEntries) == "table" then
-					ensureFolderPath(CW.Paths.TEXTURES_FOLDER .. "/" .. weapon .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+					ensureFolderPath(weaponInfo.folder .. "/" .. weapon .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 					for _, entry in ipairs(weaponEntries) do
 						local manifestWeapon
 						if type(entry) == "table" and type(entry.path) == "string" then
-							manifestWeapon = entry.path:match("^Textures/([^/]+)/")
+							manifestWeapon = entry.path:match("^" .. category .. "/([^/]+)/")
 						end
 						if type(entry) == "table" and manifestWeapon == weapon and validManifestPath(category, entry.path) then
 							table.insert(pending, { category = category, path = entry.path, crc32 = entry.crc32 })
 						else
 							skipped = skipped + 1
-							CW.Warn("Skipped invalid texture entry in manifest")
+							CW.Warn("Skipped invalid " .. category .. " entry in manifest")
 						end
 					end
 				else
@@ -774,7 +874,7 @@ local function syncImpl()
 					CW.Warn("Skipped invalid " .. category .. " entry in manifest")
 				end
 			end
-		elseif category ~= "Textures" then
+		else
 			complete = false
 			skipped = skipped + 1
 			CW.Warn("Skipped unsupported manifest category: " .. tostring(category))
@@ -805,7 +905,7 @@ local function syncImpl()
 				if actualFormat == entry.path:match("%.([%w]+)$"):lower() then
 					if entry.crc32 then
 						local expectedCRC = tostring(entry.crc32):lower():gsub("^0x", "")
-						needsDownload = string.format("%08x", CW.crc32(existing)):lower() ~= expectedCRC
+						needsDownload = string.format("%08x", CW.crc32Yielding(existing)):lower() ~= expectedCRC
 					else
 						needsDownload = previousRevision ~= revision
 					end
@@ -821,7 +921,7 @@ local function syncImpl()
 					local actualFormat = detectAssetFormat(entry.path, bytes)
 					local expectedFormat = entry.path:match("%.([%w]+)$"):lower()
 					local expectedCRC = entry.crc32 and tostring(entry.crc32):lower():gsub("^0x", "")
-					local actualCRC = string.format("%08x", CW.crc32(bytes)):lower()
+					local actualCRC = string.format("%08x", CW.crc32Yielding(bytes)):lower()
 					if actualFormat ~= expectedFormat then
 						complete = false
 						CW.Warn("Rejected " .. entry.path .. ": expected " .. expectedFormat .. " content, detected " .. actualFormat .. ". Check the GitHub path and file format.")
@@ -849,8 +949,8 @@ local function syncImpl()
 		if index % 5 == 0 then task.wait() end
 	end
 
-	-- Persist a valid manifest revision even when a few entries fail. Good files then
-	-- stay cached, while missing/invalid paths are retried because their files fail validation.
+	-- Persist a valid manifest revision even when a few entries fail. Good files stay cached,
+	-- while missing/invalid paths are retried because their files fail validation.
 	pcall(writefile, CW.Paths.LIBRARY_REVISION_FILE, revision)
 	if complete then
 		if skipped == 0 and #pending > 0 then pruneOfficial(expected) end
@@ -868,7 +968,9 @@ function CW.Library.sync()
 		return CW.State.lastSyncResult == true
 	end
 	CW.State.syncing = true
+	CW.Library.invalidate() -- files may have been added or removed by hand since the last scan
 	local ok, result = pcall(syncImpl)
+	CW.Library.invalidate() -- ... and the sync itself may have written new ones
 	CW.State.syncing = false
 	CW.State.lastSyncResult = ok and result == true
 	if not ok then error(result, 0) end
@@ -880,13 +982,13 @@ CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
 CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
 end)
 
-
 runModule("PNG", function()
 -- PNG.lua
 local CW = getgenv().__CW_CORE_STATE
 
 local floor   = math.floor
 local mmin    = math.min
+local mmax    = math.max
 local mabs    = math.abs
 local sbyte   = string.byte
 local schar   = string.char
@@ -915,75 +1017,43 @@ end
 
 local function pngChunk(t, data)
 	local p = t..data
-	return u32be(#data)..p..u32be(CW.crc32(p))
+	return u32be(#data)..p..u32be(CW.crc32Yielding(p))
 end
 
-local function literalCode(n)
-	if n <= 143 then
-		return 0x30 + n, 8
-	else
-		return 0x190 + (n - 144), 9
-	end
-end
-
-local function deflateFixedHuffman(raw)
-	local outBytes = {}
-	local bitbuf, bitcnt = 0, 0
-
-	local function pushBit(bit)
-		bitbuf = bitbuf + bit * (2 ^ bitcnt)
-		bitcnt = bitcnt + 1
-		if bitcnt == 8 then
-			outBytes[#outBytes + 1] = schar(bitbuf)
-			bitbuf, bitcnt = 0, 0
-		end
-	end
-
-	local function writeBitsLSB(value, n)
-		for i = 0, n - 1 do
-			pushBit(band(rshift(value, i), 1))
-		end
-	end
-
-	local function writeHuffman(code, len)
-		for i = len - 1, 0, -1 do
-			pushBit(band(rshift(code, i), 1))
-		end
-	end
-
-	writeBitsLSB(1, 1)
-	writeBitsLSB(1, 2)
-
-	for i = 1, #raw do
-		local code, len = literalCode(sbyte(raw, i))
-		writeHuffman(code, len)
-		if i % 8192 == 0 then CW.yieldBudget() end
-	end
-
-	writeHuffman(0, 7)
-
-	if bitcnt > 0 then
-		outBytes[#outBytes + 1] = schar(bitbuf)
-	end
-
-	return tconcat(outBytes)
+-- Deflate "stored" blocks (no compression). The cursor files are small, local and only read by
+-- the engine, so skipping compression makes the encoder dramatically faster than the old
+-- bit-by-bit Huffman writer. Each block holds at most 65535 bytes.
+local function deflateStored(raw)
+	local parts = {}
+	local total = #raw
+	local pos = 1
+	repeat
+		local len = mmin(65535, total - pos + 1)
+		local final = (pos + len > total) and 1 or 0
+		local nlen = bxor(len, 0xFFFF)
+		parts[#parts + 1] = schar(final, band(len, 0xFF), rshift(len, 8), band(nlen, 0xFF), rshift(nlen, 8))
+		parts[#parts + 1] = raw:sub(pos, pos + len - 1)
+		pos = pos + len
+	until pos > total
+	return tconcat(parts)
 end
 
 function CW.encodePNG(px, w, h)
 	local rows = {}
-	for y = 0, h-1 do
-		local row = {"\0"}
-		for x = 0, w-1 do
-			local i = (y*w+x)*4+1
-			row[#row+1] = schar(px[i], px[i+1], px[i+2], px[i+3])
+	local rowLen = w * 4
+	for y = 0, h - 1 do
+		local base = y * rowLen
+		local parts = { "\0" }
+		for s = 1, rowLen, 4096 do
+			parts[#parts + 1] = schar(tunpack(px, base + s, base + mmin(s + 4095, rowLen)))
 		end
-		rows[y+1] = tconcat(row)
-		if y % 8 == 0 then CW.yieldBudget() end
+		rows[y + 1] = tconcat(parts)
+		if y % 16 == 0 then CW.yieldBudget() end
 	end
 	local raw = tconcat(rows)
 	return "\137\80\78\71\13\10\26\10"
 		.. pngChunk("IHDR", u32be(w)..u32be(h).."\8\6\0\0\0")
-		.. pngChunk("IDAT", "\120\1"..deflateFixedHuffman(raw)..u32be(adler32(raw)))
+		.. pngChunk("IDAT", "\120\1"..deflateStored(raw)..u32be(adler32(raw)))
 		.. pngChunk("IEND", "")
 end
 
@@ -1074,7 +1144,13 @@ local function inflate(data)
 	repeat
 		local bfinal, btype = readbits(1), readbits(2)
 		if btype == 0 then
-			if bitcount%8 ~= 0 then readbits(bitcount%8) end
+			-- Stored block. The bit reader may already have prefetched whole bytes beyond the
+			-- block header, so after discarding the partial byte those bytes are handed back
+			-- (pos moves back) before the LEN/NLEN fields and the raw data are read.
+			local partial = bitcount % 8
+			if partial > 0 then readbits(partial) end
+			pos = pos - floor(bitcount / 8)
+			bitbuf, bitcount = 0, 0
 			local len = bytes[pos] + bytes[pos+1]*256; pos = pos+4
 			for i = 0, len-1 do out[opos]=bytes[pos+i]; opos=opos+1 end
 			pos = pos+len
@@ -1183,17 +1259,61 @@ function CW.parsePNG(data)
 	return px, w, h
 end
 
+-- Smooth resize. Shrinking averages every source pixel under the target pixel (box filter),
+-- enlarging interpolates (bilinear). Colors are weighted by alpha, so transparent edges do
+-- not bleed dark fringes into the cursor.
 function CW.resizePixels(px, w, h, tw, th)
-	if tw==w and th==h then return px,w,h end
-	local out, scaleX, scaleY = {}, w/tw, h/th
-	for y=0,th-1 do
-		if y % 8 == 0 then CW.yieldBudget() end
-		local srcY = mmin(floor(y*scaleY), h-1)
-		for x=0,tw-1 do
-			local srcX = mmin(floor(x*scaleX), w-1)
-			local src=(srcY*w+srcX)*4+1; local dst=(y*tw+x)*4+1
-			out[dst]=px[src] or 0; out[dst+1]=px[src+1] or 0
-			out[dst+2]=px[src+2] or 0; out[dst+3]=px[src+3] or 0
+	if tw == w and th == h then return px, w, h end
+	local out = {}
+	local sx, sy = w / tw, h / th
+	local ceil = math.ceil
+
+	local function acc(i, weight, sr, sg, sb, sa)
+		local a = (px[i + 3] or 0) * weight
+		return sr + (px[i] or 0) * a, sg + (px[i + 1] or 0) * a, sb + (px[i + 2] or 0) * a, sa + a
+	end
+
+	for y = 0, th - 1 do
+		if y % 4 == 0 then CW.yieldBudget() end
+		for x = 0, tw - 1 do
+			local dst = (y * tw + x) * 4 + 1
+			local sr, sg, sb, sa = 0, 0, 0, 0
+			local alpha
+
+			if sx > 1 or sy > 1 then
+				local x0 = mmin(floor(x * sx), w - 1)
+				local x1 = mmin(mmax(x0, ceil((x + 1) * sx) - 1), w - 1)
+				local y0 = mmin(floor(y * sy), h - 1)
+				local y1 = mmin(mmax(y0, ceil((y + 1) * sy) - 1), h - 1)
+				local count = 0
+				for yy = y0, y1 do
+					for xx = x0, x1 do
+						sr, sg, sb, sa = acc((yy * w + xx) * 4 + 1, 1, sr, sg, sb, sa)
+						count = count + 1
+					end
+				end
+				alpha = sa / count
+			else
+				local fx = mmax(0, (x + 0.5) * sx - 0.5)
+				local fy = mmax(0, (y + 0.5) * sy - 0.5)
+				local x0, y0 = mmin(floor(fx), w - 1), mmin(floor(fy), h - 1)
+				local x1, y1 = mmin(x0 + 1, w - 1), mmin(y0 + 1, h - 1)
+				local tx, ty = fx - x0, fy - y0
+				sr, sg, sb, sa = acc((y0 * w + x0) * 4 + 1, (1 - tx) * (1 - ty), sr, sg, sb, sa)
+				sr, sg, sb, sa = acc((y0 * w + x1) * 4 + 1, tx * (1 - ty), sr, sg, sb, sa)
+				sr, sg, sb, sa = acc((y1 * w + x0) * 4 + 1, (1 - tx) * ty, sr, sg, sb, sa)
+				sr, sg, sb, sa = acc((y1 * w + x1) * 4 + 1, tx * ty, sr, sg, sb, sa)
+				alpha = sa
+			end
+
+			if sa > 0 then
+				out[dst]     = mmin(255, floor(sr / sa + 0.5))
+				out[dst + 1] = mmin(255, floor(sg / sa + 0.5))
+				out[dst + 2] = mmin(255, floor(sb / sa + 0.5))
+				out[dst + 3] = mmin(255, floor(alpha + 0.5))
+			else
+				out[dst], out[dst + 1], out[dst + 2], out[dst + 3] = 0, 0, 0, 0
+			end
 		end
 	end
 	CW.Log(sformat("Resized to %d×%d", tw, th))
@@ -1241,9 +1361,10 @@ local function computeCursorSourceSignature()
 	for _, v in ipairs(TINT_VARIANTS) do
 		tintSig = tintSig.."|"..v.key..":"..v.tR..","..v.tG..","..v.tB
 	end
+	-- "|fit" marks the aspect-preserving resize, so caches made by older versions are rebuilt.
 	return CW.computeFileSignature(
 		CW.Paths.CURSOR_FILE, "cur",
-		"|size:"..tostring(CW.Settings.CURSOR_TARGET_SIZE)..tintSig
+		"|size:"..tostring(CW.Settings.CURSOR_TARGET_SIZE).."|fit"..tintSig
 	)
 end
 
@@ -1321,9 +1442,14 @@ local function reloadCursorFromSource(sigHash, data)
 	end
 	CW.Log(sformat("Loaded new cursor.png (%d×%d)", w, h))
 
+	-- The longest side becomes the target size and the other side follows the image's aspect
+	-- ratio, so non-square cursors are no longer stretched.
 	local targetSize = CW.Settings.CURSOR_TARGET_SIZE
 	if targetSize then
-		px, w, h = CW.resizePixels(px, w, h, targetSize, targetSize)
+		local scale = targetSize / math.max(w, h)
+		local tw = math.max(1, math.floor(w * scale + 0.5))
+		local th = math.max(1, math.floor(h * scale + 0.5))
+		px, w, h = CW.resizePixels(px, w, h, tw, th)
 	end
 
 	local files = buildCursorFiles(sigHash)
@@ -1388,8 +1514,8 @@ local function generateCursorsOnce()
 	end
 end
 
--- The codec now yields, so serialise runs: a request made while one is running
--- marks the state dirty and triggers exactly one more pass with the latest settings.
+-- The codec yields, so runs are serialised: a request made while one is running marks the
+-- state dirty and triggers exactly one more pass with the latest settings.
 local function generateCursors()
 	if CW.State.cursorBusy then
 		CW.State.cursorDirty = true
@@ -1409,8 +1535,14 @@ task.spawn(generateCursors)
 
 -- Registered with CW.track: a re-run replaces the loop with this version's code.
 do
+	-- Mouse.Target is a raycast, so it is sampled 25 times per second instead of every frame.
+	local CURSOR_CHECK_INTERVAL = 0.04
+	local nextCursorCheck = 0
 	CW.track("cursorLoop", RunService.PreRender:Connect(function()
 		if not CW.State.cursorsReady then return end
+		local now = os.clock()
+		if now < nextCursorCheck then return end
+		nextCursorCheck = now + CURSOR_CHECK_INTERVAL
 		local Target = Mouse.Target
 		if Target == CW.State.lastTarget then return end
 		CW.State.lastTarget = Target
@@ -1420,7 +1552,7 @@ do
 			or (Target.Parent.Parent and Players:GetPlayerFromCharacter(Target.Parent.Parent))
 
 		if Player and Player ~= LocalPlayer then
-			setOSCursor(Player.TeamColor == CW.State.cachedTeamColor and "green" or "red")
+			setOSCursor(CW.isEnemy(Player) and "red" or "green")
 		else
 			setOSCursor("white")
 		end
@@ -1428,10 +1560,11 @@ do
 end
 end)
 
-
 runModule("Hitmarker", function()
 -- Hitmarker.lua
 local CW = getgenv().__CW_CORE_STATE
+
+local ContentProvider = game:GetService("ContentProvider")
 
 -- Parents the GUI to the first container that accepts it: gethui() when the executor has it,
 -- otherwise CoreGui, otherwise PlayerGui.
@@ -1485,6 +1618,13 @@ local function reloadHitmarker()
 	})
 	-- Clear the old image when the selection is gone, instead of keeping a stale one.
 	CW.HMTemplate.Image = asset or ""
+
+	-- Preload in the background so the first hitmarker is not blank.
+	if asset then
+		task.spawn(function()
+			pcall(function() ContentProvider:PreloadAsync({ CW.HMTemplate }) end)
+		end)
+	end
 end
 
 CW.reloadHitmarkerAsset = reloadHitmarker
@@ -1493,24 +1633,17 @@ end)
 
 
 runModule("Sound", function()
--- Sound.lua  (replace the whole existing Sound.lua block with this one)
+-- Sound.lua
 local CW = getgenv().__CW_CORE_STATE
 
 local SoundService    = game:GetService("SoundService")
 local ContentProvider = game:GetService("ContentProvider")
 local Debris          = game:GetService("Debris")
 
--- Why the old version was late
---   Every hit created a brand-new Sound from a local file, so Roblox had to load and decode
---   the audio at that moment. The hitmarker image is already loaded, which is why it appeared
---   instantly while the sound lagged behind.
---
--- How this works
---   A few Sound objects are created ONCE when the hit sound is (re)loaded and preloaded with
---   ContentProvider. A hit then only rewinds one of them and calls :Play(), which is
---   immediate. They are used round-robin so rapid hits (automatic weapons, shotgun pellets)
---   overlap instead of cutting each other off.
---   If the pool is unavailable for any reason, the previous behaviour is used as a fallback.
+-- A few Sound objects are created ONCE when the hit sound is (re)loaded and preloaded with
+-- ContentProvider. A hit then only rewinds one of them and calls :Play(), which is immediate.
+-- They are used round-robin so rapid hits overlap instead of cutting each other off.
+-- If the pool is unavailable for any reason, a fresh Sound per hit is used as a fallback.
 
 local POOL_SIZE = 4
 
@@ -1548,8 +1681,6 @@ local function buildPool(assetId)
 
 	CW.State.hitSoundPool = pool
 
-	-- Preload in the background so even the first hit is instant. A failure here is harmless:
-	-- the sounds still play, they just load on first use.
 	task.spawn(function()
 		local ok, err = pcall(function() ContentProvider:PreloadAsync(pool) end)
 		if not ok then CW.Log("Hit sound preload skipped: " .. tostring(err)) end
@@ -1573,7 +1704,6 @@ end
 CW.reloadSoundAsset = reloadSound
 reloadSound()
 
--- Previous behaviour: a fresh Sound per hit. Only used when the pool cannot play.
 local function playOnDemand()
 	local ok, s = pcall(function()
 		local snd = Instance.new("Sound")
@@ -1618,8 +1748,9 @@ runModule("Texture", function()
 -- Texture.lua
 local CW = getgenv().__CW_CORE_STATE
 
-local Players     = game:GetService("Players")
-local LocalPlayer = CW.LocalPlayer
+local Players         = game:GetService("Players")
+local ContentProvider = game:GetService("ContentProvider")
+local LocalPlayer     = CW.LocalPlayer
 
 local _cfg = getgenv().CW_CONFIG or {}
 
@@ -1634,22 +1765,13 @@ local WEAPON_MESHES = _cfg.WEAPON_MESHES or {
 	["AK-47"]         = "Meshes/AK47_7",
 }
 
-local function normalizeKey(s)
-	return (s:gsub("%W", "")):lower()
-end
-
 local WEAPON_LIST = {}
-local SEEN_WEAPONS = {}
 for weaponName in pairs(WEAPON_MESHES) do
-	if not SEEN_WEAPONS[weaponName] then
-		SEEN_WEAPONS[weaponName] = true
-		table.insert(WEAPON_LIST, weaponName)
-	end
+	table.insert(WEAPON_LIST, weaponName)
 end
 table.sort(WEAPON_LIST)
 
-CW.WeaponList          = WEAPON_LIST
-CW.normalizeTextureKey = normalizeKey
+CW.WeaponList = WEAPON_LIST
 CW.Assets.weaponTextures = {}
 CW.Settings.ASSET_SELECTIONS.Textures = CW.Settings.ASSET_SELECTIONS.Textures or {}
 
@@ -1675,6 +1797,9 @@ end
 for _, weaponName in ipairs(WEAPON_LIST) do
 	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName)
 	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName .. "/" .. CW.Paths.OFFICIAL_FOLDER)
+	-- Same weapon names for the gun-sound library: WeaponSounds/<Weapon>/ takes your own sound files.
+	CW.Library.ensureFolder(CW.Paths.WEAPON_SOUNDS_FOLDER .. "/" .. weaponName)
+	CW.Library.ensureFolder(CW.Paths.WEAPON_SOUNDS_FOLDER .. "/" .. weaponName .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 end
 
 
@@ -1785,29 +1910,42 @@ end
 
 -- The ChildAdded connection is registered under `key` (replacing the previous one) and calls
 -- CW.applyWeaponTexture at call time, so the latest run's code is the one that runs.
+-- The texture is applied right away (no flicker of the original) and once more after a short
+-- wait, in case the tool's parts were not fully there yet.
 local function monitor(container, key)
 	CW.track(key, container.ChildAdded:Connect(function(child)
-		task.wait(0.1)
 		local apply = CW.applyWeaponTexture
-		if apply then apply(child) end
+		if not apply then return end
+		pcall(apply, child)
+		task.wait(0.1)
+		apply = CW.applyWeaponTexture
+		if apply then pcall(apply, child) end
 	end))
 	applyToContainer(container)
 end
 
 local function reloadTexturesAndApply()
 	local loadedTextures = {}
+	local toPreload = {}
 	for _, weaponName in ipairs(WEAPON_LIST) do
 		local filePath = CW.Library.selectedPath("Textures", weaponName)
 		if filePath then
 			local ok, asset = pcall(getcustomasset, filePath)
 			if ok and asset then
 				loadedTextures[weaponName] = asset
+				table.insert(toPreload, asset)
 			else
 				CW.Warn("Could not load selected texture for " .. weaponName)
 			end
 		end
 	end
 	CW.Assets.weaponTextures = loadedTextures
+
+	if #toPreload > 0 then
+		task.spawn(function()
+			pcall(function() ContentProvider:PreloadAsync(toPreload) end)
+		end)
+	end
 
 	local backpack = LocalPlayer:FindFirstChild("Backpack")
 	if backpack then applyToContainer(backpack) end
@@ -1818,22 +1956,17 @@ reloadTexturesAndApply()
 
 -- Monitors are (re)created on every run, so a re-run replaces the old ones.
 do
-	-- Connection stored by the previous script version.
-	if CW.State.backpackMonitorConn then
+	if CW.State.backpackMonitorConn then -- connection stored by an older script version
 		pcall(function() CW.State.backpackMonitorConn:Disconnect() end)
 		CW.State.backpackMonitorConn = nil
 	end
 
+	-- The Backpack is recreated on every respawn, so the player is always watched for a new one.
 	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-	if backpack then
-		monitor(backpack, "textureBackpack")
-	else
-		CW.track("textureBackpackWait", LocalPlayer.ChildAdded:Connect(function(child)
-			if not child:IsA("Backpack") then return end
-			CW.untrack("textureBackpackWait")
-			monitor(child, "textureBackpack")
-		end))
-	end
+	if backpack then monitor(backpack, "textureBackpack") end
+	CW.track("textureBackpackWait", LocalPlayer.ChildAdded:Connect(function(child)
+		if child:IsA("Backpack") then monitor(child, "textureBackpack") end
+	end))
 
 	CW.track("textureCharacterAdded", LocalPlayer.CharacterAdded:Connect(function(character)
 		monitor(character, "textureCharacter")
@@ -1851,9 +1984,7 @@ runModule("Tracers", function()
 local CW = getgenv().__CW_CORE_STATE
 
 local Workspace         = game:GetService("Workspace")
-local Debris            = game:GetService("Debris")
 local TweenService      = game:GetService("TweenService")
-local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = CW.LocalPlayer
@@ -1872,13 +2003,26 @@ local function numOr(v, default, minValue)
 	return v
 end
 
-CW.Settings.CUSTOM_BULLET_TRACERS  = boolOr(_cfg.customBulletTracers, false)
-CW.Settings.TRACER_COLOR           = _cfg.tracerColor or Color3.fromRGB(170, 0, 255)
-CW.Settings.TRACER_GLOW_COLOR      = _cfg.glowColor or Color3.fromRGB(200, 100, 255)
-CW.Settings.TRACER_WIDTH           = numOr(_cfg.tracerWidth, 0.05, 0.01)
-CW.Settings.TRACER_LIFETIME        = numOr(_cfg.tracerLifetime, 0.05, 0.01)
+-- UPPER_CASE is the standard key; the old camelCase keys still work.
+local function cfgValue(upperKey, legacyKey)
+	if _cfg[upperKey] ~= nil then return _cfg[upperKey] end
+	return _cfg[legacyKey]
+end
 
-CW.Settings.TRACER_APPLY_TO_OTHERS = boolOr(_cfg.applyToOthers, false)
+CW.Settings.CUSTOM_BULLET_TRACERS  = boolOr(cfgValue("CUSTOM_BULLET_TRACERS", "customBulletTracers"), false)
+CW.Settings.TRACER_COLOR           = cfgValue("TRACER_COLOR", "tracerColor") or Color3.fromRGB(170, 0, 255)
+CW.Settings.TRACER_GLOW_COLOR      = cfgValue("TRACER_GLOW_COLOR", "glowColor") or Color3.fromRGB(200, 100, 255)
+CW.Settings.TRACER_WIDTH           = numOr(cfgValue("TRACER_WIDTH", "tracerWidth"), 0.05, 0.01)
+CW.Settings.TRACER_LIFETIME        = numOr(cfgValue("TRACER_LIFETIME", "tracerLifetime"), 0.05, 0.01)
+CW.Settings.TRACER_APPLY_TO_OTHERS = boolOr(cfgValue("TRACER_APPLY_TO_OTHERS", "applyToOthers"), false)
+
+CW.Defaults = CW.Defaults or {}
+for _, key in ipairs({
+	"CUSTOM_BULLET_TRACERS", "TRACER_COLOR", "TRACER_GLOW_COLOR",
+	"TRACER_WIDTH", "TRACER_LIFETIME", "TRACER_APPLY_TO_OTHERS",
+}) do
+	CW.Defaults[key] = CW.Settings[key]
+end
 
 local function isLocalPlayerShot()
 	local char = LocalPlayer.Character
@@ -1888,47 +2032,75 @@ local function isLocalPlayerShot()
 	return tool:GetAttribute("Local_IsShooting") == true
 end
 
+-- Part pool: tracer parts are reused instead of created and destroyed for every bullet
+-- (shotgun pellets and automatic weapons make many per second). There is no PointLight per
+-- bullet any more; the neon glow part carries the look.
+local MAX_POOL = 48
+local pool = CW.State.tracerPool
+if not pool then
+	pool = {}
+	CW.State.tracerPool = pool
+end
+
+local function newTracerPart()
+	local part = Instance.new("Part")
+	part.Anchored   = true
+	part.CanCollide = false
+	part.CanQuery   = false
+	part.CanTouch   = false
+	part.CastShadow = false
+	part.Material   = Enum.Material.Neon
+	return part
+end
+
+local function acquirePart(parent)
+	while #pool > 0 do
+		local part = table.remove(pool)
+		if pcall(function() part.Parent = parent end) then return part end
+	end
+	local part = newTracerPart()
+	part.Parent = parent
+	return part
+end
+
+local function releasePart(part)
+	pcall(function() part.Parent = nil end)
+	if #pool < MAX_POOL then
+		pool[#pool + 1] = part
+	else
+		pcall(function() part:Destroy() end)
+	end
+end
+
 local function createEnergyTracer(startPos, endPos)
+	local camera = Workspace.CurrentCamera
+	if not camera then error("no current camera", 0) end
+
 	local distance = (startPos - endPos).Magnitude
-	local midpoint  = (startPos + endPos) / 2
+	local midpoint = (startPos + endPos) / 2
 	local width = CW.Settings.TRACER_WIDTH
 	local life  = CW.Settings.TRACER_LIFETIME
 
-	local core = Instance.new("Part")
-	core.Anchored     = true
-	core.CanCollide   = false
-	core.CanQuery     = false
-	core.CanTouch     = false
-	core.Material     = Enum.Material.Neon
+	local core = acquirePart(camera)
 	core.Color        = CW.Settings.TRACER_COLOR
 	core.Size         = Vector3.new(width, width, distance)
 	core.CFrame       = CFrame.new(midpoint, endPos)
 	core.Transparency = 0.1
-	core.Parent       = Workspace.CurrentCamera
 
-	local glow = Instance.new("Part")
-	glow.Anchored     = true
-	glow.CanCollide   = false
-	glow.CanQuery     = false
-	glow.CanTouch     = false
-	glow.Material     = Enum.Material.Neon
+	local glow = acquirePart(camera)
 	glow.Color        = CW.Settings.TRACER_GLOW_COLOR
 	glow.Size         = Vector3.new(width * 2, width * 2, distance)
 	glow.CFrame       = core.CFrame
 	glow.Transparency = 0.6
-	glow.Parent       = Workspace.CurrentCamera
-
-	local light = Instance.new("PointLight")
-	light.Color      = CW.Settings.TRACER_COLOR
-	light.Range      = 8
-	light.Brightness = 2
-	light.Parent     = core
 
 	TweenService:Create(core, TweenInfo.new(life), { Transparency = 1 }):Play()
 	TweenService:Create(glow, TweenInfo.new(life), { Transparency = 1 }):Play()
 
-	Debris:AddItem(core, life)
-	Debris:AddItem(glow, life)
+	-- Returned to the pool just after the fade ends.
+	task.delay(life + 0.05, function()
+		releasePart(core)
+		releasePart(glow)
+	end)
 end
 
 local function shouldUseCustom()
@@ -2026,12 +2198,9 @@ local LocalPlayer = CW.LocalPlayer
 -- How it works
 --   The __namecall hook runs on the GAME's thread, which lacks the capabilities needed to
 --   parent GUI into gethui() ("lacking capability Plugin"). So the hook does nothing but
---   copy the hit parts into a small queue (plain tables only, no Instance method calls, so
---   the namecall state stays intact for OldNameCall). A PreRender connection created from
---   this script's own thread drains the queue and does the real work (hit sound + hitmarker).
---
---   CW.onShot is what the hook calls. Both the hook installed by an earlier run and the one
---   below call it through the CW table, so re-running the script is enough to update it.
+--   copy the hit parts into a small queue (plain tables only, no Instance method calls).
+--   A PreRender connection created from this script's own thread drains the queue and does
+--   the real work (hit sound + hitmarker).
 
 local MAX_QUEUE   = 32   -- shots waiting for the next frame (oldest dropped beyond this)
 local MAX_BULLETS = 64   -- bullets copied per shot
@@ -2070,7 +2239,7 @@ function CW.processShot(hits)
 			local character = hit.Parent
 			local player = Players:GetPlayerFromCharacter(character)
 				or (character.Parent and Players:GetPlayerFromCharacter(character.Parent))
-			if player and player ~= LocalPlayer and player.TeamColor ~= CW.State.cachedTeamColor then
+			if player and CW.isEnemy(player) then
 				shotHit = true
 				break
 			end
@@ -2156,9 +2325,7 @@ function CW.drainShots()
 	end
 end
 
--- Registered with CW.track, so a re-run replaces it. It looks CW.drainShots up on every
--- frame, so a re-run that redefines the function takes effect immediately.
-if CW.State.shotDrainConn then -- connection stored by the previous script version
+if CW.State.shotDrainConn then -- connection stored by an older script version
 	pcall(function() CW.State.shotDrainConn:Disconnect() end)
 	CW.State.shotDrainConn = nil
 end
@@ -2169,7 +2336,6 @@ end))
 
 -- The hook only forwards the call: it copies the hit parts into the queue and returns the
 -- game's own result untouched, so it can never break or delay the game's FireServer.
--- getnamecallmethod() is read first, before anything that could alter the namecall state.
 local function installShootHook()
 	if CW.State.shootHooked then return true end
 
@@ -2186,7 +2352,6 @@ local function installShootHook()
 	if not shootEvent then return false end
 	CW.ShootEvent = shootEvent
 
-	-- Resolved once, so the hook itself can never throw because a function is missing.
 	local isExecutorCall = type(checkcaller) == "function" and checkcaller or function() return false end
 	local wrap = type(newcclosure) == "function" and newcclosure or function(fn) return fn end
 
@@ -2239,17 +2404,18 @@ function CW.cleanup()
 	pcall(function() UserInputService.MouseIcon="" end)
 	pcall(function() CW.IAPortable:Destroy() end)
 	pcall(function() if CW.UIWindow then CW.UIWindow:Destroy() end end)
-	pcall(function() if CW.State.enforcerConn then CW.State.enforcerConn:Disconnect() end end)
-	pcall(function() if CW.State.enableConn   then CW.State.enableConn:Disconnect()   end end)
-	pcall(function() if CW.State.sprintCharacterConn then CW.State.sprintCharacterConn:Disconnect() end end)
-	pcall(function() if CW.State.chatToggleConn then CW.State.chatToggleConn:Disconnect() end end)
-	pcall(function() if CW.State.ammoGuiConn then CW.State.ammoGuiConn:Disconnect() end end)
-	pcall(function() if CW.State.ammoCharacterConn then CW.State.ammoCharacterConn:Disconnect() end end)
-	pcall(function() if CW.State.backpackMonitorConn then CW.State.backpackMonitorConn:Disconnect() end end)
+	for _, key in ipairs({
+		"enforcerConn", "enableConn", "sprintCharacterConn", "chatToggleConn", "ammoGuiConn",
+		"ammoCharacterConn", "backpackMonitorConn", "shotDrainConn",
+	}) do
+		pcall(function()
+			local connection = CW.State[key]
+			if connection then connection:Disconnect() end
+		end)
+	end
 	pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
 	pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
 	pcall(function() if CW.State.stopWeaponShootSoundOverrides then CW.State.stopWeaponShootSoundOverrides() end end)
-	pcall(function() if CW.State.shotDrainConn then CW.State.shotDrainConn:Disconnect() end end)
 	pcall(function() if CW.State.destroyHitSoundPool then CW.State.destroyHitSoundPool() end end)
 	pcall(function()
 		local contextActions = game:GetService("ContextActionService")
@@ -2279,8 +2445,8 @@ function CW.reloadCoreAssets()
 	CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
 	CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
 
-	-- The cursor goes last: generating it yields for a while (PNG codec), and it no longer
-	-- delays the textures and the hit sound.
+	-- The cursor goes last: generating it yields for a while (PNG codec), and it must not
+	-- delay the textures and the hit sound.
 	local reloaders = {
 		{ "hitmarker", CW.reloadHitmarkerAsset },
 		{ "textures", CW.reloadTextures },
@@ -2320,7 +2486,6 @@ task.spawn(function()
 end)
 end)
 
-
 do
 -- UI.lua
 local uiOk, uiError = pcall(function()
@@ -2348,16 +2513,35 @@ end
 -- Autosave (debounced). Assigned for real in the Settings section.
 local scheduleSave = function() end
 
-local UI_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CWUI.lua"
-CW.Log("Downloading CycleWare UI from GitHub")
+--// Download the UI library, pinned to a commit and verified by checksum when configured ----
+local REPO_RAW = "https://raw.githubusercontent.com/nutellaimw/CycleWare/"
+local uiCommit = tostring(_cfg.UI_COMMIT or UI_PIN_COMMIT or ""):lower()
+local uiCRC = tostring(_cfg.UI_CRC32 or UI_PIN_CRC32 or ""):lower():gsub("^0x", "")
+local UI_URL
+if uiCommit:match("^%x+$") and #uiCommit >= 7 and #uiCommit <= 40 then
+	UI_URL = REPO_RAW .. uiCommit .. "/CWUI.lua"
+else
+	UI_URL = REPO_RAW .. "refs/heads/main/CWUI.lua"
+	uiCommit = ""
+end
+
+CW.Log("Downloading CycleWare UI from GitHub" .. (uiCommit ~= "" and (" (commit " .. uiCommit:sub(1, 7) .. ")") or " (main branch)"))
 local fetchOK, uiSource = pcall(CW.httpGet, UI_URL)
-assert(fetchOK and type(uiSource) == "string" and uiSource ~= "", "Could not download CycleWareUI.lua from GitHub: " .. tostring(uiSource))
-CW.Log("CycleWare UI source downloaded")
+assert(fetchOK and type(uiSource) == "string" and uiSource ~= "", "Could not download CWUI.lua from GitHub: " .. tostring(uiSource))
+
+if uiCRC ~= "" then
+	local actual = string.format("%08x", CW.crc32Yielding(uiSource))
+	assert(actual == uiCRC, "CWUI.lua failed the integrity check (expected crc32 " .. uiCRC .. ", got " .. actual .. "). The UI was not loaded.")
+	CW.Log("CycleWare UI verified (crc32 " .. actual .. ")")
+elseif not CW.State.uiUnpinnedWarned then
+	CW.State.uiUnpinnedWarned = true
+	CW.Warn("CWUI.lua is loaded without a commit pin or checksum: any change pushed to GitHub takes effect immediately. Set UI_PIN_COMMIT and UI_PIN_CRC32 at the top of the script to lock it.")
+end
 
 local loadUI, compileError = loadstring(uiSource)
-assert(type(loadUI) == "function", tostring(compileError or "Could not compile CycleWareUI.lua"))
+assert(type(loadUI) == "function", tostring(compileError or "Could not compile CWUI.lua"))
 local CWUI = loadUI()
-assert(type(CWUI) == "table" and type(CWUI.CreateWindow) == "function", "Invalid CycleWareUI library")
+assert(type(CWUI) == "table" and type(CWUI.CreateWindow) == "function", "Invalid CWUI library")
 
 if CW.UIWindow and type(CW.UIWindow.Destroy) == "function" then
 	pcall(function() CW.UIWindow:Destroy() end)
@@ -2485,12 +2669,6 @@ local function hitSoundLabel(value)
 	return nil
 end
 
--- Label for a saved relative path, even if the file isn't on disk yet (e.g. before the first sync).
-local function relativeLabel(relative)
-	if type(relative) ~= "string" then return nil end
-	return (relative:gsub("^HitSounds/", ""))
-end
-
 local function applySoundFile(value)
 	local path = hitSoundPath(value)
 	if not path then return end
@@ -2505,12 +2683,17 @@ local configuredWeaponSounds = CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES
 	or _cfg.WEAPON_SHOOT_SOUNDS
 CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES = type(configuredWeaponSounds) == "table"
 	and configuredWeaponSounds or {}
+
+-- Off by default: nothing changes in the game until the player turns it on.
 if CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED == nil then
-	CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED = _cfg.WEAPON_SOUND_OVERRIDE_ENABLED ~= false
+	CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED = _cfg.WEAPON_SOUND_OVERRIDE_ENABLED == true
 end
 if CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS == nil then
 	CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS = _cfg.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS == true
 end
+-- Volume multiplier for the overridden gun sounds, relative to the game's own volume.
+CW.Settings.WEAPON_SOUND_VOLUME = math.clamp(tonumber(CW.Settings.WEAPON_SOUND_VOLUME) or 1, 0, 2)
+CW.Defaults.WEAPON_SOUND_VOLUME = 1
 
 if CW.State.stopWeaponShootSoundOverrides then
 	pcall(CW.State.stopWeaponShootSoundOverrides)
@@ -2523,17 +2706,96 @@ local weaponSoundPlayerConnections = {}
 local weaponSoundGlobalConnections = {}
 local weaponSoundRefreshScheduled = false
 local weaponSoundRefreshGeneration = 0
+local weaponAssetIds = {} -- relative path -> getcustomasset id; rebuilt with every override refresh
 
--- Keep saved overrides even if the file isn't downloaded yet; only drop malformed values.
-for weapon, selectedPath in pairs(weaponSoundOverrides) do
-	if type(selectedPath) ~= "string" then weaponSoundOverrides[weapon] = nil end
+------------------------------------------------------------------------------
+-- Weapon sound library: WeaponSounds/<Weapon>/<file> (separate from HitSounds)
+------------------------------------------------------------------------------
+local WEAPON_SOUND_DEFAULT = "Default"
+local weaponSoundCatalog = {} -- weapon -> { options = {...}, byLabel = {label -> relative}, available = {relative -> true} }
+local weaponSoundMigrated = false
+
+-- "WeaponSounds/<weapon>/rest" -> "rest" (nil when the path is not inside that weapon's folder).
+local function weaponSoundTail(weapon, relative)
+	if type(weapon) ~= "string" or type(relative) ~= "string" then return nil end
+	if relative:find("..", 1, true) or relative:find("\\", 1, true) then return nil end
+	local prefix = "WeaponSounds/" .. weapon .. "/"
+	if relative:sub(1, #prefix) ~= prefix or #relative == #prefix then return nil end
+	return relative:sub(#prefix + 1)
 end
+
+local function refreshWeaponSoundCatalog()
+	table.clear(weaponSoundCatalog)
+	for _, weapon in ipairs(CW.WeaponList or {}) do
+		local entry = { options = { WEAPON_SOUND_DEFAULT }, byLabel = {}, available = {} }
+		for _, item in ipairs(CW.Library.list("WeaponSounds", weapon)) do
+			local tail = weaponSoundTail(weapon, item.Relative)
+			if tail then
+				local label = tail:gsub("^_Official/", "")
+				if entry.byLabel[label] then label = tail end -- a user file with the same name as an official one
+				entry.byLabel[label] = item.Relative
+				entry.available[item.Relative] = true
+				table.insert(entry.options, label)
+			end
+		end
+		weaponSoundCatalog[weapon] = entry
+	end
+end
+
+-- Text shown in a weapon's dropdown for a saved override (also when the file is not on disk yet).
+local function weaponSoundLabel(weapon, relative)
+	local tail = weaponSoundTail(weapon, relative)
+	if not tail then return WEAPON_SOUND_DEFAULT end
+	local entry = weaponSoundCatalog[weapon]
+	if entry then
+		for label, savedRelative in pairs(entry.byLabel) do
+			if savedRelative == relative then return label end
+		end
+	end
+	return (tail:gsub("^_Official/", ""))
+end
+
+-- Overrides saved before the separate WeaponSounds library existed point at HitSounds/...
+-- Those files no longer belong to this list, so they are dropped once, with a warning.
+do
+	local dropped = {}
+	for weapon, path in pairs(weaponSoundOverrides) do
+		if type(path) ~= "string" or not weaponSoundTail(weapon, path) then
+			weaponSoundOverrides[weapon] = nil
+			if type(path) == "string" then table.insert(dropped, tostring(weapon)) end
+		end
+	end
+	if #dropped > 0 then
+		table.sort(dropped)
+		weaponSoundMigrated = true
+		CW.Warn("Weapon sound overrides now use the WeaponSounds library. Removed the old selection for: "
+			.. table.concat(dropped, ", ") .. ". Choose a new sound for them in the Weapon Sounds tab.")
+	end
+end
+refreshWeaponSoundCatalog()
 
 local function disconnectList(connections)
 	for _, connection in ipairs(connections) do
 		pcall(function() connection:Disconnect() end)
 	end
 	table.clear(connections)
+end
+
+-- Volume handling. baseVolume is the game's own volume for that sound; the sound plays at
+-- baseVolume * WEAPON_SOUND_VOLUME. If the game itself changes the volume later (distance,
+-- per-shot values), that new value becomes the base, so the slider always scales the game's value.
+local function setScaledVolume(sound, data)
+	local target = math.clamp(data.baseVolume * (CW.Settings.WEAPON_SOUND_VOLUME or 1), 0, 10)
+	data.lastVolume = target
+	if sound.Volume ~= target then
+		pcall(function() sound.Volume = target end)
+	end
+end
+
+local function updateWeaponSoundVolumes()
+	for sound, data in pairs(activeWeaponSounds) do
+		if sound.Parent then setScaledVolume(sound, data) end
+	end
 end
 
 local function restoreWeaponSound(sound)
@@ -2543,14 +2805,21 @@ local function restoreWeaponSound(sound)
 	if data.connection then
 		pcall(function() data.connection:Disconnect() end)
 	end
+	if data.volumeConnection then
+		pcall(function() data.volumeConnection:Disconnect() end)
+	end
 	if sound.Parent then
-		pcall(function() sound.SoundId = data.originalId end)
+		pcall(function()
+			sound.SoundId = data.originalId
+			sound.Volume = data.baseVolume
+		end)
 	end
 end
 
 local function stopWeaponShootSoundOverrides()
 	weaponSoundRefreshGeneration = weaponSoundRefreshGeneration + 1
 	weaponSoundRefreshScheduled = false
+	table.clear(weaponAssetIds)
 	disconnectList(weaponSoundGlobalConnections)
 	for _, connections in pairs(weaponSoundPlayerConnections) do
 		disconnectList(connections)
@@ -2580,6 +2849,8 @@ local function applyWeaponSound(sound, targetId, tool, player, container)
 	if not data then
 		data = {
 			originalId = sound.SoundId,
+			baseVolume = sound.Volume,
+			lastVolume = sound.Volume,
 			tool = tool,
 			player = player,
 			container = container,
@@ -2595,6 +2866,18 @@ local function applyWeaponSound(sound, targetId, tool, player, container)
 			end)
 		end)
 		if ok then data.connection = connection end
+
+		local okVolume, volumeConnection = pcall(function()
+			return sound:GetPropertyChangedSignal("Volume"):Connect(function()
+				local current = activeWeaponSounds[sound]
+				if not current or not sound.Parent then return end
+				if math.abs(sound.Volume - current.lastVolume) > 0.0001 then
+					current.baseVolume = sound.Volume -- the game changed it: scale the new value
+					setScaledVolume(sound, current)
+				end
+			end)
+		end)
+		if okVolume then data.volumeConnection = volumeConnection end
 	else
 		data.tool = tool
 		data.player = player
@@ -2605,6 +2888,7 @@ local function applyWeaponSound(sound, targetId, tool, player, container)
 	if sound.SoundId ~= targetId then
 		pcall(function() sound.SoundId = targetId end)
 	end
+	setScaledVolume(sound, data)
 end
 
 local function applyWeaponSoundToTool(tool, player, container)
@@ -2614,10 +2898,15 @@ local function applyWeaponSoundToTool(tool, player, container)
 
 	local relativePath = weaponSoundOverrides[tool.Name]
 	if type(relativePath) ~= "string" then return end
-	local filePath = CW.Paths.LIBRARY_ROOT .. "/" .. relativePath
-	if not isfile(filePath) then return end
-	local loaded, targetId = pcall(getcustomasset, filePath)
-	if not loaded or type(targetId) ~= "string" then return end
+	local targetId = weaponAssetIds[relativePath]
+	if not targetId then
+		local filePath = CW.Paths.LIBRARY_ROOT .. "/" .. relativePath
+		if not isfile(filePath) then return end
+		local loaded, assetId = pcall(getcustomasset, filePath)
+		if not loaded or type(assetId) ~= "string" then return end
+		weaponAssetIds[relativePath] = assetId
+		targetId = assetId
+	end
 	for _, descendant in ipairs(tool:GetDescendants()) do
 		if descendant:IsA("Sound") and descendant.Name == "ShootSound" then
 			applyWeaponSound(descendant, targetId, tool, player, container)
@@ -2722,20 +3011,19 @@ local function scheduleWeaponShootSoundRefresh()
 	end)
 end
 
-local function normalizeWeaponSoundPath(value)
-	local path = hitSoundPath(value)
-	local relative = path and CW.Library.relative(path)
-	if type(relative) == "string" and availableHitSounds[relative] then return relative end
-	return nil
-end
-
+-- value is what the weapon's dropdown shows: "Default" (the game's own sound) or a file label.
 local function setWeaponShootSound(weapon, value)
-	local relative = normalizeWeaponSoundPath(value)
-	if not relative then
-		CW.Warn("Choose a sound file from the local HitSounds library for " .. weapon)
-		return
+	if value == WEAPON_SOUND_DEFAULT then
+		weaponSoundOverrides[weapon] = nil
+	else
+		local entry = weaponSoundCatalog[weapon]
+		local relative = entry and (entry.byLabel[value] or (entry.available[value] and value))
+		if not relative then
+			CW.Warn("Choose a sound file from the WeaponSounds library for " .. tostring(weapon))
+			return
+		end
+		weaponSoundOverrides[weapon] = relative
 	end
-	weaponSoundOverrides[weapon] = relative
 	scheduleWeaponShootSoundRefresh()
 end
 
@@ -2768,7 +3056,6 @@ guarded("Effects", function()
 		Max = 200,
 		Default = CW.Settings.HITMARKER_SIZE,
 		Suffix = "px",
-		Flag = "Hitmarker_Size",
 		Callback = function(v)
 			CW.Settings.HITMARKER_SIZE = v
 			if CW.HMTemplate then
@@ -2780,14 +3067,12 @@ guarded("Effects", function()
 	EffectsTab:Toggle({
 		Title = "Random Rotation",
 		Default = CW.Settings.HITMARKER_RANDOM_ROTATION,
-		Flag = "Hitmarker_RandomRotation",
 		Callback = function(s) CW.Settings.HITMARKER_RANDOM_ROTATION = s end,
 	})
 
 	EffectsTab:Toggle({
 		Title = "Follow Mouse",
 		Default = CW.Settings.HITMARKER_FOLLOW_MOUSE,
-		Flag = "Hitmarker_FollowMouse",
 		Callback = function(s) CW.Settings.HITMARKER_FOLLOW_MOUSE = s end,
 	})
 
@@ -2798,14 +3083,12 @@ guarded("Effects", function()
 		Default = CW.Settings.HITMARKER_VISIBLE_DURATION,
 		Decimal = 2,
 		Suffix = "s",
-		Flag = "Hitmarker_VisibleDuration",
 		Callback = function(v) CW.Settings.HITMARKER_VISIBLE_DURATION = v end,
 	})
 
 	EffectsTab:Toggle({
 		Title = "Fadeout",
 		Default = CW.Settings.HITMARKER_FADEOUT,
-		Flag = "Hitmarker_Fadeout",
 		Callback = function(s) CW.Settings.HITMARKER_FADEOUT = s end,
 	})
 
@@ -2816,7 +3099,6 @@ guarded("Effects", function()
 		Default = CW.Settings.HITMARKER_FADEOUT_DURATION,
 		Decimal = 2,
 		Suffix = "s",
-		Flag = "Hitmarker_FadeoutDuration",
 		Callback = function(v) CW.Settings.HITMARKER_FADEOUT_DURATION = v end,
 	})
 
@@ -2847,7 +3129,6 @@ guarded("Effects", function()
 	EffectsTab:Toggle({
 		Title = "Custom Bullet Tracers",
 		Default = CW.Settings.CUSTOM_BULLET_TRACERS,
-		Flag = "Tracer_Enabled",
 		Callback = function(s) CW.Settings.CUSTOM_BULLET_TRACERS = s end,
 	})
 
@@ -2875,7 +3156,6 @@ guarded("Effects", function()
 		Max = 0.5,
 		Default = CW.Settings.TRACER_WIDTH,
 		Decimal = 2,
-		Flag = "Tracer_Width",
 		Callback = function(v) CW.Settings.TRACER_WIDTH = v end,
 	})
 
@@ -2886,14 +3166,12 @@ guarded("Effects", function()
 		Default = CW.Settings.TRACER_LIFETIME,
 		Decimal = 2,
 		Suffix = "s",
-		Flag = "Tracer_Lifetime",
 		Callback = function(v) CW.Settings.TRACER_LIFETIME = v end,
 	})
 
 	EffectsTab:Toggle({
 		Title = "Apply To Others",
 		Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
-		Flag = "Tracer_ApplyToOthers",
 		Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
 	})
 end)
@@ -2943,7 +3221,6 @@ guarded("Visuals", function()
 		Max = 256,
 		Default = CW.Settings.CURSOR_TARGET_SIZE,
 		Suffix = "px",
-		Flag = "Cursor_Size",
 		Callback = applyCursorSize,
 	})
 
@@ -2989,7 +3266,6 @@ guarded("Hit Sound", function()
 		Default = CW.Settings.SOUND_VOLUME,
 		Decimal = 2,
 		Suffix = "x",
-		Flag = "Sound_Volume",
 		Callback = function(v) CW.Settings.SOUND_VOLUME = v end,
 	})
 end)
@@ -3002,8 +3278,7 @@ guarded("Weapon Sounds", function()
 
 	WeaponSoundsTab:Toggle({
 		Title = "Enable Weapon Sound Overrides",
-		Default = CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED,
-		Flag = "WeaponSoundOverrides_Enabled",
+		Default = CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED == true,
 		Callback = function(enabled)
 			CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED = enabled == true
 			scheduleWeaponShootSoundRefresh()
@@ -3012,20 +3287,33 @@ guarded("Weapon Sounds", function()
 
 	WeaponSoundsTab:Toggle({
 		Title = "Apply to Other Players Locally",
-		Default = CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS,
-		Flag = "WeaponSoundOverrides_Others",
+		Default = CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS == true,
 		Callback = function(enabled)
 			CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS = enabled == true
 			scheduleWeaponShootSoundRefresh()
 		end,
 	})
 
+	WeaponSoundsTab:Slider({
+		Title = "Weapon Sound Volume",
+		Min = 0,
+		Max = 2,
+		Default = CW.Settings.WEAPON_SOUND_VOLUME,
+		Decimal = 2,
+		Suffix = "x",
+		Callback = function(v)
+			CW.Settings.WEAPON_SOUND_VOLUME = v
+			updateWeaponSoundVolumes()
+		end,
+	})
+
 	for _, weaponName in ipairs(CW.WeaponList or {}) do
 		local weapon = weaponName
+		local entry = weaponSoundCatalog[weapon]
 		local dropdown = WeaponSoundsTab:Dropdown({
 			Title = weapon .. " Shoot Sound",
-			Options = hitSoundOptions,
-			Default = relativeLabel(weaponSoundOverrides[weapon]),
+			Options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
+			Default = weaponSoundLabel(weapon, weaponSoundOverrides[weapon]),
 			Callback = function(value)
 				setWeaponShootSound(weapon, value)
 			end,
@@ -3131,7 +3419,6 @@ guarded("Utilities", function()
 	UtilityTab:Toggle({
 		Title = "Toggle Sprint with Shift",
 		Default = CW.Settings.SHIFT_TOGGLE_ENABLED == true,
-		Flag = "Sprint_ToggleEnabled",
 		Callback = function(enabled)
 			CW.Settings.SHIFT_TOGGLE_ENABLED = enabled == true
 			if not CW.Settings.SHIFT_TOGGLE_ENABLED then
@@ -3141,6 +3428,7 @@ guarded("Utilities", function()
 		end,
 	})
 
+	-- The chat is no longer forced on at load: it is only touched by the Z toggle below.
 	local function setChatVisible(visible)
 		pcall(function()
 			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, visible)
@@ -3149,13 +3437,6 @@ guarded("Utilities", function()
 			StarterGui:SetCore("ChatActive", visible)
 		end)
 	end
-
-	task.spawn(function()
-		if not game:IsLoaded() then
-			game.Loaded:Wait()
-		end
-		setChatVisible(true)
-	end)
 
 	if CW.State.chatToggleConn then
 		CW.State.chatToggleConn:Disconnect()
@@ -3171,7 +3452,6 @@ guarded("Utilities", function()
 	UtilityTab:Toggle({
 		Title = "Toggle Chat with Z",
 		Default = CW.Settings.CHAT_TOGGLE_ENABLED == true,
-		Flag = "Chat_ToggleEnabled",
 		Callback = function(enabled)
 			CW.Settings.CHAT_TOGGLE_ENABLED = enabled == true
 			if not CW.Settings.CHAT_TOGGLE_ENABLED then
@@ -3181,7 +3461,7 @@ guarded("Utilities", function()
 		end,
 	})
 
-	-- Auto reload
+	-- Auto reload (off by default)
 	local PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
 		or LocalPlayer:WaitForChild("PlayerGui", 5)
 	assert(PlayerGui, "PlayerGui did not become available within 5 seconds")
@@ -3193,7 +3473,7 @@ guarded("Utilities", function()
 	local AMMO_LABEL_PATH = "Home.hud.BottomRightFrame.GunFrame.BulletsLabel"
 	CW.Settings.AUTO_RELOAD_LABEL_PATH = AMMO_LABEL_PATH
 	if CW.Settings.AUTO_RELOAD_ENABLED == nil then
-		CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED ~= false
+		CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED == true
 	end
 
 	if CW.State.clearAmmoLabelWatchers then
@@ -3397,8 +3677,7 @@ guarded("Utilities", function()
 	end
 	CW.State.ammoGuiConn = PlayerGui.DescendantAdded:Connect(function(instance)
 		if not CW.Settings.AUTO_RELOAD_ENABLED or not isTextGui(instance) then return end
-		-- Already watching a live label: nothing to rebuild. Checked before the string work
-		-- below, so a new text label costs almost nothing in the common case.
+		-- Already watching a live label: nothing to rebuild (checked before any string work).
 		for label in pairs(ammoLabelConnections) do
 			if label.Parent then return end
 		end
@@ -3419,7 +3698,6 @@ guarded("Utilities", function()
 	UtilityTab:Toggle({
 		Title = "Auto Reload at 0 Ammo",
 		Default = CW.Settings.AUTO_RELOAD_ENABLED == true,
-		Flag = "AutoReload_Enabled",
 		Callback = function(enabled)
 			CW.Settings.AUTO_RELOAD_ENABLED = enabled == true
 			rebuildAmmoLabelWatchers()
@@ -3436,9 +3714,10 @@ end)
 ------------------------------------------------------------------------------
 -- Rebuilds every library-backed control from disk. Core assets are reloaded separately
 -- by CW.reloadCoreAssets (so this never touches the cursor/texture pipeline).
+-- The gallery drops its own asset cache entries on every rebuild, so no extra cache clear is needed.
 local function refreshUIFromLibrary()
-	if type(CWUI.ClearAssetCache) == "function" then CWUI.ClearAssetCache() end
 	hitSoundOptions = refreshHitSoundCatalog()
+	refreshWeaponSoundCatalog()
 
 	local function syncGallery(gallery, category, weapon, selectedFile)
 		if not gallery then return end
@@ -3457,8 +3736,9 @@ local function refreshUIFromLibrary()
 		HitSoundDropdown:Set(hitSoundLabel(CW.Paths.SOUND_FILE) or "—", true)
 	end
 	for _, entry in ipairs(weaponSoundDropdowns) do
-		entry.control:Refresh(hitSoundOptions)
-		entry.control:Set(relativeLabel(weaponSoundOverrides[entry.weapon]) or "—", true)
+		local catalog = weaponSoundCatalog[entry.weapon]
+		entry.control:Refresh(catalog and catalog.options or { WEAPON_SOUND_DEFAULT })
+		entry.control:Set(weaponSoundLabel(entry.weapon, weaponSoundOverrides[entry.weapon]), true)
 	end
 
 	refreshWeaponShootSoundOverrides()
@@ -3501,24 +3781,40 @@ guarded("Settings", function()
 		return result
 	end
 
+	-- A setting is saved only when the player changed it: its value differs from the default.
+	-- Switching a setting back to its default removes it from the file.
+	local function isDefaultValue(key, value)
+		if type(value) == "table" then return next(value) == nil end
+		local default = CW.Defaults[key]
+		if default == nil and type(value) == "boolean" then default = false end
+		return value == default
+	end
+
 	local function saveSettings()
 		local savedSettings = {}
 		for key, value in pairs(CW.Settings) do
 			if key ~= "ASSET_SELECTIONS" and key ~= "SOUND_ID" and key ~= "AUTO_RELOAD_LABEL_PATH" then
 				local serialized = serializableValue(value)
-				if serialized ~= nil then savedSettings[key] = serialized end
+				if serialized ~= nil and not isDefaultValue(key, serialized) then
+					savedSettings[key] = serialized
+				end
 			end
 		end
 
-		-- Tracer colors are Color3 (not serialisable): store the palette name instead.
+		-- Tracer colors are Color3 (not serialisable): store the palette name, only when changed.
 		local nameOf = CW.State.tracerColorName
 		if nameOf then
-			savedSettings.TRACER_COLOR_NAME = nameOf(CW.Settings.TRACER_COLOR)
-			savedSettings.TRACER_GLOW_COLOR_NAME = nameOf(CW.Settings.TRACER_GLOW_COLOR)
+			local color, glow = nameOf(CW.Settings.TRACER_COLOR), nameOf(CW.Settings.TRACER_GLOW_COLOR)
+			if CW.Defaults.TRACER_COLOR == nil or color ~= nameOf(CW.Defaults.TRACER_COLOR) then
+				savedSettings.TRACER_COLOR_NAME = color
+			end
+			if CW.Defaults.TRACER_GLOW_COLOR == nil or glow ~= nameOf(CW.Defaults.TRACER_GLOW_COLOR) then
+				savedSettings.TRACER_GLOW_COLOR_NAME = glow
+			end
 		end
 
 		local out = {
-			schemaVersion = 2,
+			schemaVersion = 3,
 			Settings = savedSettings,
 			AssetSelections = CW.Settings.ASSET_SELECTIONS,
 		}
@@ -3554,6 +3850,7 @@ guarded("Settings", function()
 end)
 
 scheduleWeaponShootSoundRefresh()
+if weaponSoundMigrated then scheduleSave() end -- write the cleaned-up overrides so the warning shows only once
 print("[CW] UI loaded.")
 
 -- The asset sync runs independently (Sync module). When it finishes, rebuild the UI lists.
