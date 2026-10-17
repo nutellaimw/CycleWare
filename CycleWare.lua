@@ -171,10 +171,39 @@ function CW.untrackAll()
 end
 
 --// Teams ----------------------------------------------------------------------------
--- Neutral players (no team, free-for-all) count as enemies; otherwise teams are compared.
+-- How the game uses teams decides who is an enemy (re-evaluated at most once per second):
+--   "teams":  the game has Team objects. A neutral player on either side counts as an enemy,
+--             otherwise the team colors are compared.
+--   "colors": no Team objects, but players do have different TeamColors, so the colors are
+--             compared (Player.Neutral is ignored, because it is not reliable there).
+--   "ffa":    no Team objects and everybody has the same color: everyone is an enemy.
+local TeamsService = game:GetService("Teams")
+local teamModeValue, teamModeAt = nil, 0
+
+local function teamMode()
+	local now = os.clock()
+	if teamModeValue and now - teamModeAt < 1 then return teamModeValue end
+	teamModeAt = now
+	local okTeams, teams = pcall(function() return TeamsService:GetTeams() end)
+	if okTeams and #teams > 0 then
+		teamModeValue = "teams"
+	else
+		teamModeValue = "ffa"
+		for _, other in ipairs(Players:GetPlayers()) do
+			if other.TeamColor ~= LocalPlayer.TeamColor then
+				teamModeValue = "colors"
+				break
+			end
+		end
+	end
+	return teamModeValue
+end
+
 function CW.isEnemy(player)
 	if not player or player == LocalPlayer then return false end
-	if LocalPlayer.Neutral or player.Neutral then return true end
+	local mode = teamMode()
+	if mode == "ffa" then return true end
+	if mode == "teams" and (LocalPlayer.Neutral or player.Neutral) then return true end
 	return player.TeamColor ~= CW.State.cachedTeamColor
 end
 
@@ -726,8 +755,7 @@ end
 
 -- Returns the file to use for a category (and weapon) plus its relative path.
 -- A saved selection whose file is not on disk yet is NOT overwritten: it stays saved and is
--- used again as soon as the file exists. Meanwhile the first file (or nothing, for textures)
--- is used without being persisted.
+-- used again as soon as the file exists.
 function CW.Library.selectedPath(category, weapon)
 	local selections = CW.Settings.ASSET_SELECTIONS
 	local selected
@@ -743,11 +771,10 @@ function CW.Library.selectedPath(category, weapon)
 	end
 	if category == "Textures" then return nil, nil end
 
+	-- Nothing chosen (or the chosen file is missing): the first file is used, but it is NOT
+	-- saved as a selection. Only a choice made by the player is persisted.
 	local first = files[1]
 	if not first then return nil, nil end
-	if selected == nil then
-		CW.Library.setSelection(category, weapon, first.Relative)
-	end
 	return first.Path, first.Relative
 end
 
@@ -2015,11 +2042,12 @@ CW.Settings.TRACER_GLOW_COLOR      = cfgValue("TRACER_GLOW_COLOR", "glowColor") 
 CW.Settings.TRACER_WIDTH           = numOr(cfgValue("TRACER_WIDTH", "tracerWidth"), 0.05, 0.01)
 CW.Settings.TRACER_LIFETIME        = numOr(cfgValue("TRACER_LIFETIME", "tracerLifetime"), 0.05, 0.01)
 CW.Settings.TRACER_APPLY_TO_OTHERS = boolOr(cfgValue("TRACER_APPLY_TO_OTHERS", "applyToOthers"), false)
+CW.Settings.TRACER_POINT_LIGHT     = boolOr(cfgValue("TRACER_POINT_LIGHT", "pointLight"), false)
 
 CW.Defaults = CW.Defaults or {}
 for _, key in ipairs({
 	"CUSTOM_BULLET_TRACERS", "TRACER_COLOR", "TRACER_GLOW_COLOR",
-	"TRACER_WIDTH", "TRACER_LIFETIME", "TRACER_APPLY_TO_OTHERS",
+	"TRACER_WIDTH", "TRACER_LIFETIME", "TRACER_APPLY_TO_OTHERS", "TRACER_POINT_LIGHT",
 }) do
 	CW.Defaults[key] = CW.Settings[key]
 end
@@ -2033,8 +2061,9 @@ local function isLocalPlayerShot()
 end
 
 -- Part pool: tracer parts are reused instead of created and destroyed for every bullet
--- (shotgun pellets and automatic weapons make many per second). There is no PointLight per
--- bullet any more; the neon glow part carries the look.
+-- (shotgun pellets and automatic weapons make many per second). The PointLight is optional
+-- (TRACER_POINT_LIGHT, off by default): it is created once per pooled part and only switched
+-- on or off afterwards, so enabling it never creates a new light per bullet.
 local MAX_POOL = 48
 local pool = CW.State.tracerPool
 if not pool then
@@ -2086,6 +2115,21 @@ local function createEnergyTracer(startPos, endPos)
 	core.Size         = Vector3.new(width, width, distance)
 	core.CFrame       = CFrame.new(midpoint, endPos)
 	core.Transparency = 0.1
+
+	local light = core:FindFirstChild("CW_Light")
+	if CW.Settings.TRACER_POINT_LIGHT then
+		if not light then
+			light = Instance.new("PointLight")
+			light.Name       = "CW_Light"
+			light.Range      = 8
+			light.Brightness = 2
+			light.Parent     = core
+		end
+		light.Color   = CW.Settings.TRACER_COLOR
+		light.Enabled = true
+	elseif light then
+		light.Enabled = false
+	end
 
 	local glow = acquirePart(camera)
 	glow.Color        = CW.Settings.TRACER_GLOW_COLOR
@@ -3170,6 +3214,12 @@ guarded("Effects", function()
 	})
 
 	EffectsTab:Toggle({
+		Title = "Tracer Light",
+		Default = CW.Settings.TRACER_POINT_LIGHT == true,
+		Callback = function(s) CW.Settings.TRACER_POINT_LIGHT = s == true end,
+	})
+
+	EffectsTab:Toggle({
 		Title = "Apply To Others",
 		Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
 		Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
@@ -3330,7 +3380,8 @@ guarded("Utilities", function()
 
 	local StarterGui = game:GetService("StarterGui")
 	local ContextActionService = game:GetService("ContextActionService")
-	local chatHidden = false
+	-- Kept in CW.State so a re-run still knows that the chat was hidden with Z.
+	local chatHidden = CW.State.chatHidden == true
 	local sprinting = false
 	local allowSprintRelease = false
 	local heldShiftKeys = {}
@@ -3446,6 +3497,7 @@ guarded("Utilities", function()
 		if input.KeyCode ~= Enum.KeyCode.Z then return end
 
 		chatHidden = not chatHidden
+		CW.State.chatHidden = chatHidden
 		setChatVisible(not chatHidden)
 	end)
 
@@ -3456,6 +3508,7 @@ guarded("Utilities", function()
 			CW.Settings.CHAT_TOGGLE_ENABLED = enabled == true
 			if not CW.Settings.CHAT_TOGGLE_ENABLED then
 				chatHidden = false
+				CW.State.chatHidden = false
 				setChatVisible(true)
 			end
 		end,
