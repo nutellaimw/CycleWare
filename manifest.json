@@ -66,10 +66,6 @@
         "path": "Cursors/scoop.png"
       },
       {
-        "crc32": "6be8b60c",
-        "path": "Cursors/trianglecrosshair.png"
-      },
-      {
         "crc32": "13716ee2",
         "path": "Cursors/whitedot.png"
       }
@@ -219,6 +215,6 @@
       ]
     }
   },
-  "revision": "5af3f9c363a4",
+  "revision": "df2078c8ab1e",
   "schemaVersion": 1
 }
