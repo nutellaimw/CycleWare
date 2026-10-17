@@ -1,4 +1,4 @@
--- CycleWare (phase-4). Standalone entry point; module bodies below are kept in isolated scopes.
+-- CycleWare (phase-5). Standalone entry point; module bodies below are kept in isolated scopes.
 --
 -- Optional, to pin the UI library (see the notes next to UI_PIN_*):
 --   getgenv().CW_CONFIG = { UI_COMMIT = "<commit hash of CWUI.lua>", UI_CRC32 = "<8 hex chars>" }
@@ -9,7 +9,7 @@
 --   stand-in, so a single missing function disables one feature instead of aborting the
 --   whole script. What was found is stored in CW.Caps and reported once at startup.
 --=============================================================================
-local SCRIPT_VERSION = "phase-4"
+local SCRIPT_VERSION = "phase-5"
 
 -- UI pinning. Fill both after you upload CWUI.lua:
 --   UI_PIN_COMMIT: the commit hash that contains the CWUI.lua you want (7 to 40 hex chars).
@@ -264,6 +264,8 @@ CW.Paths.CURSOR_SIG_FILE = CW.Paths.TINTED_FOLDER .. "/cursor.sig"
 CW.Paths.MANIFEST_FILE = CW.Paths.LIBRARY_ROOT .. "/manifest.json"
 CW.Paths.LIBRARY_REVISION_FILE = CW.Paths.LIBRARY_ROOT .. "/.revision"
 CW.Paths.SETTINGS_FILE = CW.Paths.CACHE_FOLDER .. "/ui_settings.json"
+CW.Paths.AUDIO_COPIES_FOLDER = CW.Paths.CACHE_FOLDER .. "/Audio"
+CW.Paths.AUDIO_PROBE_FILE = CW.Paths.CACHE_FOLDER .. "/audio_probe.json"
 
 CW.Paths.CURSOR_FILE = nil
 CW.Paths.HITMARKER_FILE = nil
@@ -463,6 +465,7 @@ local ALL_FOLDERS = {
 	CW.Paths.CACHE_FOLDER,
 	CW.Paths.GENERATED_FOLDER,
 	CW.Paths.TINTED_FOLDER,
+	CW.Paths.AUDIO_COPIES_FOLDER,
 }
 
 function CW.ensureFolders()
@@ -558,9 +561,16 @@ function CW.loadLibraryAsset(cfg)
 		return nil, "missing"
 	end
 
-	local ok, asset = pcall(getcustomasset, cfg.file)
+	local ok, asset, reason
+	if cfg.audio and CW.Library and CW.Library.audioAsset then
+		-- Audio goes through the library: format detected by content, compatibility copy if needed.
+		ok, asset, reason = pcall(CW.Library.audioAsset, cfg.file)
+		if ok and not asset then ok, asset = false, reason end
+	else
+		ok, asset = pcall(getcustomasset, cfg.file)
+	end
 	if not ok or not asset then
-		CW.Warn("getcustomasset failed for " .. cfg.label .. ": " .. tostring(asset))
+		CW.Warn("Could not load " .. cfg.label .. ": " .. tostring(asset))
 		return nil, "error"
 	end
 
@@ -578,7 +588,7 @@ local HttpService = game:GetService("HttpService")
 local CATEGORY_INFO = {
 	Cursors = { folder = CW.Paths.CURSORS_FOLDER, extensions = { png = true } },
 	Hitmarkers = { folder = CW.Paths.HITMARKERS_FOLDER, extensions = { png = true } },
-	HitSounds = { folder = CW.Paths.HIT_SOUNDS_FOLDER, extensions = { mp3 = true, ogg = true } },
+	HitSounds = { folder = CW.Paths.HIT_SOUNDS_FOLDER, extensions = { mp3 = true, ogg = true, wav = true, flac = true }, audio = true },
 }
 local SELECTION_KEYS = {
 	Cursors = "Cursor",
@@ -589,9 +599,10 @@ local SELECTION_KEYS = {
 -- ones the Textures folders use.
 local WEAPON_CATEGORIES = {
 	Textures = { folder = CW.Paths.TEXTURES_FOLDER, extensions = { png = true } },
-	WeaponSounds = { folder = CW.Paths.WEAPON_SOUNDS_FOLDER, extensions = { mp3 = true, ogg = true } },
+	WeaponSounds = { folder = CW.Paths.WEAPON_SOUNDS_FOLDER, extensions = { mp3 = true, ogg = true, wav = true, flac = true }, audio = true },
 }
-local ASSET_EXTENSIONS = { png = true, mp3 = true, ogg = true }
+local ASSET_EXTENSIONS = { png = true, mp3 = true, ogg = true, wav = true, flac = true }
+local AUDIO_FORMATS = { mp3 = true, ogg = true, wav = true, flac = true }
 
 local function ensureFolderPath(path)
 	local current = ""
@@ -643,8 +654,23 @@ local function detectAssetFormat(path, data)
 	if data:sub(1, 3) == "ID3" then return "mp3" end
 	local first, second = string.byte(data, 1, 2)
 	if first == 0xFF and second and bit32.band(second, 0xE0) == 0xE0 then return "mp3" end
+	if data:sub(1, 4) == "RIFF" and data:sub(9, 12) == "WAVE" then return "wav" end
+	if data:sub(1, 4) == "fLaC" then return "flac" end
 	if data:match("^%d%d%d:%s") then return "HTTP error response" end
 	return "unknown"
+end
+
+-- Images must be PNG with a matching extension. Audio is judged by its content only: any of
+-- mp3/ogg/wav/flac is accepted whatever the file is called (a WAV named .mp3 is fine).
+local function isAudioCategory(category)
+	local info = CATEGORY_INFO[category] or WEAPON_CATEGORIES[category]
+	return info ~= nil and info.audio == true
+end
+
+local function formatMatches(category, path, actual)
+	if isAudioCategory(category) then return AUDIO_FORMATS[actual] == true end
+	local extension = path:match("%.([%w]+)$")
+	return extension ~= nil and actual == extension:lower()
 end
 
 local invalidAssetWarnings = {}
@@ -668,9 +694,11 @@ CW.Library.ensureFolder = ensureFolderPath
 -- Directory scans read and validate every file, so the result is cached per category/weapon.
 -- The cache is cleared whenever the library can have changed (CW.Library.sync).
 local listCache = {}
+local audioAssetCache, audioPending = {}, {}
 
 function CW.Library.invalidate()
 	table.clear(listCache)
+	table.clear(audioAssetCache)
 end
 
 local function scanLibrary(category, weapon)
@@ -702,7 +730,7 @@ local function scanLibrary(category, weapon)
 					if relative then
 						local okData, data = pcall(readfile, normalized)
 						local actualFormat = okData and detectAssetFormat(normalized, data) or "unreadable"
-						if actualFormat == extension:lower() then
+						if formatMatches(category, normalized, actualFormat) then
 							table.insert(result, {
 								Name = filename:gsub("%.[%w]+$", ""),
 								Path = CW.Paths.LIBRARY_ROOT .. "/" .. relative,
@@ -710,7 +738,7 @@ local function scanLibrary(category, weapon)
 							})
 						elseif not invalidAssetWarnings[normalized] then
 							invalidAssetWarnings[normalized] = true
-							CW.Warn("Skipped invalid library asset " .. relative .. " (expected " .. extension:lower() .. ", detected " .. actualFormat .. ")")
+							CW.Warn("Skipped invalid library asset " .. relative .. " (expected " .. (isAudioCategory(category) and "audio" or extension:lower()) .. ", detected " .. actualFormat .. ")")
 						end
 					end
 				end
@@ -736,6 +764,167 @@ function CW.Library.list(category, weapon)
 		copy[index] = { Name = item.Name, Path = item.Path, Relative = item.Relative }
 	end
 	return copy
+end
+
+--// Audio assets ------------------------------------------------------------------------
+-- getcustomasset decides how to decode a local file from its NAME, so a WAV called .mp3 (or a
+-- format the engine only accepts under another name) can fail. For those files a copy is
+-- written to the cache folder with a name that works; the original is never touched.
+-- Which name works is found once per audio format by loading the copy and checking that the
+-- sound has a length (real extension first, then .mp3, then .ogg); the result is remembered
+-- in audio_probe.json, so nothing is guessed on later runs. mp3/ogg files with a matching
+-- name are played directly, with no probe and no copy.
+local STANDARD_AUDIO = { mp3 = true, ogg = true }
+local MAX_AUDIO_BYTES = 20 * 1024 * 1024 -- Roblox's documented limit for audio files
+local audioWarned = {}
+local audioProbe
+
+local function warnAudioOnce(key, message)
+	if audioWarned[key] then return end
+	audioWarned[key] = true
+	CW.Warn(message)
+end
+
+local function loadAudioProbe()
+	if audioProbe then return audioProbe end
+	audioProbe = {}
+	local okExists, exists = pcall(isfile, CW.Paths.AUDIO_PROBE_FILE)
+	if okExists and exists then
+		local okRead, raw = pcall(readfile, CW.Paths.AUDIO_PROBE_FILE)
+		if okRead then
+			local decoded, data = pcall(HttpService.JSONDecode, HttpService, raw)
+			if decoded and type(data) == "table" then
+				for format, extension in pairs(data) do
+					if AUDIO_FORMATS[format] and AUDIO_FORMATS[extension] then audioProbe[format] = extension end
+				end
+			end
+		end
+	end
+	return audioProbe
+end
+
+local function saveAudioProbe()
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, audioProbe or {})
+	if ok then pcall(writefile, CW.Paths.AUDIO_PROBE_FILE, encoded) end
+end
+
+-- True when the engine can load the asset as a sound with a length above zero.
+local function audioLoads(asset)
+	local ok, loaded = pcall(function()
+		local sound = Instance.new("Sound")
+		sound.Volume = 0
+		sound.SoundId = asset
+		sound.Parent = game:GetService("SoundService")
+		local done = false
+		task.spawn(function()
+			pcall(function() game:GetService("ContentProvider"):PreloadAsync({ sound }) end)
+			done = true
+		end)
+		local deadline = os.clock() + 4
+		while not done and os.clock() < deadline do task.wait(0.05) end
+		local settle = os.clock() + 0.5
+		while sound.TimeLength <= 0 and os.clock() < settle do task.wait(0.05) end
+		local length = sound.TimeLength
+		sound:Destroy()
+		return length > 0
+	end)
+	return ok and loaded == true
+end
+
+local function audioCopyPath(path, data, extension)
+	local name = path:match("([^/\\]+)$") or "audio"
+	name = name:gsub("%.[%w]+$", "")
+	name = name:gsub("[^%w_%-]", "_")
+	return CW.Paths.AUDIO_COPIES_FOLDER .. "/" .. string.format("%08x", CW.crc32Yielding(data)) .. "_" .. name .. "." .. extension
+end
+
+local function compatAudioAsset(path, data, format, originalExtension)
+	local probe = loadAudioProbe()
+	local known = probe[format] ~= nil
+	local candidates = {}
+	if known then
+		candidates[1] = probe[format]
+	else
+		for _, extension in ipairs({ format, "mp3", "ogg" }) do
+			if not table.find(candidates, extension) then table.insert(candidates, extension) end
+		end
+	end
+
+	CW.Library.ensureFolder(CW.Paths.AUDIO_COPIES_FOLDER)
+	for _, extension in ipairs(candidates) do
+		local target = path
+		if extension ~= originalExtension then
+			target = audioCopyPath(path, data, extension)
+			local okFile, exists = pcall(isfile, target)
+			if not (okFile and exists) then
+				if not pcall(writefile, target, data) then target = nil end
+			end
+		end
+		if target then
+			local okAsset, asset = pcall(getcustomasset, target)
+			if okAsset and type(asset) == "string" and (known or audioLoads(asset)) then
+				if not known then
+					probe[format] = extension
+					saveAudioProbe()
+					CW.Log("Audio probe: " .. format .. " files load as ." .. extension .. " on this executor")
+				end
+				return asset
+			end
+			-- This name did not work: do not leave its copy behind.
+			if target ~= path and not known then pcall(delfile, target) end
+		end
+	end
+	if known then
+		probe[format] = nil -- the remembered name stopped working: probe again next time
+		saveAudioProbe()
+	end
+	return nil
+end
+
+-- Returns the asset id for an audio file, or nil plus the reason.
+function CW.Library.audioAsset(path)
+	if type(path) ~= "string" then return nil, "invalid path" end
+	local cached = audioAssetCache[path]
+	if cached then return cached end
+	while audioPending[path] do task.wait(0.05) end
+	cached = audioAssetCache[path]
+	if cached then return cached end
+
+	audioPending[path] = true
+	local ok, asset, reason = pcall(function()
+		local okRead, data = pcall(readfile, path)
+		if not okRead or type(data) ~= "string" then return nil, "unreadable" end
+		local format = detectAssetFormat(path, data)
+		if not AUDIO_FORMATS[format] then return nil, "not an audio file (detected " .. format .. ")" end
+		if #data > MAX_AUDIO_BYTES then
+			warnAudioOnce(path, (CW.Library.relative(path) or path) .. " is larger than 20 MB; Roblox may refuse to play it")
+		end
+
+		local originalExtension = (path:match("%.([%w]+)$") or ""):lower()
+		if STANDARD_AUDIO[format] and originalExtension == format then
+			local okAsset, direct = pcall(getcustomasset, path)
+			if okAsset and direct then return direct end
+			return nil, tostring(direct)
+		end
+
+		local compat = compatAudioAsset(path, data, format, originalExtension)
+		if compat then return compat end
+
+		-- Last resort: the original file, as is.
+		local okAsset, direct = pcall(getcustomasset, path)
+		if okAsset and direct then
+			warnAudioOnce("fallback|" .. path, "Could not verify that " .. (CW.Library.relative(path) or path) .. " plays as " .. format .. "; using the original file")
+			return direct
+		end
+		return nil, tostring(direct)
+	end)
+	audioPending[path] = nil
+
+	if ok and asset then
+		audioAssetCache[path] = asset
+		return asset
+	end
+	return nil, ok and reason or tostring(asset)
 end
 
 function CW.Library.relative(path)
@@ -929,7 +1118,7 @@ local function syncImpl()
 			if isfile(destination) then
 				local ok, existing = pcall(readfile, destination)
 				local actualFormat = ok and detectAssetFormat(entry.path, existing) or "unreadable"
-				if actualFormat == entry.path:match("%.([%w]+)$"):lower() then
+				if formatMatches(entry.category, entry.path, actualFormat) then
 					if entry.crc32 then
 						local expectedCRC = tostring(entry.crc32):lower():gsub("^0x", "")
 						needsDownload = string.format("%08x", CW.crc32Yielding(existing)):lower() ~= expectedCRC
@@ -946,10 +1135,10 @@ local function syncImpl()
 				local downloaded, bytes = pcall(CW.httpGet, baseURL .. "/" .. remotePath)
 				if downloaded and type(bytes) == "string" then
 					local actualFormat = detectAssetFormat(entry.path, bytes)
-					local expectedFormat = entry.path:match("%.([%w]+)$"):lower()
+					local expectedFormat = isAudioCategory(entry.category) and "audio" or entry.path:match("%.([%w]+)$"):lower()
 					local expectedCRC = entry.crc32 and tostring(entry.crc32):lower():gsub("^0x", "")
 					local actualCRC = string.format("%08x", CW.crc32Yielding(bytes)):lower()
-					if actualFormat ~= expectedFormat then
+					if not formatMatches(entry.category, entry.path, actualFormat) then
 						complete = false
 						CW.Warn("Rejected " .. entry.path .. ": expected " .. expectedFormat .. " content, detected " .. actualFormat .. ". Check the GitHub path and file format.")
 					elseif expectedCRC and actualCRC ~= expectedCRC then
@@ -1718,6 +1907,7 @@ local function reloadSound()
 	local asset, failReason = CW.loadLibraryAsset({
 		file = CW.Paths.SOUND_FILE,
 		label = "hit sound",
+		audio = true,
 	})
 	if asset then
 		CW.Settings.SOUND_ID = asset
@@ -1824,7 +2014,7 @@ end
 for _, weaponName in ipairs(WEAPON_LIST) do
 	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName)
 	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName .. "/" .. CW.Paths.OFFICIAL_FOLDER)
-	-- Same weapon names for the gun-sound library: WeaponSounds/<Weapon>/ takes your own sound files.
+	-- Same weapon names for the gun-sound library: WeaponSounds/<Weapon>/ takes your own mp3, ogg, wav or flac files.
 	CW.Library.ensureFolder(CW.Paths.WEAPON_SOUNDS_FOLDER .. "/" .. weaponName)
 	CW.Library.ensureFolder(CW.Paths.WEAPON_SOUNDS_FOLDER .. "/" .. weaponName .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 end
@@ -2813,7 +3003,7 @@ do
 		table.sort(dropped)
 		weaponSoundMigrated = true
 		CW.Warn("Weapon sound overrides now use the WeaponSounds library. Removed the old selection for: "
-			.. table.concat(dropped, ", ") .. ". Choose a new sound for them in the Weapon Sounds tab.")
+			.. table.concat(dropped, ", ") .. ". Choose a new sound for them in the Sounds tab.")
 	end
 end
 refreshWeaponSoundCatalog()
@@ -2946,7 +3136,7 @@ local function applyWeaponSoundToTool(tool, player, container)
 	if not targetId then
 		local filePath = CW.Paths.LIBRARY_ROOT .. "/" .. relativePath
 		if not isfile(filePath) then return end
-		local loaded, assetId = pcall(getcustomasset, filePath)
+		local loaded, assetId = pcall(CW.Library.audioAsset, filePath)
 		if not loaded or type(assetId) ~= "string" then return end
 		weaponAssetIds[relativePath] = assetId
 		targetId = assetId
@@ -3297,36 +3487,15 @@ guarded("Visuals", function()
 end)
 
 ------------------------------------------------------------------------------
--- Hit Sound tab
+-- Sounds tab: Weapon Sounds and Hit Sound as two collapsible sections of one tab.
+-- Controls and saved settings are the same as before, so nothing already saved is lost.
 ------------------------------------------------------------------------------
-guarded("Hit Sound", function()
-	local HitSoundsTab = Window:Tab({ Title = "Hit Sound" })
+guarded("Sounds", function()
+	local SoundsTab = Window:AddTab({ Name = "Sounds" })
+	local WeaponSection = wrapSection(SoundsTab:AddSection({ Name = "Weapon Sounds", Open = true }))
+	local HitSection = wrapSection(SoundsTab:AddSection({ Name = "Hit Sound", Open = true }))
 
-	HitSoundDropdown = HitSoundsTab:Dropdown({
-		Title = "Hit Sound",
-		Options = hitSoundOptions,
-		Default = hitSoundLabel(CW.Paths.SOUND_FILE),
-		Callback = applySoundFile,
-	})
-
-	HitSoundsTab:Slider({
-		Title = "Hit Sound Volume",
-		Min = 0,
-		Max = 2,
-		Default = CW.Settings.SOUND_VOLUME,
-		Decimal = 2,
-		Suffix = "x",
-		Callback = function(v) CW.Settings.SOUND_VOLUME = v end,
-	})
-end)
-
-------------------------------------------------------------------------------
--- Weapon Sounds tab
-------------------------------------------------------------------------------
-guarded("Weapon Sounds", function()
-	local WeaponSoundsTab = Window:Tab({ Title = "Weapon Sounds" })
-
-	WeaponSoundsTab:Toggle({
+	WeaponSection:Toggle({
 		Title = "Enable Weapon Sound Overrides",
 		Default = CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED == true,
 		Callback = function(enabled)
@@ -3335,7 +3504,7 @@ guarded("Weapon Sounds", function()
 		end,
 	})
 
-	WeaponSoundsTab:Toggle({
+	WeaponSection:Toggle({
 		Title = "Apply to Other Players Locally",
 		Default = CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS == true,
 		Callback = function(enabled)
@@ -3344,7 +3513,7 @@ guarded("Weapon Sounds", function()
 		end,
 	})
 
-	WeaponSoundsTab:Slider({
+	WeaponSection:Slider({
 		Title = "Weapon Sound Volume",
 		Min = 0,
 		Max = 2,
@@ -3360,7 +3529,7 @@ guarded("Weapon Sounds", function()
 	for _, weaponName in ipairs(CW.WeaponList or {}) do
 		local weapon = weaponName
 		local entry = weaponSoundCatalog[weapon]
-		local dropdown = WeaponSoundsTab:Dropdown({
+		local dropdown = WeaponSection:Dropdown({
 			Title = weapon .. " Shoot Sound",
 			Options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
 			Default = weaponSoundLabel(weapon, weaponSoundOverrides[weapon]),
@@ -3370,6 +3539,23 @@ guarded("Weapon Sounds", function()
 		})
 		table.insert(weaponSoundDropdowns, { weapon = weapon, control = dropdown })
 	end
+
+	HitSoundDropdown = HitSection:Dropdown({
+		Title = "Hit Sound",
+		Options = hitSoundOptions,
+		Default = hitSoundLabel(CW.Paths.SOUND_FILE),
+		Callback = applySoundFile,
+	})
+
+	HitSection:Slider({
+		Title = "Hit Sound Volume",
+		Min = 0,
+		Max = 2,
+		Default = CW.Settings.SOUND_VOLUME,
+		Decimal = 2,
+		Suffix = "x",
+		Callback = function(v) CW.Settings.SOUND_VOLUME = v end,
+	})
 end)
 
 ------------------------------------------------------------------------------
