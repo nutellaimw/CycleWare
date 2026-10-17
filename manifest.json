@@ -34,10 +34,6 @@
         "path": "Cursors/heartcrosshair.png"
       },
       {
-        "crc32": "4f4218f0",
-        "path": "Cursors/kuromimaid.png"
-      },
-      {
         "crc32": "64541017",
         "path": "Cursors/pc.png"
       },
@@ -211,6 +207,6 @@
       ]
     }
   },
-  "revision": "a2d77e669ca2",
+  "revision": "79b4811a0a8a",
   "schemaVersion": 1
 }
