@@ -50,10 +50,6 @@
         "path": "Cursors/purpledot.png"
       },
       {
-        "crc32": "3c0ad73b",
-        "path": "Cursors/purplepluscursor.png"
-      },
-      {
         "crc32": "718519e5",
         "path": "Cursors/reddotwdiagonalcrosshairs.png"
       },
@@ -215,6 +211,6 @@
       ]
     }
   },
-  "revision": "df2078c8ab1e",
+  "revision": "a2d77e669ca2",
   "schemaVersion": 1
 }
