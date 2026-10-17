@@ -30,10 +30,6 @@
         "path": "Cursors/heart.png"
       },
       {
-        "crc32": "b839244e",
-        "path": "Cursors/heartcrosshair.png"
-      },
-      {
         "crc32": "64541017",
         "path": "Cursors/pc.png"
       },
@@ -207,6 +203,6 @@
       ]
     }
   },
-  "revision": "79b4811a0a8a",
+  "revision": "f83fc52b93c2",
   "schemaVersion": 1
 }
