@@ -161,39 +161,10 @@ function CW.untrackAll()
 end
 
 --// Teams ----------------------------------------------------------------------------
--- How the game uses teams decides who is an enemy (re-evaluated at most once per second):
---   "teams":  the game has Team objects. A neutral player on either side counts as an enemy,
---             otherwise the team colors are compared.
---   "colors": no Team objects, but players do have different TeamColors, so the colors are
---             compared (Player.Neutral is ignored, because it is not reliable there).
---   "ffa":    no Team objects and everybody has the same color: everyone is an enemy.
-local TeamsService = game:GetService("Teams")
-local teamModeValue, teamModeAt = nil, 0
-
-local function teamMode()
-	local now = os.clock()
-	if teamModeValue and now - teamModeAt < 1 then return teamModeValue end
-	teamModeAt = now
-	local okTeams, teams = pcall(function() return TeamsService:GetTeams() end)
-	if okTeams and #teams > 0 then
-		teamModeValue = "teams"
-	else
-		teamModeValue = "ffa"
-		for _, other in ipairs(Players:GetPlayers()) do
-			if other.TeamColor ~= LocalPlayer.TeamColor then
-				teamModeValue = "colors"
-				break
-			end
-		end
-	end
-	return teamModeValue
-end
-
+-- The game always uses Team objects (police, prisoner, criminal) and nobody is neutral, so
+-- a player is an enemy whenever the team color differs from yours.
 function CW.isEnemy(player)
 	if not player or player == LocalPlayer then return false end
-	local mode = teamMode()
-	if mode == "ffa" then return true end
-	if mode == "teams" and (LocalPlayer.Neutral or player.Neutral) then return true end
 	return player.TeamColor ~= CW.State.cachedTeamColor
 end
 
@@ -3911,7 +3882,15 @@ local function refreshUIFromLibrary()
 	local function syncGallery(gallery, category, weapon, selectedFile)
 		if not gallery then return end
 		gallery:SetItems(galleryItems(category, weapon))
-		if selectedFile then gallery:Set(selectedFile, true) else gallery:Clear() end
+		-- SetItems already restores the previous selection. Calling Set on an entry that is
+		-- already selected would DESELECT it in galleries that allow deselecting (the weapon
+		-- texture galleries), so Set is only used when the selection really has to change.
+		local current = gallery:Get()
+		if selectedFile then
+			if not (current and current.Path == selectedFile) then gallery:Set(selectedFile, true) end
+		elseif current then
+			gallery:Clear()
+		end
 	end
 
 	syncGallery(HitmarkerGallery, "Hitmarkers", nil, CW.Paths.HITMARKER_FILE)
