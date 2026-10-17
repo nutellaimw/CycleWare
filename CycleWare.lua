@@ -1,7 +1,4 @@
 -- CycleWare (phase-5). Standalone entry point; module bodies below are kept in isolated scopes.
---
--- Optional, to pin the UI library (see the notes next to UI_PIN_*):
---   getgenv().CW_CONFIG = { UI_COMMIT = "<commit hash of CWUI.lua>", UI_CRC32 = "<8 hex chars>" }
 
 --=============================================================================
 -- Preflight
@@ -10,13 +7,6 @@
 --   whole script. What was found is stored in CW.Caps and reported once at startup.
 --=============================================================================
 local SCRIPT_VERSION = "phase-5"
-
--- UI pinning. Fill both after you upload CWUI.lua:
---   UI_PIN_COMMIT: the commit hash that contains the CWUI.lua you want (7 to 40 hex chars).
---   UI_PIN_CRC32:  the crc32 of that file as 8 lowercase hex chars; the UI is refused if it differs.
--- Left empty, the UI is loaded from the main branch without any check (a warning is shown once).
-local UI_PIN_COMMIT = ""
-local UI_PIN_CRC32  = ""
 
 local CAPS = {
 	files = type(isfile) == "function" and type(isfolder) == "function"
@@ -641,11 +631,8 @@ local function validManifestPath(category, path)
 	return false
 end
 
-local function detectAssetFormat(path, data)
+local function detectAssetFormat(data)
 	if type(data) ~= "string" or #data < 4 then return "empty or truncated" end
-	local extension = path:match("%.([%w]+)$")
-	if not extension then return "unknown" end
-	extension = extension:lower()
 
 	if data:sub(1, 8) == "\137\80\78\71\13\10\26\10" then return "png" end
 	if data:sub(1, 4) == "MM\0\42" or data:sub(1, 4) == "II\42\0" then return "tiff" end
@@ -729,7 +716,7 @@ local function scanLibrary(category, weapon)
 					local relative = libraryRelative(normalized)
 					if relative then
 						local okData, data = pcall(readfile, normalized)
-						local actualFormat = okData and detectAssetFormat(normalized, data) or "unreadable"
+						local actualFormat = okData and detectAssetFormat(data) or "unreadable"
 						if formatMatches(category, normalized, actualFormat) then
 							table.insert(result, {
 								Name = filename:gsub("%.[%w]+$", ""),
@@ -894,7 +881,7 @@ function CW.Library.audioAsset(path)
 	local ok, asset, reason = pcall(function()
 		local okRead, data = pcall(readfile, path)
 		if not okRead or type(data) ~= "string" then return nil, "unreadable" end
-		local format = detectAssetFormat(path, data)
+		local format = detectAssetFormat(data)
 		if not AUDIO_FORMATS[format] then return nil, "not an audio file (detected " .. format .. ")" end
 		if #data > MAX_AUDIO_BYTES then
 			warnAudioOnce(path, (CW.Library.relative(path) or path) .. " is larger than 20 MB; Roblox may refuse to play it")
@@ -1057,6 +1044,9 @@ local function syncImpl()
 	local complete = true
 	local skipped = 0
 	local pending = {}
+	-- False when an entry of the manifest itself is malformed: the list of files to keep is then
+	-- not reliable, so nothing is removed from the _Official folders in that run.
+	local entriesTrusted = true
 
 	for category, entries in pairs(manifest.assets) do
 		local weaponInfo = WEAPON_CATEGORIES[category]
@@ -1074,11 +1064,13 @@ local function syncImpl()
 							table.insert(pending, { category = category, path = entry.path, crc32 = entry.crc32 })
 						else
 							skipped = skipped + 1
+							entriesTrusted = false
 							CW.Warn("Skipped invalid " .. category .. " entry in manifest")
 						end
 					end
 				else
 					skipped = skipped + 1
+					entriesTrusted = false
 				end
 			end
 		elseif CATEGORY_INFO[category] and type(entries) == "table" then
@@ -1087,6 +1079,7 @@ local function syncImpl()
 					table.insert(pending, { category = category, path = entry.path, crc32 = entry.crc32 })
 				else
 					skipped = skipped + 1
+					entriesTrusted = false
 					CW.Warn("Skipped invalid " .. category .. " entry in manifest")
 				end
 			end
@@ -1108,6 +1101,7 @@ local function syncImpl()
 		local destination = officialDestination(entry.category, entry.path)
 		if not destination then
 			complete = false
+			entriesTrusted = false
 		else
 			local destinationRelative = libraryRelative(destination)
 			if destinationRelative then expected[destinationRelative] = true end
@@ -1117,7 +1111,7 @@ local function syncImpl()
 			local needsDownload = true
 			if isfile(destination) then
 				local ok, existing = pcall(readfile, destination)
-				local actualFormat = ok and detectAssetFormat(entry.path, existing) or "unreadable"
+				local actualFormat = ok and detectAssetFormat(existing) or "unreadable"
 				if formatMatches(entry.category, entry.path, actualFormat) then
 					if entry.crc32 then
 						local expectedCRC = tostring(entry.crc32):lower():gsub("^0x", "")
@@ -1134,7 +1128,7 @@ local function syncImpl()
 				local remotePath = encodeURLPath(entry.path)
 				local downloaded, bytes = pcall(CW.httpGet, baseURL .. "/" .. remotePath)
 				if downloaded and type(bytes) == "string" then
-					local actualFormat = detectAssetFormat(entry.path, bytes)
+					local actualFormat = detectAssetFormat(bytes)
 					local expectedFormat = isAudioCategory(entry.category) and "audio" or entry.path:match("%.([%w]+)$"):lower()
 					local expectedCRC = entry.crc32 and tostring(entry.crc32):lower():gsub("^0x", "")
 					local actualCRC = string.format("%08x", CW.crc32Yielding(bytes)):lower()
@@ -1168,8 +1162,17 @@ local function syncImpl()
 	-- Persist a valid manifest revision even when a few entries fail. Good files stay cached,
 	-- while missing/invalid paths are retried because their files fail validation.
 	pcall(writefile, CW.Paths.LIBRARY_REVISION_FILE, revision)
+	-- Official files that are no longer in the manifest (for example a cursor removed from the
+	-- repository) are deleted from the _Official folders. This no longer depends on every other
+	-- download having succeeded; user files outside _Official are never touched.
+	if #pending > 0 then
+		if entriesTrusted then
+			pruneOfficial(expected)
+		else
+			CW.Warn("The manifest has invalid entries; obsolete official files were not removed this time")
+		end
+	end
 	if complete then
-		if skipped == 0 and #pending > 0 then pruneOfficial(expected) end
 		CW.Log("Asset library synchronized at revision " .. revision)
 	else
 		CW.Warn("Asset sync finished with invalid or unavailable files; valid assets were kept")
@@ -1965,11 +1968,8 @@ runModule("Texture", function()
 -- Texture.lua
 local CW = getgenv().__CW_CORE_STATE
 
-local Players         = game:GetService("Players")
 local ContentProvider = game:GetService("ContentProvider")
 local LocalPlayer     = CW.LocalPlayer
-
-local _cfg = getgenv().CW_CONFIG or {}
 
 CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER)
 
@@ -1996,13 +1996,6 @@ local originals = CW.State.weaponTextureOriginals
 if not originals then
 	originals = {}
 	CW.State.weaponTextureOriginals = originals
-	local old = CW.State.originalWeaponTextureIds
-	if old then
-		for mesh, entry in pairs(old) do
-			originals[mesh] = type(entry) == "table" and entry or { value = entry }
-		end
-		CW.State.originalWeaponTextureIds = nil
-	end
 end
 
 local appliedIds = CW.State.appliedTextureIds
@@ -2173,11 +2166,6 @@ reloadTexturesAndApply()
 
 -- Monitors are (re)created on every run, so a re-run replaces the old ones.
 do
-	if CW.State.backpackMonitorConn then -- connection stored by an older script version
-		pcall(function() CW.State.backpackMonitorConn:Disconnect() end)
-		CW.State.backpackMonitorConn = nil
-	end
-
 	-- The Backpack is recreated on every respawn, so the player is always watched for a new one.
 	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
 	if backpack then monitor(backpack, "textureBackpack") end
@@ -2206,19 +2194,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = CW.LocalPlayer
 
-local _cfg = getgenv().CW_CONFIG or {}
-
-local function boolOr(v, default)
-	if v == nil then return default end
-	return v
-end
-
-local function numOr(v, default, minValue)
-	v = tonumber(v)
-	if v == nil then v = default end
-	if minValue and v < minValue then v = minValue end
-	return v
-end
+-- (boolOr, numOr and _cfg come from the top of the script.)
 
 -- UPPER_CASE is the standard key; the old camelCase keys still work.
 local function cfgValue(upperKey, legacyKey)
@@ -2394,7 +2370,6 @@ local function installTracers()
 		TracersModule.createSniper = makeTracerWrapper("_originalCreateSniper")
 	end
 
-	CW.State.tracersHooked = true
 	CW.Log("Tracer override installed.")
 	return true
 end
@@ -2426,8 +2401,6 @@ local TweenService      = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService  = game:GetService("UserInputService")
 local RunService        = game:GetService("RunService")
-
-local LocalPlayer = CW.LocalPlayer
 
 -- How it works
 --   The __namecall hook runs on the GAME's thread, which lacks the capabilities needed to
@@ -2559,10 +2532,6 @@ function CW.drainShots()
 	end
 end
 
-if CW.State.shotDrainConn then -- connection stored by an older script version
-	pcall(function() CW.State.shotDrainConn:Disconnect() end)
-	CW.State.shotDrainConn = nil
-end
 CW.track("shotDrain", RunService.PreRender:Connect(function()
 	local drain = CW.drainShots
 	if drain then drain() end
@@ -2640,7 +2609,7 @@ function CW.cleanup()
 	pcall(function() if CW.UIWindow then CW.UIWindow:Destroy() end end)
 	for _, key in ipairs({
 		"enforcerConn", "enableConn", "sprintCharacterConn", "chatToggleConn", "ammoGuiConn",
-		"ammoCharacterConn", "backpackMonitorConn", "shotDrainConn",
+		"ammoCharacterConn",
 	}) do
 		pcall(function()
 			local connection = CW.State[key]
@@ -2747,30 +2716,11 @@ end
 -- Autosave (debounced). Assigned for real in the Settings section.
 local scheduleSave = function() end
 
---// Download the UI library, pinned to a commit and verified by checksum when configured ----
-local REPO_RAW = "https://raw.githubusercontent.com/nutellaimw/CycleWare/"
-local uiCommit = tostring(_cfg.UI_COMMIT or UI_PIN_COMMIT or ""):lower()
-local uiCRC = tostring(_cfg.UI_CRC32 or UI_PIN_CRC32 or ""):lower():gsub("^0x", "")
-local UI_URL
-if uiCommit:match("^%x+$") and #uiCommit >= 7 and #uiCommit <= 40 then
-	UI_URL = REPO_RAW .. uiCommit .. "/CWUI.lua"
-else
-	UI_URL = REPO_RAW .. "refs/heads/main/CWUI.lua"
-	uiCommit = ""
-end
-
-CW.Log("Downloading CycleWare UI from GitHub" .. (uiCommit ~= "" and (" (commit " .. uiCommit:sub(1, 7) .. ")") or " (main branch)"))
+--// Download the UI library
+local UI_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CWUI.lua"
+CW.Log("Downloading CycleWare UI from GitHub")
 local fetchOK, uiSource = pcall(CW.httpGet, UI_URL)
 assert(fetchOK and type(uiSource) == "string" and uiSource ~= "", "Could not download CWUI.lua from GitHub: " .. tostring(uiSource))
-
-if uiCRC ~= "" then
-	local actual = string.format("%08x", CW.crc32Yielding(uiSource))
-	assert(actual == uiCRC, "CWUI.lua failed the integrity check (expected crc32 " .. uiCRC .. ", got " .. actual .. "). The UI was not loaded.")
-	CW.Log("CycleWare UI verified (crc32 " .. actual .. ")")
-elseif not CW.State.uiUnpinnedWarned then
-	CW.State.uiUnpinnedWarned = true
-	CW.Warn("CWUI.lua is loaded without a commit pin or checksum: any change pushed to GitHub takes effect immediately. Set UI_PIN_COMMIT and UI_PIN_CRC32 at the top of the script to lock it.")
-end
 
 local loadUI, compileError = loadstring(uiSource)
 assert(type(loadUI) == "function", tostring(compileError or "Could not compile CWUI.lua"))
@@ -2787,7 +2737,7 @@ Window.ToggleVisibility = Window.Toggle
 local function mapControlOptions(options)
 	options = options or {}
 	return {
-		Name = options.Title or options.Name or options.Action,
+		Name = options.Title or options.Name,
 		Default = options.Default,
 		Min = options.Min,
 		Max = options.Max,
@@ -3988,7 +3938,6 @@ end
 ------------------------------------------------------------------------------
 guarded("Settings", function()
 	local SettingsTab = createCompatTab({ Title = "Settings" })
-	Window.ConfigTab = SettingsTab
 
 	SettingsTab:Button({
 		Title = "Refresh Asset Library",
@@ -4080,7 +4029,6 @@ guarded("Settings", function()
 
 	SettingsTab:Button({
 		Title = "Save Settings",
-		Action = "Save",
 		Callback = function()
 			saveSettings()
 			CW.Log("Settings saved.")
