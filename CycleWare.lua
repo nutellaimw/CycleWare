@@ -1,11 +1,5 @@
 -- CycleWare (phase-5). Standalone entry point; module bodies below are kept in isolated scopes.
 
---=============================================================================
--- Preflight
---   Executor functions this script depends on. Whatever is missing is replaced by a safe
---   stand-in, so a single missing function disables one feature instead of aborting the
---   whole script. What was found is stored in CW.Caps and reported once at startup.
---=============================================================================
 local SCRIPT_VERSION = "phase-5"
 
 local CAPS = {
@@ -101,7 +95,6 @@ if not CW then
 			lastTarget       = nil,
 			enforcerConn     = nil,
 			enableConn       = nil,
-			cachedTeamColor  = LocalPlayer.TeamColor,
 			mouseX           = 0,
 			mouseY           = 0,
 		},
@@ -161,11 +154,26 @@ function CW.untrackAll()
 end
 
 --// Teams ----------------------------------------------------------------------------
--- The game always uses Team objects (police, prisoner, criminal) and nobody is neutral, so
--- a player is an enemy whenever the team color differs from yours.
-function CW.isEnemy(player)
+-- The same rule the game applies before a shot can hurt someone (GunController.canBeDamaged):
+-- another team, no ForceField, a living humanoid, and a Guard can only hurt an Inmate whose
+-- character has the attribute "Hostile". Used for the hitmarker and the red cursor, so neither
+-- shows for a target that cannot take damage.
+local TeamsService = game:GetService("Teams")
+
+function CW.canDamage(player)
 	if not player or player == LocalPlayer then return false end
-	return player.TeamColor ~= CW.State.cachedTeamColor
+	local myTeam, theirTeam = LocalPlayer.Team, player.Team
+	if theirTeam == myTeam then return false end
+	local character = player.Character
+	if not character then return false end
+	local guards = TeamsService:FindFirstChild("Guards")
+	local inmates = TeamsService:FindFirstChild("Inmates")
+	if guards and inmates and myTeam == guards and theirTeam == inmates and not character:GetAttribute("Hostile") then
+		return false
+	end
+	if character:FindFirstChildOfClass("ForceField") then return false end
+	local humanoid = character:FindFirstChild("Humanoid")
+	return humanoid ~= nil and humanoid.Health > 0
 end
 
 --// HTTP -----------------------------------------------------------------------------
@@ -359,12 +367,6 @@ if settingsFileExists then
 	end
 end
 
--- ShootEvent is resolved (and waited for) by the Hook module.
-if not CW.ShootEvent then
-	local gunRemotes = ReplicatedStorage:FindFirstChild("GunRemotes")
-	CW.ShootEvent = gunRemotes and gunRemotes:FindFirstChild("ShootEvent")
-end
-
 do
 	local loc = UserInputService:GetMouseLocation()
 	CW.State.mouseX, CW.State.mouseY = loc.X, loc.Y
@@ -372,15 +374,11 @@ end
 
 -- Created on every run and registered with CW.track: a re-run replaces the previous connections.
 do
-	CW.State.cachedTeamColor = LocalPlayer.TeamColor
-	CW.track("teamColor", LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
-		CW.State.cachedTeamColor = LocalPlayer.TeamColor
-	end))
-
 	CW.track("mouseMove", UserInputService.InputChanged:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseMovement then
 			return
 		end
+		if next(CW.ActiveFollowClones) == nil then return end -- nothing to move
 
 		local inset = GuiService:GetGuiInset()
 
@@ -1579,7 +1577,12 @@ end
 
 local function connectEnforcer()
 	if CW.State.enforcerConn then CW.State.enforcerConn:Disconnect() end
-	if CW.State.enableConn   then CW.State.enableConn:Disconnect()   end
+	-- Stored by the previous version, which forced MouseIconEnabled back on. That fought the
+	-- game's sniper scope (it hides the cursor on purpose), so it is no longer done.
+	if CW.State.enableConn then
+		pcall(function() CW.State.enableConn:Disconnect() end)
+		CW.State.enableConn = nil
+	end
 
 	CW.State.enforcerConn = UserInputService:GetPropertyChangedSignal("MouseIcon"):Connect(function()
 		if CW.State.settingCursor then return end
@@ -1589,12 +1592,6 @@ local function connectEnforcer()
 			CW.State.settingCursor = true
 			UserInputService.MouseIcon = expected
 			CW.State.settingCursor = false
-		end
-	end)
-
-	CW.State.enableConn = UserInputService:GetPropertyChangedSignal("MouseIconEnabled"):Connect(function()
-		if CW.State.cursorsReady and not UserInputService.MouseIconEnabled then
-			UserInputService.MouseIconEnabled = true
 		end
 	end)
 end
@@ -1742,7 +1739,13 @@ do
 			or (Target.Parent.Parent and Players:GetPlayerFromCharacter(Target.Parent.Parent))
 
 		if Player and Player ~= LocalPlayer then
-			setOSCursor(CW.isEnemy(Player) and "red" or "green")
+			if Player.Team == LocalPlayer.Team then
+				setOSCursor("green")
+			elseif CW.canDamage(Player) then
+				setOSCursor("red")
+			else
+				setOSCursor("white")
+			end
 		else
 			setOSCursor("white")
 		end
@@ -1939,41 +1942,35 @@ runModule("Texture", function()
 -- Texture.lua
 local CW = getgenv().__CW_CORE_STATE
 
-local ContentProvider = game:GetService("ContentProvider")
-local LocalPlayer     = CW.LocalPlayer
+local ContentProvider   = game:GetService("ContentProvider")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer       = CW.LocalPlayer
 
 CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER)
 
-local WEAPON_MESHES = _cfg.WEAPON_MESHES or {
-	["M9"]            = "Meshes/M9_3",
-	["M4A1"]          = "Meshes/m4_7",
-	["Remington 870"] = "Meshes/r870_2",
-	["Revolver"]      = "Meshes/revolver (3)",
-	["MP5"]           = "GunMesh",
-	["AK-47"]         = "Meshes/AK47_7",
-}
-
+-- The weapons that can be textured are the gun templates that have a MeshPart: in this game
+-- every regular gun has exactly one MeshPart, and that is the part that carries the texture.
+-- (M700, FAL and Taser are built from SpecialMesh pieces and are not supported yet.)
 local WEAPON_LIST = {}
-for weaponName in pairs(WEAPON_MESHES) do
-	table.insert(WEAPON_LIST, weaponName)
+local TEXTURABLE = {}
+do
+	local tools = ReplicatedStorage:FindFirstChild("Tools")
+	local guns = tools and tools:FindFirstChild("Guns")
+	for _, tool in ipairs(guns and guns:GetChildren() or {}) do
+		if tool:IsA("Tool") and tool:FindFirstChildWhichIsA("MeshPart", true) then
+			table.insert(WEAPON_LIST, tool.Name)
+		end
+	end
+	if #WEAPON_LIST == 0 then
+		WEAPON_LIST = { "AK-47", "M4A1", "M9", "MP5", "Remington 870", "Revolver" }
+	end
+	table.sort(WEAPON_LIST)
+	for _, name in ipairs(WEAPON_LIST) do TEXTURABLE[name] = true end
 end
-table.sort(WEAPON_LIST)
 
 CW.WeaponList = WEAPON_LIST
 CW.Assets.weaponTextures = {}
 CW.Settings.ASSET_SELECTIONS.Textures = CW.Settings.ASSET_SELECTIONS.Textures or {}
-
-local originals = CW.State.weaponTextureOriginals
-if not originals then
-	originals = {}
-	CW.State.weaponTextureOriginals = originals
-end
-
-local appliedIds = CW.State.appliedTextureIds
-if not appliedIds then
-	appliedIds = {}
-	CW.State.appliedTextureIds = appliedIds
-end
 
 for _, weaponName in ipairs(WEAPON_LIST) do
 	CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER .. "/" .. weaponName)
@@ -1983,124 +1980,57 @@ for _, weaponName in ipairs(WEAPON_LIST) do
 	CW.Library.ensureFolder(CW.Paths.WEAPON_SOUNDS_FOLDER .. "/" .. weaponName .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 end
 
+-- The original texture is kept on the mesh itself, as an attribute. It lives and dies with the
+-- instance (a new tool is a fresh clone with the original texture), and it survives a re-run of
+-- the script, so no separate bookkeeping is needed to restore it.
+local ORIGINAL_ATTRIBUTE = "CW_OriginalTexture"
 
-local function isTextureTarget(instance)
-	return instance:IsA("MeshPart") or instance:IsA("SpecialMesh")
-end
-
-local function findWeaponMesh(tool, meshPath)
-	-- Some game assets keep the slash in the Instance.Name; try that exact name first.
-	local exact = tool:FindFirstChild(meshPath, true)
-	if exact and isTextureTarget(exact) then return exact end
-
-	local current = tool
-	for segment in meshPath:gmatch("[^/]+") do
-		current = current and current:FindFirstChild(segment)
-		if not current then break end
-	end
-	if current and isTextureTarget(current) then return current end
-
-	local meshName = meshPath:match("([^/]+)$")
-	local fallback = meshName and tool:FindFirstChild(meshName, true)
-	if fallback and isTextureTarget(fallback) then return fallback end
-	return nil
-end
-
-local function getTextureId(target)
-	if target:IsA("MeshPart") then return target.TextureID end
-	return target.TextureId
-end
-
-local function setTextureId(target, textureId)
-	if target:IsA("MeshPart") then
-		target.TextureID = textureId
-	else
-		target.TextureId = textureId
-	end
-end
-
-local function forgetOriginal(mesh)
-	local entry = originals[mesh]
-	originals[mesh] = nil
-	if entry and entry.conn then
-		pcall(function() entry.conn:Disconnect() end)
-	end
-end
-
+-- Returns true when the weapon's mesh was found (and the texture applied or restored).
 local function applyTexture(tool)
-	if not tool:IsA("Tool") then return end
-	local meshName = WEAPON_MESHES[tool.Name]
-	if not meshName then return end
-
-	local mesh = findWeaponMesh(tool, meshName)
-	if not mesh then
-		CW.State.textureLookupWarnings = CW.State.textureLookupWarnings or {}
-		if not CW.State.textureLookupWarnings[tool.Name] then
-			CW.State.textureLookupWarnings[tool.Name] = true
-			CW.Warn("Texture target not found for " .. tool.Name .. " (mapped path: " .. meshName .. ")")
-		end
-		return
-	end
+	local mesh = tool:FindFirstChildWhichIsA("MeshPart", true)
+	if not mesh then return false end
 
 	local textureId = CW.Assets.weaponTextures[tool.Name]
-	local entry = originals[mesh]
-	local current = getTextureId(mesh) or ""
+	local original = mesh:GetAttribute(ORIGINAL_ATTRIBUTE)
 	if textureId then
-		if not entry then
-			entry = { value = not appliedIds[current] and current or nil }
-			entry.conn = mesh.Destroying:Connect(function() forgetOriginal(mesh) end)
-			originals[mesh] = entry
+		if original == nil then mesh:SetAttribute(ORIGINAL_ATTRIBUTE, mesh.TextureID) end
+		if mesh.TextureID ~= textureId then
+			local ok, err = pcall(function() mesh.TextureID = textureId end)
+			if not ok then CW.Warn("Could not apply texture to " .. tool.Name .. ": " .. tostring(err)) end
 		end
-		appliedIds[textureId] = true
-		local ok, err = pcall(setTextureId, mesh, textureId)
-		if not ok then CW.Warn("Could not apply texture to " .. tool.Name .. ": " .. tostring(err)) end
-		return
-	end
-
-	if not entry then
-		if appliedIds[current] then
-			CW.State.textureRestoreWarnings = CW.State.textureRestoreWarnings or {}
-			if not CW.State.textureRestoreWarnings[tool.Name] then
-				CW.State.textureRestoreWarnings[tool.Name] = true
-				CW.Warn("Original texture of " .. tool.Name .. " is unknown (it was customized before this run); respawn to restore it")
-			end
+	elseif original ~= nil then
+		local ok, err = pcall(function() mesh.TextureID = original end)
+		if ok then
+			mesh:SetAttribute(ORIGINAL_ATTRIBUTE, nil)
+		else
+			CW.Warn("Could not restore the original texture of " .. tool.Name .. ": " .. tostring(err))
 		end
-		return
 	end
-
-	if entry.value == nil or appliedIds[entry.value] then
-		CW.Warn("Original texture of " .. tool.Name .. " is unknown; respawn to restore it")
-		forgetOriginal(mesh)
-		return
-	end
-
-	local restored, err = pcall(setTextureId, mesh, entry.value)
-	if restored then
-		forgetOriginal(mesh)
-	else
-		CW.Warn("Could not restore original texture for " .. tool.Name .. ": " .. tostring(err))
-	end
+	return true
 end
-CW.applyWeaponTexture = applyTexture
 
 local function applyToContainer(container)
 	for _, child in ipairs(container:GetChildren()) do
-		applyTexture(child)
+		if child:IsA("Tool") and TEXTURABLE[child.Name] then applyTexture(child) end
 	end
 end
 
--- The ChildAdded connection is registered under `key` (replacing the previous one) and calls
--- CW.applyWeaponTexture at call time, so the latest run's code is the one that runs.
--- The texture is applied right away (no flicker of the original) and once more after a short
--- wait, in case the tool's parts were not fully there yet.
+-- Looked up through CW at call time, so the latest run's code is the one that runs.
+CW.applyWeaponTexture = function(tool)
+	if tool:IsA("Tool") and TEXTURABLE[tool.Name] then return applyTexture(tool) end
+	return true
+end
+
+-- A tool arrives with its parts, so one pass is enough; if the mesh is not there yet, it is
+-- retried once shortly after.
 local function monitor(container, key)
 	CW.track(key, container.ChildAdded:Connect(function(child)
 		local apply = CW.applyWeaponTexture
-		if not apply then return end
-		pcall(apply, child)
-		task.wait(0.1)
-		apply = CW.applyWeaponTexture
-		if apply then pcall(apply, child) end
+		if apply and not apply(child) then
+			task.wait(0.1)
+			apply = CW.applyWeaponTexture
+			if apply then apply(child) end
+		end
 	end))
 	applyToContainer(container)
 end
@@ -2135,9 +2065,9 @@ end
 CW.reloadTextures = reloadTexturesAndApply
 reloadTexturesAndApply()
 
--- Monitors are (re)created on every run, so a re-run replaces the old ones.
+-- Monitors are (re)created on every run, so a re-run replaces the old ones. The Backpack is
+-- recreated on every respawn, so the player is always watched for a new one.
 do
-	-- The Backpack is recreated on every respawn, so the player is always watched for a new one.
 	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
 	if backpack then monitor(backpack, "textureBackpack") end
 	CW.track("textureBackpackWait", LocalPlayer.ChildAdded:Connect(function(child)
@@ -2189,12 +2119,14 @@ for _, key in ipairs({
 	CW.Defaults[key] = CW.Settings[key]
 end
 
-local function isLocalPlayerShot()
+-- A tracer is yours when you are shooting AND it starts at your own muzzle. Checking only the
+-- attribute would also claim the tracers of other players that arrive while you shoot.
+local function isLocalPlayerShot(startPos)
 	local char = LocalPlayer.Character
-	if not char then return false end
-	local tool = char:FindFirstChildOfClass("Tool")
-	if not tool then return false end
-	return tool:GetAttribute("Local_IsShooting") == true
+	local tool = char and char:FindFirstChildOfClass("Tool")
+	if not tool or tool:GetAttribute("Local_IsShooting") ~= true then return false end
+	local muzzle = tool:FindFirstChild("Muzzle")
+	return muzzle ~= nil and (muzzle.Position - startPos).Magnitude < 2
 end
 
 -- Part pool: tracer parts are reused instead of created and destroyed for every bullet
@@ -2284,10 +2216,10 @@ local function createEnergyTracer(startPos, endPos)
 	end)
 end
 
-local function shouldUseCustom()
+local function shouldUseCustom(startPos)
 	if not CW.Settings.CUSTOM_BULLET_TRACERS then return false end
 	if CW.Settings.TRACER_APPLY_TO_OTHERS then return true end
-	return isLocalPlayerShot()
+	return isLocalPlayerShot(startPos)
 end
 
 local function warnTracerFailure(err)
@@ -2297,18 +2229,18 @@ local function warnTracerFailure(err)
 end
 
 -- The wrappers run on the game's own thread, so they must never throw into the game's gun
--- code: a failing custom tracer falls back to the original function, every argument is passed
--- through, and the original's result is returned unchanged.
+-- code: a failing custom tracer falls back to the game's own function. The game always calls
+-- the three tracer functions with exactly two arguments (start, end).
 local function makeTracerWrapper(originalKey)
-	return function(...)
-		local okUse, useCustom = pcall(shouldUseCustom)
+	return function(startPos, endPos)
+		local okUse, useCustom = pcall(shouldUseCustom, startPos)
 		if okUse and useCustom then
-			local okDraw, err = pcall(createEnergyTracer, ...)
+			local okDraw, err = pcall(createEnergyTracer, startPos, endPos)
 			if okDraw then return end
 			warnTracerFailure(err)
 		end
 		local original = CW[originalKey]
-		if original then return original(...) end
+		if original then return original(startPos, endPos) end
 	end
 end
 
@@ -2345,21 +2277,18 @@ local function installTracers()
 	return true
 end
 
-if not installTracers() and not CW.State.tracersRetrying then
-	CW.State.tracersRetrying = true
-	task.spawn(function()
-		local deadline = os.clock() + 60
-		while os.clock() < deadline do
-			task.wait(1)
-			if installTracers() then
-				CW.State.tracersRetrying = false
-				return
-			end
-		end
-		CW.State.tracersRetrying = false
+-- The module is shared with the game's own scripts, so it exists from the start; the waits only
+-- matter if the script runs very early.
+task.spawn(function()
+	local shared = ReplicatedStorage:WaitForChild("SharedModules", 30)
+	if not (shared and shared:WaitForChild("GunTracers", 30)) then
 		CW.Warn("GunTracers module not found — custom tracers disabled.")
-	end)
-end
+		return
+	end
+	if not installTracers() then
+		CW.Warn("Could not load the GunTracers module — custom tracers disabled.")
+	end
+end)
 end)
 
 
@@ -2381,7 +2310,7 @@ local RunService        = game:GetService("RunService")
 --   the real work (hit sound + hitmarker).
 
 local MAX_QUEUE   = 32   -- shots waiting for the next frame (oldest dropped beyond this)
-local MAX_BULLETS = 64   -- bullets copied per shot
+local MAX_BULLETS = 8    -- bullets copied per shot (the shotgun sends 5)
 local MAX_AGE     = 1    -- seconds; older queued shots are discarded instead of drawn late
 
 CW.State.shotQueue = CW.State.shotQueue or {}
@@ -2414,10 +2343,9 @@ function CW.processShot(hits)
 	for i = 1, #hits do
 		local hit = hits[i]
 		if typeof(hit) == "Instance" and hit:IsA("BasePart") and hit.Parent then
-			local character = hit.Parent
-			local player = Players:GetPlayerFromCharacter(character)
-				or (character.Parent and Players:GetPlayerFromCharacter(character.Parent))
-			if player and CW.isEnemy(player) then
+			local character = hit:FindFirstAncestorOfClass("Model") -- same lookup the game uses
+			local player = character and Players:GetPlayerFromCharacter(character)
+			if player and CW.canDamage(player) then
 				shotHit = true
 				break
 			end
@@ -2510,20 +2438,8 @@ end))
 
 -- The hook only forwards the call: it copies the hit parts into the queue and returns the
 -- game's own result untouched, so it can never break or delay the game's FireServer.
-local function installShootHook()
-	if CW.State.shootHooked then return true end
-
-	if not CW.Caps.hook then
-		if not CW.State.hookCapabilityWarned then
-			CW.State.hookCapabilityWarned = true
-			CW.Warn("hookmetamethod/getnamecallmethod unavailable; hitmarker and hit sound detection is disabled")
-		end
-		return true -- nothing to wait for
-	end
-
-	local remotes = ReplicatedStorage:FindFirstChild("GunRemotes")
-	local shootEvent = remotes and remotes:FindFirstChild("ShootEvent")
-	if not shootEvent then return false end
+local function installShootHook(shootEvent)
+	if CW.State.shootHooked then return end
 	CW.ShootEvent = shootEvent
 
 	local isExecutorCall = type(checkcaller) == "function" and checkcaller or function() return false end
@@ -2540,24 +2456,25 @@ local function installShootHook()
 
 	CW.State.shootHooked = true
 	CW.Log("ShootEvent hook installed")
-	return true
 end
 
-local installed, installResult = pcall(installShootHook)
-if not installed then
-	CW.Warn("Could not install the ShootEvent hook: " .. tostring(installResult))
-elseif not installResult and not CW.State.shootHookRetrying then
-	CW.State.shootHookRetrying = true
+if not CW.Caps.hook then
+	if not CW.State.hookCapabilityWarned then
+		CW.State.hookCapabilityWarned = true
+		CW.Warn("hookmetamethod/getnamecallmethod unavailable; hitmarker and hit sound detection is disabled")
+	end
+else
+	-- GunRemotes.ShootEvent exists from the start of the game; the waits only matter if the
+	-- script runs very early.
 	task.spawn(function()
-		local remotes = ReplicatedStorage:WaitForChild("GunRemotes", 60)
-		if remotes then remotes:WaitForChild("ShootEvent", 60) end
-		CW.State.shootHookRetrying = false
-		local ok, result = pcall(installShootHook)
-		if not ok then
-			CW.Warn("Could not install the ShootEvent hook: " .. tostring(result))
-		elseif not result then
+		local remotes = ReplicatedStorage:WaitForChild("GunRemotes", 30)
+		local shootEvent = remotes and remotes:WaitForChild("ShootEvent", 30)
+		if not shootEvent then
 			CW.Warn("GunRemotes.ShootEvent not found; hitmarker detection unavailable")
+			return
 		end
+		local ok, err = pcall(installShootHook, shootEvent)
+		if not ok then CW.Warn("Could not install the ShootEvent hook: " .. tostring(err)) end
 	end)
 end
 end)
@@ -2579,8 +2496,7 @@ function CW.cleanup()
 	pcall(function() CW.IAPortable:Destroy() end)
 	pcall(function() if CW.UIWindow then CW.UIWindow:Destroy() end end)
 	for _, key in ipairs({
-		"enforcerConn", "enableConn", "sprintCharacterConn", "chatToggleConn", "ammoGuiConn",
-		"ammoCharacterConn",
+		"enforcerConn", "enableConn", "sprintCharacterConn", "chatToggleConn",
 	}) do
 		pcall(function()
 			local connection = CW.State[key]
@@ -2588,7 +2504,6 @@ function CW.cleanup()
 		end)
 	end
 	pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
-	pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
 	pcall(function() if CW.State.stopWeaponShootSoundOverrides then CW.State.stopWeaponShootSoundOverrides() end end)
 	pcall(function() if CW.State.destroyHitSoundPool then CW.State.destroyHitSoundPool() end end)
 	pcall(function()
@@ -3549,11 +3464,9 @@ guarded("Utilities", function()
 		if inputState == Enum.UserInputState.Begin then
 			Window:ToggleVisibility()
 		end
-
-		if sprinting then
-			return Enum.ContextActionResult.Sink
-		end
-		return Enum.ContextActionResult.Pass
+		-- Always sunk: the game reads RightShift as sprint, and opening the menu must not make
+		-- the character run.
+		return Enum.ContextActionResult.Sink
 	end
 
 	ContextActionService:UnbindAction("CycleWareProtectSprint")
@@ -3621,92 +3534,15 @@ guarded("Utilities", function()
 		end,
 	})
 
-	-- Auto reload (off by default)
-	local PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-		or LocalPlayer:WaitForChild("PlayerGui", 5)
-	assert(PlayerGui, "PlayerGui did not become available within 5 seconds")
+	-- Auto reload (off by default).
+	-- It reads the equipped gun's own attributes instead of the ammo text on screen: the game keeps
+	-- Local_CurrentAmmo (the client's count) and Local_ReloadSession (0 when idle, a timestamp while
+	-- reloading) on the tool, and the sniper's text ("1 | 14") is not a plain "x/y" anyway.
 	local VirtualInputManager
 	pcall(function()
 		VirtualInputManager = game:GetService("VirtualInputManager")
 	end)
-
-	local AMMO_LABEL_PATH = "Home.hud.BottomRightFrame.GunFrame.BulletsLabel"
-	CW.Settings.AUTO_RELOAD_LABEL_PATH = AMMO_LABEL_PATH
-	if CW.Settings.AUTO_RELOAD_ENABLED == nil then
-		CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED == true
-	end
-
-	if CW.State.clearAmmoLabelWatchers then
-		CW.State.clearAmmoLabelWatchers(true)
-	end
-
-	local ammoLabelConnections = {}
-	local ammoLabelStates = setmetatable({}, { __mode = "k" })
 	local autoReloadWarned = false
-	local autoReloadLabelWarned = false
-	local ammoScanGeneration = 0
-	local rebuildAmmoLabelWatchers
-
-	local function clearAmmoLabelWatchers(resetStates)
-		for _, connection in pairs(ammoLabelConnections) do
-			connection:Disconnect()
-		end
-		table.clear(ammoLabelConnections)
-		if resetStates then
-			table.clear(ammoLabelStates)
-		end
-	end
-	CW.State.clearAmmoLabelWatchers = clearAmmoLabelWatchers
-
-	local function parseAmmoText(text)
-		local current, capacity = tostring(text):match("^%s*(%d+)%s*/%s*(%d+)%s*$")
-		return tonumber(current), tonumber(capacity)
-	end
-
-	local function isTextGui(instance)
-		return instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")
-	end
-
-	local function isNamedAmmoLabel(instance)
-		local name = instance.Name:lower()
-		return name:find("ammo", 1, true) ~= nil
-			or name:find("magazine", 1, true) ~= nil
-			or name:find("magcount", 1, true) ~= nil
-			or name:find("clipammo", 1, true) ~= nil
-			or name:find("bullet", 1, true) ~= nil
-	end
-
-	local function findConfiguredAmmoLabel()
-		local current = PlayerGui
-		for part in AMMO_LABEL_PATH:gmatch("[^%.]+") do
-			current = current and current:FindFirstChild(part)
-		end
-
-		if current and isTextGui(current) then return current end
-		return nil
-	end
-
-	local function findAmmoLabels()
-		local configured = findConfiguredAmmoLabel()
-		if configured then return { configured } end
-
-		local namedLabels = {}
-		local fractionLabels = {}
-		for _, instance in ipairs(PlayerGui:GetDescendants()) do
-			if isTextGui(instance) then
-				if isNamedAmmoLabel(instance) then
-					table.insert(namedLabels, instance)
-				elseif parseAmmoText(instance.Text) then
-					table.insert(fractionLabels, instance)
-				end
-			end
-		end
-
-		if #namedLabels == 1 then return namedLabels end
-		if #namedLabels > 1 then return {} end
-		if #fractionLabels == 1 then return fractionLabels end
-		return {}
-	end
 
 	local function pressReloadKey()
 		if VirtualInputManager then
@@ -3757,116 +3593,74 @@ guarded("Utilities", function()
 		return false
 	end
 
-	local function attemptReload(label)
-		if not CW.Settings.AUTO_RELOAD_ENABLED or UserInputService:GetFocusedTextBox() then return end
-		if UserInputService:IsKeyDown(Enum.KeyCode.R) then return end
-		local character = LocalPlayer.Character
-		if not character or not character:FindFirstChildOfClass("Tool") then return end
+	if CW.Settings.AUTO_RELOAD_ENABLED == nil then
+		CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED == true
+	end
 
-		local state = ammoLabelStates[label]
-		local now = os.clock()
-		if state and now - state.lastReload < 0.3 then return end
-		state = state or { lastReload = 0 }
-		state.lastReload = now
-		ammoLabelStates[label] = state
+	-- True when the gun is empty, not already reloading, and the game would accept a reload
+	-- (the sniper cannot reload without stored ammo).
+	local function needsReload(tool)
+		if not CW.Settings.AUTO_RELOAD_ENABLED then return false end
+		if tool:GetAttribute("Local_CurrentAmmo") ~= 0 then return false end
+		if tool:GetAttribute("Local_ReloadSession") ~= 0 then return false end
+		if tool:GetAttribute("Behavior") == "Sniper" and (tool:GetAttribute("StoredAmmo") or 0) <= 0 then return false end
+		return true
+	end
 
+	local reloading = setmetatable({}, { __mode = "k" })
+	local function autoReload(tool)
+		if reloading[tool] then return end
+		reloading[tool] = true
 		task.spawn(function()
-			if not pressReloadKey() then return end
-			task.wait(0.15)
-			if not CW.Settings.AUTO_RELOAD_ENABLED or not label.Parent then return end
-			if UserInputService:GetFocusedTextBox() then return end
-			local current = parseAmmoText(label.Text)
-			if current == 0 then
+			-- At most two presses; the second only if the first did not start a reload.
+			for _ = 1, 2 do
+				if not needsReload(tool) or tool.Parent ~= LocalPlayer.Character then break end
+				if UserInputService:GetFocusedTextBox() or UserInputService:IsKeyDown(Enum.KeyCode.R) then break end
 				pressReloadKey()
+				task.wait(0.15)
+				if tool:GetAttribute("Local_ReloadSession") ~= 0 then break end
 			end
+			reloading[tool] = nil
 		end)
 	end
 
-	local function onAmmoLabelChanged(label)
-		if not CW.Settings.AUTO_RELOAD_ENABLED then return end
-		local current, capacity = parseAmmoText(label.Text)
-		if current == nil or capacity == nil then return end
+	local function watchTool(tool)
+		if not tool:IsA("Tool") or tool:GetAttribute("ToolType") ~= "Gun" then return end
+		CW.track("autoReloadTool", tool:GetAttributeChangedSignal("Local_CurrentAmmo"):Connect(function()
+			if needsReload(tool) then autoReload(tool) end
+		end))
+		if needsReload(tool) then autoReload(tool) end
+	end
 
-		local state = ammoLabelStates[label]
-		if not state or state.capacity ~= capacity then
-			state = { capacity = capacity, lastReload = 0 }
-			ammoLabelStates[label] = state
-		end
+	local function watchCharacter(character)
+		CW.track("autoReloadAdded", character.ChildAdded:Connect(watchTool))
+		CW.track("autoReloadRemoved", character.ChildRemoved:Connect(function(child)
+			if child:IsA("Tool") then CW.untrack("autoReloadTool") end
+		end))
+		for _, child in ipairs(character:GetChildren()) do watchTool(child) end
+	end
 
-		if current == 0 then
-			attemptReload(label)
+	local function setAutoReload(enabled)
+		if enabled then
+			CW.track("autoReloadCharacter", LocalPlayer.CharacterAdded:Connect(watchCharacter))
+			if LocalPlayer.Character then watchCharacter(LocalPlayer.Character) end
 		else
-			state.lastReload = 0
-		end
-	end
-
-	rebuildAmmoLabelWatchers = function()
-		clearAmmoLabelWatchers()
-		ammoScanGeneration = ammoScanGeneration + 1
-		local generation = ammoScanGeneration
-		if not CW.Settings.AUTO_RELOAD_ENABLED then return end
-
-		task.spawn(function()
-			for _ = 1, 20 do
-				if generation ~= ammoScanGeneration or not CW.Settings.AUTO_RELOAD_ENABLED then return end
-
-				local labels = findAmmoLabels()
-				if #labels > 0 then
-					autoReloadLabelWarned = false
-					for _, label in ipairs(labels) do
-						ammoLabelConnections[label] = label:GetPropertyChangedSignal("Text"):Connect(function()
-							onAmmoLabelChanged(label)
-						end)
-						onAmmoLabelChanged(label)
-					end
-					return
-				end
-
-				task.wait(0.5)
+			for _, key in ipairs({ "autoReloadCharacter", "autoReloadAdded", "autoReloadRemoved", "autoReloadTool" }) do
+				CW.untrack(key)
 			end
-
-			if generation == ammoScanGeneration and not autoReloadLabelWarned then
-				autoReloadLabelWarned = true
-				CW.Warn("Auto Reload could not find the ammo label at PlayerGui." .. AMMO_LABEL_PATH)
-			end
-		end)
-	end
-
-	if CW.State.ammoGuiConn then
-		CW.State.ammoGuiConn:Disconnect()
-	end
-	CW.State.ammoGuiConn = PlayerGui.DescendantAdded:Connect(function(instance)
-		if not CW.Settings.AUTO_RELOAD_ENABLED or not isTextGui(instance) then return end
-		-- Already watching a live label: nothing to rebuild (checked before any string work).
-		for label in pairs(ammoLabelConnections) do
-			if label.Parent then return end
 		end
-		if not (isNamedAmmoLabel(instance) or parseAmmoText(instance.Text)) then return end
-		task.defer(rebuildAmmoLabelWatchers)
-	end)
-
-	if CW.State.ammoCharacterConn then
-		CW.State.ammoCharacterConn:Disconnect()
 	end
-	CW.State.ammoCharacterConn = LocalPlayer.CharacterAdded:Connect(function()
-		task.wait(1)
-		if CW.Settings.AUTO_RELOAD_ENABLED then
-			rebuildAmmoLabelWatchers()
-		end
-	end)
 
 	UtilityTab:Toggle({
 		Title = "Auto Reload at 0 Ammo",
 		Default = CW.Settings.AUTO_RELOAD_ENABLED == true,
 		Callback = function(enabled)
 			CW.Settings.AUTO_RELOAD_ENABLED = enabled == true
-			rebuildAmmoLabelWatchers()
+			setAutoReload(CW.Settings.AUTO_RELOAD_ENABLED)
 		end,
 	})
 
-	if CW.Settings.AUTO_RELOAD_ENABLED and ammoScanGeneration == 0 then
-		rebuildAmmoLabelWatchers()
-	end
+	setAutoReload(CW.Settings.AUTO_RELOAD_ENABLED == true)
 end)
 
 ------------------------------------------------------------------------------
