@@ -1,5 +1,11 @@
 -- CycleWare (phase-5). Standalone entry point; module bodies below are kept in isolated scopes.
 
+--=============================================================================
+-- Preflight
+--   Executor functions this script depends on. Whatever is missing is replaced by a safe
+--   stand-in, so a single missing function disables one feature instead of aborting the
+--   whole script. What was found is stored in CW.Caps and reported once at startup.
+--=============================================================================
 local SCRIPT_VERSION = "phase-5"
 
 local CAPS = {
