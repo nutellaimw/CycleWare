@@ -160,26 +160,12 @@ function CW.untrackAll()
 end
 
 --// Teams ----------------------------------------------------------------------------
--- The same rule the game applies before a shot can hurt someone (GunController.canBeDamaged):
--- another team, no ForceField, a living humanoid, and a Guard can only hurt an Inmate whose
--- character has the attribute "Hostile". Used for the hitmarker and the red cursor, so neither
--- shows for a target that cannot take damage.
-local TeamsService = game:GetService("Teams")
-
-function CW.canDamage(player)
-	if not player or player == LocalPlayer then return false end
-	local myTeam, theirTeam = LocalPlayer.Team, player.Team
-	if theirTeam == myTeam then return false end
-	local character = player.Character
-	if not character then return false end
-	local guards = TeamsService:FindFirstChild("Guards")
-	local inmates = TeamsService:FindFirstChild("Inmates")
-	if guards and inmates and myTeam == guards and theirTeam == inmates and not character:GetAttribute("Hostile") then
-		return false
-	end
-	if character:FindFirstChildOfClass("ForceField") then return false end
-	local humanoid = character:FindFirstChild("Humanoid")
-	return humanoid ~= nil and humanoid.Health > 0
+-- The original rule: anyone on a different team than you is an enemy, whether or not a shot could
+-- actually hurt them (a ForceField, or a Guard against a calm Inmate, still counts). The hit sound,
+-- the hitmarker and the red cursor use it; the same team gets the green cursor. The team color is
+-- read straight from the player, so no cache or signal is needed.
+function CW.isEnemy(player)
+	return player ~= nil and player ~= LocalPlayer and player.TeamColor ~= LocalPlayer.TeamColor
 end
 
 --// HTTP -----------------------------------------------------------------------------
@@ -1591,7 +1577,7 @@ local function connectEnforcer()
 	end
 
 	CW.State.enforcerConn = UserInputService:GetPropertyChangedSignal("MouseIcon"):Connect(function()
-		if CW.State.settingCursor then return end
+		if CW.State.settingCursor or CW.State.scoped then return end
 		if not CW.State.cursorsReady or not CW.State.currentCursorKey then return end
 		local expected = CW.Assets[CW.State.currentCursorKey]
 		if expected and UserInputService.MouseIcon ~= expected then
@@ -1726,6 +1712,44 @@ end
 CW.reloadCursor = generateCursors
 task.spawn(generateCursors)
 
+-- Sniper scope. While the game's scope frame is open, the game hides the cursor on purpose.
+-- The custom cursor stays hidden for exactly that time (nothing is drawn over the scope and the
+-- game's own crosshair does not come back), and it is restored as soon as the scope closes.
+local function restoreCursorIcon()
+	local url = CW.State.cursorsReady and CW.Assets[CW.State.currentCursorKey or "white"]
+	if url then
+		CW.State.settingCursor = true
+		UserInputService.MouseIcon = url
+		CW.State.settingCursor = false
+	end
+end
+
+local function watchScope()
+	local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 30)
+	local crosshairGui = playerGui and playerGui:WaitForChild("CrosshairGui", 30)
+	local scopeFrame = crosshairGui and crosshairGui:WaitForChild("ScopeFrame", 30)
+	if not scopeFrame then return end
+
+	local function update()
+		if scopeFrame.Visible then
+			CW.State.scoped = true
+			UserInputService.MouseIconEnabled = false
+			-- Per frame, and only while scoped: whatever turns the icon back on is undone.
+			CW.track("scopeHide", RunService.PreRender:Connect(function()
+				if UserInputService.MouseIconEnabled then UserInputService.MouseIconEnabled = false end
+			end))
+		else
+			CW.State.scoped = false
+			CW.untrack("scopeHide")
+			UserInputService.MouseIconEnabled = true
+			restoreCursorIcon()
+		end
+	end
+	CW.track("scopeWatch", scopeFrame:GetPropertyChangedSignal("Visible"):Connect(update))
+	update()
+end
+task.spawn(watchScope)
+
 -- Registered with CW.track: a re-run replaces the loop with this version's code.
 do
 	-- Mouse.Target is a raycast, so it is sampled 25 times per second instead of every frame.
@@ -1745,13 +1769,7 @@ do
 			or (Target.Parent.Parent and Players:GetPlayerFromCharacter(Target.Parent.Parent))
 
 		if Player and Player ~= LocalPlayer then
-			if Player.Team == LocalPlayer.Team then
-				setOSCursor("green")
-			elseif CW.canDamage(Player) then
-				setOSCursor("red")
-			else
-				setOSCursor("white")
-			end
+			setOSCursor(Player.TeamColor == LocalPlayer.TeamColor and "green" or "red")
 		else
 			setOSCursor("white")
 		end
@@ -1954,9 +1972,31 @@ local LocalPlayer       = CW.LocalPlayer
 
 CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER)
 
--- The weapons that can be textured are the gun templates that have a MeshPart: in this game
--- every regular gun has exactly one MeshPart, and that is the part that carries the texture.
--- (M700, FAL and Taser are built from SpecialMesh pieces and are not supported yet.)
+-- Two kinds of weapons can be textured:
+--  * Regular guns have exactly one MeshPart, and that part carries the texture.
+--  * FAL and M700 have no MeshPart: they are built from many block pieces. For them a custom
+--    MeshPart (the whole gun as one model with proper UVs) is built and welded to the Handle, and
+--    the original pieces are hidden while a texture is selected. Deselecting the texture removes
+--    the custom mesh and shows the original pieces again.
+local CUSTOM_MESH_WEAPONS = {
+	["FAL"] = {
+		meshId   = "rbxassetid://90772329772088",
+		meshName = "FAL/Meshes",
+		hide     = { ["Smooth Block Model"] = true, ["Black"] = true },
+		offset   = Vector3.new(0.05, 0.2, -0.55),
+		rotation = Vector3.new(0, 90, 0),
+		size     = Vector3.new(0.4, 0.4, 0.4),
+	},
+	["M700"] = {
+		meshId   = "rbxassetid://109235772617313",
+		meshName = "M700/Meshes",
+		hide     = { ["Smooth Block Model"] = true },
+		offset   = Vector3.new(0, 0.43, -0.8),
+		rotation = Vector3.new(0, 90, 0),
+		size     = Vector3.new(1, 1, 1),
+	},
+}
+
 local WEAPON_LIST = {}
 local TEXTURABLE = {}
 do
@@ -1964,14 +2004,15 @@ do
 	local guns = tools and tools:FindFirstChild("Guns")
 	for _, tool in ipairs(guns and guns:GetChildren() or {}) do
 		if tool:IsA("Tool") and tool:FindFirstChildWhichIsA("MeshPart", true) then
-			table.insert(WEAPON_LIST, tool.Name)
+			TEXTURABLE[tool.Name] = true
 		end
 	end
-	if #WEAPON_LIST == 0 then
-		WEAPON_LIST = { "AK-47", "M4A1", "M9", "MP5", "Remington 870", "Revolver" }
+	if next(TEXTURABLE) == nil then
+		for _, name in ipairs({ "AK-47", "M4A1", "M9", "MP5", "Remington 870", "Revolver" }) do TEXTURABLE[name] = true end
 	end
+	for name in pairs(CUSTOM_MESH_WEAPONS) do TEXTURABLE[name] = true end
+	for name in pairs(TEXTURABLE) do table.insert(WEAPON_LIST, name) end
 	table.sort(WEAPON_LIST)
-	for _, name in ipairs(WEAPON_LIST) do TEXTURABLE[name] = true end
 end
 
 CW.WeaponList = WEAPON_LIST
@@ -1986,20 +2027,21 @@ for _, weaponName in ipairs(WEAPON_LIST) do
 	CW.Library.ensureFolder(CW.Paths.WEAPON_SOUNDS_FOLDER .. "/" .. weaponName .. "/" .. CW.Paths.OFFICIAL_FOLDER)
 end
 
--- The original texture is kept on the mesh itself, as an attribute. It lives and dies with the
--- instance (a new tool is a fresh clone with the original texture), and it survives a re-run of
--- the script, so no separate bookkeeping is needed to restore it.
-local ORIGINAL_ATTRIBUTE = "CW_OriginalTexture"
+-- What was changed is remembered on the instances themselves, as attributes. They live and die
+-- with the instance (a new tool is a fresh clone) and survive a re-run of the script, so no
+-- separate bookkeeping is needed to restore anything.
+local ORIGINAL_TEXTURE = "CW_OriginalTexture"        -- on a regular gun's MeshPart
+local ORIGINAL_TRANSPARENCY = "CW_OriginalTransparency" -- on the pieces hidden for a custom mesh
 
 -- Returns true when the weapon's mesh was found (and the texture applied or restored).
-local function applyTexture(tool)
+local function applyRegularTexture(tool)
 	local mesh = tool:FindFirstChildWhichIsA("MeshPart", true)
 	if not mesh then return false end
 
 	local textureId = CW.Assets.weaponTextures[tool.Name]
-	local original = mesh:GetAttribute(ORIGINAL_ATTRIBUTE)
+	local original = mesh:GetAttribute(ORIGINAL_TEXTURE)
 	if textureId then
-		if original == nil then mesh:SetAttribute(ORIGINAL_ATTRIBUTE, mesh.TextureID) end
+		if original == nil then mesh:SetAttribute(ORIGINAL_TEXTURE, mesh.TextureID) end
 		if mesh.TextureID ~= textureId then
 			local ok, err = pcall(function() mesh.TextureID = textureId end)
 			if not ok then CW.Warn("Could not apply texture to " .. tool.Name .. ": " .. tostring(err)) end
@@ -2007,12 +2049,93 @@ local function applyTexture(tool)
 	elseif original ~= nil then
 		local ok, err = pcall(function() mesh.TextureID = original end)
 		if ok then
-			mesh:SetAttribute(ORIGINAL_ATTRIBUTE, nil)
+			mesh:SetAttribute(ORIGINAL_TEXTURE, nil)
 		else
 			CW.Warn("Could not restore the original texture of " .. tool.Name .. ": " .. tostring(err))
 		end
 	end
 	return true
+end
+
+local function buildCustomMesh(tool, cfg)
+	local handle = tool:FindFirstChild("Handle")
+	if not handle then return nil end
+
+	local mesh = Instance.new("MeshPart")
+	mesh.Name       = cfg.meshName
+	mesh.MeshId     = cfg.meshId
+	mesh.Material   = Enum.Material.SmoothPlastic
+	mesh.Size       = cfg.size
+	mesh.Anchored   = false
+	mesh.CanCollide = false
+	mesh.CanQuery   = false
+	mesh.CanTouch   = false
+	mesh.Massless   = true
+	mesh.CFrame = handle.CFrame
+		* CFrame.new(cfg.offset)
+		* CFrame.Angles(math.rad(cfg.rotation.X), math.rad(cfg.rotation.Y), math.rad(cfg.rotation.Z))
+	mesh.Parent = tool
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0  = handle
+	weld.Part1  = mesh
+	weld.Parent = mesh
+	CW.Log("Custom mesh built for " .. tool.Name)
+	return mesh
+end
+
+-- Every BasePart of a piece (the piece itself and, for a Model, everything inside it).
+local function forEachPart(piece, callback)
+	if piece:IsA("BasePart") then callback(piece) end
+	for _, descendant in ipairs(piece:GetDescendants()) do
+		if descendant:IsA("BasePart") then callback(descendant) end
+	end
+end
+
+local function hideOriginalPieces(tool, cfg, custom)
+	for _, piece in ipairs(tool:GetChildren()) do
+		if piece ~= custom and cfg.hide[piece.Name] then
+			forEachPart(piece, function(part)
+				if part:GetAttribute(ORIGINAL_TRANSPARENCY) == nil then
+					part:SetAttribute(ORIGINAL_TRANSPARENCY, part.Transparency)
+				end
+				if part.Transparency ~= 1 then part.Transparency = 1 end
+			end)
+		end
+	end
+end
+
+local function showOriginalPieces(tool)
+	for _, descendant in ipairs(tool:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			local original = descendant:GetAttribute(ORIGINAL_TRANSPARENCY)
+			if original ~= nil then
+				descendant.Transparency = original
+				descendant:SetAttribute(ORIGINAL_TRANSPARENCY, nil)
+			end
+		end
+	end
+end
+
+local function applyCustomTexture(tool, cfg)
+	local textureId = CW.Assets.weaponTextures[tool.Name]
+	local custom = tool:FindFirstChild(cfg.meshName)
+	if textureId then
+		if not custom then custom = buildCustomMesh(tool, cfg) end
+		if not custom then return false end -- no Handle yet
+		hideOriginalPieces(tool, cfg, custom)
+		if custom.TextureID ~= textureId then custom.TextureID = textureId end
+	else
+		if custom then custom:Destroy() end
+		showOriginalPieces(tool)
+	end
+	return true
+end
+
+local function applyTexture(tool)
+	local cfg = CUSTOM_MESH_WEAPONS[tool.Name]
+	if cfg then return applyCustomTexture(tool, cfg) end
+	return applyRegularTexture(tool)
 end
 
 local function applyToContainer(container)
@@ -2027,8 +2150,8 @@ CW.applyWeaponTexture = function(tool)
 	return true
 end
 
--- A tool arrives with its parts, so one pass is enough; if the mesh is not there yet, it is
--- retried once shortly after.
+-- A tool arrives with its parts, so one pass is enough; if the mesh (or the Handle) is not there
+-- yet, it is retried once shortly after.
 local function monitor(container, key)
 	CW.track(key, container.ChildAdded:Connect(function(child)
 		local apply = CW.applyWeaponTexture
@@ -2222,6 +2345,32 @@ local function createEnergyTracer(startPos, endPos)
 	end)
 end
 
+-- The taser and sniper tracers keep the game's own width, fade and lifetime (0.8 s and 2.8 s):
+-- only their color changes. The game's functions create one part named "RayPart" and parent it
+-- to the camera, so the new tracer is the RayPart that was not there before the call.
+local function snapshotRayParts()
+	local seen = {}
+	local camera = Workspace.CurrentCamera
+	if camera then
+		for _, child in ipairs(camera:GetChildren()) do
+			if child.Name == "RayPart" then seen[child] = true end
+		end
+	end
+	return seen
+end
+
+local function recolorNewRayParts(before)
+	local camera = Workspace.CurrentCamera
+	if not camera then return end
+	for _, child in ipairs(camera:GetChildren()) do
+		if child.Name == "RayPart" and not before[child] then
+			child.Color = CW.Settings.TRACER_COLOR
+			local light = child:FindFirstChildOfClass("SurfaceLight") -- the taser has one
+			if light then light.Color = CW.Settings.TRACER_COLOR end
+		end
+	end
+end
+
 local function shouldUseCustom(startPos)
 	if not CW.Settings.CUSTOM_BULLET_TRACERS then return false end
 	if CW.Settings.TRACER_APPLY_TO_OTHERS then return true end
@@ -2250,6 +2399,24 @@ local function makeTracerWrapper(originalKey)
 	end
 end
 
+-- Taser and sniper: always the game's own tracer, recolored afterwards when custom tracers apply.
+local function makeRecolorWrapper(originalKey)
+	return function(startPos, endPos)
+		local okUse, useCustom = pcall(shouldUseCustom, startPos)
+		local before
+		if okUse and useCustom then
+			local okSnapshot, snapshot = pcall(snapshotRayParts)
+			if okSnapshot then before = snapshot end
+		end
+		local original = CW[originalKey]
+		if original then original(startPos, endPos) end
+		if before then
+			local ok, err = pcall(recolorNewRayParts, before)
+			if not ok then warnTracerFailure(err) end
+		end
+	end
+end
+
 -- Installs the wrappers; returns false (so we can retry) if the game module isn't ready yet.
 -- The game's own functions are captured once and kept in CW, so installing again on a re-run
 -- replaces our wrappers with the new ones instead of stacking them.
@@ -2273,10 +2440,10 @@ local function installTracers()
 		TracersModule.createBullet = makeTracerWrapper("_originalCreateBullet")
 	end
 	if type(CW._originalCreateTaser) == "function" then
-		TracersModule.createTaser = makeTracerWrapper("_originalCreateTaser")
+		TracersModule.createTaser = makeRecolorWrapper("_originalCreateTaser")
 	end
 	if type(CW._originalCreateSniper) == "function" then
-		TracersModule.createSniper = makeTracerWrapper("_originalCreateSniper")
+		TracersModule.createSniper = makeRecolorWrapper("_originalCreateSniper")
 	end
 
 	CW.Log("Tracer override installed.")
@@ -2351,7 +2518,7 @@ function CW.processShot(hits)
 		if typeof(hit) == "Instance" and hit:IsA("BasePart") and hit.Parent then
 			local character = hit:FindFirstAncestorOfClass("Model") -- same lookup the game uses
 			local player = character and Players:GetPlayerFromCharacter(character)
-			if player and CW.canDamage(player) then
+			if player and CW.isEnemy(player) then
 				shotHit = true
 				break
 			end
