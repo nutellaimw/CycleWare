@@ -125,10 +125,22 @@
           "path": "Textures/AK-47/texture.png"
         }
       ],
+      "FAL": [
+        {
+          "crc32": "b0748450",
+          "path": "Textures/FAL/texture.png"
+        }
+      ],
       "M4A1": [
         {
           "crc32": "b0748450",
           "path": "Textures/M4A1/texture.png"
+        }
+      ],
+      "M700": [
+        {
+          "crc32": "b0748450",
+          "path": "Textures/M700/texture.png"
         }
       ],
       "M9": [
@@ -203,6 +215,6 @@
       ]
     }
   },
-  "revision": "f83fc52b93c2",
+  "revision": "2b9329e58030",
   "schemaVersion": 1
 }
