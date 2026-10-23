@@ -106,10 +106,6 @@
         "path": "Hitmarkers/default.png"
       },
       {
-        "crc32": "adcc7ec9",
-        "path": "Hitmarkers/hitmarker2.png"
-      },
-      {
         "crc32": "7c6d4d4a",
         "path": "Hitmarkers/purplehitmarker.png"
       },
@@ -215,6 +211,6 @@
       ]
     }
   },
-  "revision": "2b9329e58030",
+  "revision": "7eddbf0c98cf",
   "schemaVersion": 1
 }
