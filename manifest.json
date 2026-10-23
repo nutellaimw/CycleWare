@@ -104,10 +104,6 @@
       {
         "crc32": "d1d435a4",
         "path": "Hitmarkers/default.png"
-      },
-      {
-        "crc32": "a3a36d15",
-        "path": "Hitmarkers/redhitmarker.png"
       }
     ],
     "Textures": {
@@ -207,6 +203,6 @@
       ]
     }
   },
-  "revision": "9e44f9816634",
+  "revision": "494e3af849ff",
   "schemaVersion": 1
 }
