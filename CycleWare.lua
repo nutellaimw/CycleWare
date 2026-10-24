@@ -100,6 +100,7 @@ if not CW then
 			settingCursor    = false,
 			lastTarget       = nil,
 			enforcerConn     = nil,
+			enableConn       = nil,
 			mouseX           = 0,
 			mouseY           = 0,
 		},
@@ -107,6 +108,7 @@ if not CW then
 	getgenv().__CW_CORE_STATE = CW
 end
 
+CW.IsFirstRun  = isFirstRun
 CW.LocalPlayer = LocalPlayer
 CW.Mouse       = Mouse
 
@@ -1121,9 +1123,9 @@ local function syncImpl()
 	-- Persist a valid manifest revision even when a few entries fail. Good files stay cached,
 	-- while missing/invalid paths are retried because their files fail validation.
 	pcall(writefile, CW.Paths.LIBRARY_REVISION_FILE, revision)
-	-- Official files that are not in the manifest (for example a cursor removed from the repository)
-	-- are deleted from the _Official folders, even if another download failed. User files outside
-	-- _Official are never touched.
+	-- Official files that are no longer in the manifest (for example a cursor removed from the
+	-- repository) are deleted from the _Official folders. This no longer depends on every other
+	-- download having succeeded; user files outside _Official are never touched.
 	if #pending > 0 then
 		if entriesTrusted then
 			pruneOfficial(expected)
@@ -1529,10 +1531,6 @@ local Mouse       = CW.Mouse
 
 local sformat = string.format
 
--- The only icon the game sets itself: on equip, and every frame while the sniper is equipped.
--- (On unequip it sets the empty icon.) Only these values are overridden, nothing else.
-local GAME_CROSSHAIR = "rbxassetid://98794608762931"
-
 local TINT_VARIANTS = {
 	{key="red",   tR=255, tG=56,  tB=56},
 	{key="green", tR=56,  tG=255, tB=56},
@@ -1571,13 +1569,18 @@ end
 
 local function connectEnforcer()
 	if CW.State.enforcerConn then CW.State.enforcerConn:Disconnect() end
+	-- Stored by the previous version, which forced MouseIconEnabled back on. That fought the
+	-- game's sniper scope (it hides the cursor on purpose), so it is no longer done.
+	if CW.State.enableConn then
+		pcall(function() CW.State.enableConn:Disconnect() end)
+		CW.State.enableConn = nil
+	end
 
 	CW.State.enforcerConn = UserInputService:GetPropertyChangedSignal("MouseIcon"):Connect(function()
 		if CW.State.settingCursor or CW.State.scoped then return end
 		if not CW.State.cursorsReady or not CW.State.currentCursorKey then return end
 		local expected = CW.Assets[CW.State.currentCursorKey]
-		local current = UserInputService.MouseIcon
-		if expected and current ~= expected and (current == GAME_CROSSHAIR or current == "") then
+		if expected and UserInputService.MouseIcon ~= expected then
 			CW.State.settingCursor = true
 			UserInputService.MouseIcon = expected
 			CW.State.settingCursor = false
@@ -1619,7 +1622,7 @@ local function reloadCursorFromSource(sigHash, data)
 	CW.Log(sformat("Loaded new cursor.png (%d×%d)", w, h))
 
 	-- The longest side becomes the target size and the other side follows the image's aspect
-	-- ratio, so non-square cursors are not stretched.
+	-- ratio, so non-square cursors are no longer stretched.
 	local targetSize = CW.Settings.CURSOR_TARGET_SIZE
 	if targetSize then
 		local scale = targetSize / math.max(w, h)
@@ -1648,7 +1651,7 @@ local function generateCursorsOnce()
 		CW.Assets.white, CW.Assets.red, CW.Assets.green = nil, nil, nil
 		CW.State.cursorsReady = false
 		CW.State.currentCursorKey = nil
-		for _, key in ipairs({ "enforcerConn" }) do
+		for _, key in ipairs({ "enforcerConn", "enableConn" }) do
 			local connection = CW.State[key]
 			if connection then
 				pcall(function() connection:Disconnect() end)
@@ -2236,15 +2239,11 @@ CW.Settings.TRACER_WIDTH           = numOr(cfgValue("TRACER_WIDTH", "tracerWidth
 CW.Settings.TRACER_LIFETIME        = numOr(cfgValue("TRACER_LIFETIME", "tracerLifetime"), 0.05, 0.01)
 CW.Settings.TRACER_APPLY_TO_OTHERS = boolOr(cfgValue("TRACER_APPLY_TO_OTHERS", "applyToOthers"), false)
 CW.Settings.TRACER_POINT_LIGHT     = boolOr(cfgValue("TRACER_POINT_LIGHT", "pointLight"), false)
--- Taser and sniper tracers keep the game's width and timing; only their color is set here.
-CW.Settings.TRACER_TASER_COLOR     = cfgValue("TRACER_TASER_COLOR", "taserColor") or Color3.fromRGB(170, 0, 255)
-CW.Settings.TRACER_SNIPER_COLOR    = cfgValue("TRACER_SNIPER_COLOR", "sniperColor") or Color3.fromRGB(170, 0, 255)
 
 CW.Defaults = CW.Defaults or {}
 for _, key in ipairs({
 	"CUSTOM_BULLET_TRACERS", "TRACER_COLOR", "TRACER_GLOW_COLOR",
 	"TRACER_WIDTH", "TRACER_LIFETIME", "TRACER_APPLY_TO_OTHERS", "TRACER_POINT_LIGHT",
-	"TRACER_TASER_COLOR", "TRACER_SNIPER_COLOR",
 }) do
 	CW.Defaults[key] = CW.Settings[key]
 end
@@ -2360,14 +2359,14 @@ local function snapshotRayParts()
 	return seen
 end
 
-local function recolorNewRayParts(before, color)
+local function recolorNewRayParts(before)
 	local camera = Workspace.CurrentCamera
 	if not camera then return end
 	for _, child in ipairs(camera:GetChildren()) do
 		if child.Name == "RayPart" and not before[child] then
-			child.Color = color
+			child.Color = CW.Settings.TRACER_COLOR
 			local light = child:FindFirstChildOfClass("SurfaceLight") -- the taser has one
-			if light then light.Color = color end
+			if light then light.Color = CW.Settings.TRACER_COLOR end
 		end
 	end
 end
@@ -2401,7 +2400,7 @@ local function makeTracerWrapper(originalKey)
 end
 
 -- Taser and sniper: always the game's own tracer, recolored afterwards when custom tracers apply.
-local function makeRecolorWrapper(originalKey, colorKey)
+local function makeRecolorWrapper(originalKey)
 	return function(startPos, endPos)
 		local okUse, useCustom = pcall(shouldUseCustom, startPos)
 		local before
@@ -2412,7 +2411,7 @@ local function makeRecolorWrapper(originalKey, colorKey)
 		local original = CW[originalKey]
 		if original then original(startPos, endPos) end
 		if before then
-			local ok, err = pcall(recolorNewRayParts, before, CW.Settings[colorKey])
+			local ok, err = pcall(recolorNewRayParts, before)
 			if not ok then warnTracerFailure(err) end
 		end
 	end
@@ -2441,10 +2440,10 @@ local function installTracers()
 		TracersModule.createBullet = makeTracerWrapper("_originalCreateBullet")
 	end
 	if type(CW._originalCreateTaser) == "function" then
-		TracersModule.createTaser = makeRecolorWrapper("_originalCreateTaser", "TRACER_TASER_COLOR")
+		TracersModule.createTaser = makeRecolorWrapper("_originalCreateTaser")
 	end
 	if type(CW._originalCreateSniper) == "function" then
-		TracersModule.createSniper = makeRecolorWrapper("_originalCreateSniper", "TRACER_SNIPER_COLOR")
+		TracersModule.createSniper = makeRecolorWrapper("_originalCreateSniper")
 	end
 
 	CW.Log("Tracer override installed.")
@@ -2670,7 +2669,7 @@ function CW.cleanup()
 	pcall(function() CW.IAPortable:Destroy() end)
 	pcall(function() if CW.UIWindow then CW.UIWindow:Destroy() end end)
 	for _, key in ipairs({
-		"enforcerConn", "sprintCharacterConn", "chatToggleConn", "ammoGuiConn", "ammoCharacterConn",
+		"enforcerConn", "enableConn", "sprintCharacterConn", "chatToggleConn",
 	}) do
 		pcall(function()
 			local connection = CW.State[key]
@@ -2678,7 +2677,6 @@ function CW.cleanup()
 		end)
 	end
 	pcall(function() CW.Settings.AUTO_RELOAD_ENABLED = false end)
-	pcall(function() if CW.State.clearAmmoLabelWatchers then CW.State.clearAmmoLabelWatchers() end end)
 	pcall(function() if CW.State.stopWeaponShootSoundOverrides then CW.State.stopWeaponShootSoundOverrides() end end)
 	pcall(function() if CW.State.destroyHitSoundPool then CW.State.destroyHitSoundPool() end end)
 	pcall(function()
@@ -2841,13 +2839,6 @@ local function wrapSection(section)
 		o.Callback = withSave(control.Callback)
 		return section:AddGallery(o)
 	end
-	-- Returns nil when the UI library has no color picker (an older CWUI.lua).
-	function adapter:Colorpicker(control)
-		if type(section.AddColorpicker) ~= "function" then return nil end
-		local o = mapControlOptions(control)
-		o.Callback = withSave(o.Callback)
-		return section:AddColorpicker(o)
-	end
 	function adapter:Button(control) return section:AddButton(mapControlOptions(control)) end
 	function adapter:AddLabel(text) return section:AddLabel(text) end
 	function adapter:AddSubSection(name, open)
@@ -2935,9 +2926,6 @@ local configuredWeaponSounds = CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES
 	or _cfg.WEAPON_SHOOT_SOUNDS
 CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES = type(configuredWeaponSounds) == "table"
 	and configuredWeaponSounds or {}
-if type(CW.Settings.WEAPON_RELOAD_SOUND_OVERRIDES) ~= "table" then
-	CW.Settings.WEAPON_RELOAD_SOUND_OVERRIDES = {}
-end
 
 -- Off by default: nothing changes in the game until the player turns it on.
 if CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED == nil then
@@ -2946,7 +2934,7 @@ end
 if CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS == nil then
 	CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS = _cfg.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS == true
 end
--- Volume multiplier for the overridden gun sounds (shoot and reload), relative to the game's own volume.
+-- Volume multiplier for the overridden gun sounds, relative to the game's own volume.
 CW.Settings.WEAPON_SOUND_VOLUME = math.clamp(tonumber(CW.Settings.WEAPON_SOUND_VOLUME) or 1, 0, 2)
 CW.Defaults.WEAPON_SOUND_VOLUME = 1
 
@@ -2954,17 +2942,14 @@ if CW.State.stopWeaponShootSoundOverrides then
 	pcall(CW.State.stopWeaponShootSoundOverrides)
 end
 
-local weaponSoundOverrides = CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES  -- weapon -> relative path, for "ShootSound"
-local reloadSoundOverrides = CW.Settings.WEAPON_RELOAD_SOUND_OVERRIDES -- weapon -> relative path, for "ReloadSound"
-local overridesBySound = { ShootSound = weaponSoundOverrides, ReloadSound = reloadSoundOverrides }
-
-local activeSounds = setmetatable({}, { __mode = "k" })  -- Sound -> { originalId, baseVolume, targetId, connection }
-local toolWatchers = setmetatable({}, { __mode = "k" })  -- Tool -> its DescendantAdded connection
-local playerWatchers = {}                                -- Player -> list of connections
-local globalConnections = {}
+local weaponSoundOverrides = CW.Settings.WEAPON_SHOOT_SOUND_OVERRIDES
+local activeWeaponSounds = setmetatable({}, { __mode = "k" })
+local watchedSoundContainers = setmetatable({}, { __mode = "k" })
+local weaponSoundPlayerConnections = {}
+local weaponSoundGlobalConnections = {}
 local weaponSoundRefreshScheduled = false
 local weaponSoundRefreshGeneration = 0
-local weaponAssetIds = {} -- relative path -> asset id; rebuilt with every override refresh
+local weaponAssetIds = {} -- relative path -> getcustomasset id; rebuilt with every override refresh
 
 ------------------------------------------------------------------------------
 -- Weapon sound library: WeaponSounds/<Weapon>/<file> (separate from HitSounds)
@@ -3013,17 +2998,14 @@ local function weaponSoundLabel(weapon, relative)
 	return (tail:gsub("^_Official/", ""))
 end
 
--- Overrides that do not point inside their weapon's WeaponSounds folder (for example the ones saved
--- before that library existed, which pointed at HitSounds/...) are dropped once, with a warning.
--- Overrides for files that are merely not downloaded yet are kept.
+-- Overrides saved before the separate WeaponSounds library existed point at HitSounds/...
+-- Those files no longer belong to this list, so they are dropped once, with a warning.
 do
 	local dropped = {}
-	for _, overrides in ipairs({ weaponSoundOverrides, reloadSoundOverrides }) do
-		for weapon, path in pairs(overrides) do
-			if type(path) ~= "string" or not weaponSoundTail(weapon, path) then
-				overrides[weapon] = nil
-				if type(path) == "string" then table.insert(dropped, tostring(weapon)) end
-			end
+	for weapon, path in pairs(weaponSoundOverrides) do
+		if type(path) ~= "string" or not weaponSoundTail(weapon, path) then
+			weaponSoundOverrides[weapon] = nil
+			if type(path) == "string" then table.insert(dropped, tostring(weapon)) end
 		end
 	end
 	if #dropped > 0 then
@@ -3035,62 +3017,114 @@ do
 end
 refreshWeaponSoundCatalog()
 
-------------------------------------------------------------------------------
--- How the overrides are applied
---   The game plays a weapon sound by CLONING the sound under the tool's Handle ("ShootSound",
---   "ReloadSound") each time, so changing the original is enough. Only the original is ever
---   touched: the per-shot clones (also named ShootSound, added under the same Handle) are ignored.
---   Only tools of weapons that have an override are watched, and only for new sounds on that tool.
-------------------------------------------------------------------------------
+local function disconnectList(connections)
+	for _, connection in ipairs(connections) do
+		pcall(function() connection:Disconnect() end)
+	end
+	table.clear(connections)
+end
+
+-- Volume handling. baseVolume is the game's own volume for that sound; the sound plays at
+-- baseVolume * WEAPON_SOUND_VOLUME. If the game itself changes the volume later (distance,
+-- per-shot values), that new value becomes the base, so the slider always scales the game's value.
 local function setScaledVolume(sound, data)
 	local target = math.clamp(data.baseVolume * (CW.Settings.WEAPON_SOUND_VOLUME or 1), 0, 10)
+	data.lastVolume = target
 	if sound.Volume ~= target then
 		pcall(function() sound.Volume = target end)
 	end
 end
 
 local function updateWeaponSoundVolumes()
-	for sound, data in pairs(activeSounds) do
+	for sound, data in pairs(activeWeaponSounds) do
 		if sound.Parent then setScaledVolume(sound, data) end
 	end
 end
 
-local function overrideAsset(relative)
-	local cached = weaponAssetIds[relative]
-	if cached then return cached end
-	local filePath = CW.Paths.LIBRARY_ROOT .. "/" .. relative
-	if not isfile(filePath) then return nil end
-	local loaded, assetId = pcall(CW.Library.audioAsset, filePath)
-	if loaded and type(assetId) == "string" then
-		weaponAssetIds[relative] = assetId
-		return assetId
+local function restoreWeaponSound(sound)
+	local data = activeWeaponSounds[sound]
+	if not data then return end
+	activeWeaponSounds[sound] = nil
+	if data.connection then
+		pcall(function() data.connection:Disconnect() end)
+	end
+	if data.volumeConnection then
+		pcall(function() data.volumeConnection:Disconnect() end)
+	end
+	if sound.Parent then
+		pcall(function()
+			sound.SoundId = data.originalId
+			sound.Volume = data.baseVolume
+		end)
+	end
+end
+
+local function stopWeaponShootSoundOverrides()
+	weaponSoundRefreshGeneration = weaponSoundRefreshGeneration + 1
+	weaponSoundRefreshScheduled = false
+	table.clear(weaponAssetIds)
+	disconnectList(weaponSoundGlobalConnections)
+	for _, connections in pairs(weaponSoundPlayerConnections) do
+		disconnectList(connections)
+	end
+	table.clear(weaponSoundPlayerConnections)
+	for container, data in pairs(watchedSoundContainers) do
+		disconnectList(data.connections)
+		watchedSoundContainers[container] = nil
+	end
+	for sound in pairs(activeWeaponSounds) do
+		restoreWeaponSound(sound)
+	end
+end
+CW.State.stopWeaponShootSoundOverrides = stopWeaponShootSoundOverrides
+
+local function findSoundTool(sound)
+	local ancestor = sound.Parent
+	while ancestor do
+		if ancestor:IsA("Tool") then return ancestor end
+		ancestor = ancestor.Parent
 	end
 	return nil
 end
 
-local function applyOverride(sound, tool)
-	local overrides = overridesBySound[sound.Name]
-	local relative = overrides and overrides[tool.Name]
-	if type(relative) ~= "string" then return end
-	local targetId = overrideAsset(relative)
-	if not targetId then return end
-
-	local data = activeSounds[sound]
+local function applyWeaponSound(sound, targetId, tool, player, container)
+	local data = activeWeaponSounds[sound]
 	if not data then
-		data = { originalId = sound.SoundId, baseVolume = sound.Volume, targetId = targetId }
-		activeSounds[sound] = data
-		-- Safety net: if the server writes the SoundId again after creating the sound, put ours back.
-		-- It is one watcher per original sound (never per shot).
+		data = {
+			originalId = sound.SoundId,
+			baseVolume = sound.Volume,
+			lastVolume = sound.Volume,
+			tool = tool,
+			player = player,
+			container = container,
+			targetId = targetId,
+		}
+		activeWeaponSounds[sound] = data
 		local ok, connection = pcall(function()
 			return sound:GetPropertyChangedSignal("SoundId"):Connect(function()
-				local current = activeSounds[sound]
+				local current = activeWeaponSounds[sound]
 				if current and sound.Parent and sound.SoundId ~= current.targetId then
 					pcall(function() sound.SoundId = current.targetId end)
 				end
 			end)
 		end)
 		if ok then data.connection = connection end
+
+		local okVolume, volumeConnection = pcall(function()
+			return sound:GetPropertyChangedSignal("Volume"):Connect(function()
+				local current = activeWeaponSounds[sound]
+				if not current or not sound.Parent then return end
+				if math.abs(sound.Volume - current.lastVolume) > 0.0001 then
+					current.baseVolume = sound.Volume -- the game changed it: scale the new value
+					setScaledVolume(sound, current)
+				end
+			end)
+		end)
+		if okVolume then data.volumeConnection = volumeConnection end
 	else
+		data.tool = tool
+		data.player = player
+		data.container = container
 		data.targetId = targetId
 	end
 
@@ -3100,86 +3134,101 @@ local function applyOverride(sound, tool)
 	setScaledVolume(sound, data)
 end
 
-local function restoreSound(sound, data)
-	if data.connection then pcall(function() data.connection:Disconnect() end) end
-	if sound.Parent then
-		pcall(function()
-			sound.SoundId = data.originalId
-			sound.Volume = data.baseVolume
-		end)
+local function applyWeaponSoundToTool(tool, player, container)
+	if not tool:IsA("Tool") then return end
+	if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
+	if player ~= LocalPlayer and not CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS then return end
+
+	local relativePath = weaponSoundOverrides[tool.Name]
+	if type(relativePath) ~= "string" then return end
+	local targetId = weaponAssetIds[relativePath]
+	if not targetId then
+		local filePath = CW.Paths.LIBRARY_ROOT .. "/" .. relativePath
+		if not isfile(filePath) then return end
+		local loaded, assetId = pcall(CW.Library.audioAsset, filePath)
+		if not loaded or type(assetId) ~= "string" then return end
+		weaponAssetIds[relativePath] = assetId
+		targetId = assetId
+	end
+	for _, descendant in ipairs(tool:GetDescendants()) do
+		if descendant:IsA("Sound") and descendant.Name == "ShootSound" then
+			applyWeaponSound(descendant, targetId, tool, player, container)
+		end
 	end
 end
 
-local function disconnectList(connections)
-	for _, connection in ipairs(connections) do
-		pcall(function() connection:Disconnect() end)
-	end
-	table.clear(connections)
-end
-
-local function stopWeaponShootSoundOverrides()
-	weaponSoundRefreshGeneration = weaponSoundRefreshGeneration + 1
-	weaponSoundRefreshScheduled = false
-	table.clear(weaponAssetIds)
-	disconnectList(globalConnections)
-	for _, connections in pairs(playerWatchers) do disconnectList(connections) end
-	table.clear(playerWatchers)
-	for tool, connection in pairs(toolWatchers) do
-		pcall(function() connection:Disconnect() end)
-		toolWatchers[tool] = nil
-	end
-	for sound, data in pairs(activeSounds) do
-		activeSounds[sound] = nil
-		restoreSound(sound, data)
+local function unwatchSoundContainer(container)
+	local data = watchedSoundContainers[container]
+	if not data then return end
+	watchedSoundContainers[container] = nil
+	disconnectList(data.connections)
+	for sound, soundData in pairs(activeWeaponSounds) do
+		if soundData.container == container then
+			restoreWeaponSound(sound)
+		end
 	end
 end
-CW.State.stopWeaponShootSoundOverrides = stopWeaponShootSoundOverrides
 
-local function watchTool(tool)
-	if toolWatchers[tool] or not tool:IsA("Tool") then return end
-	if not (weaponSoundOverrides[tool.Name] or reloadSoundOverrides[tool.Name]) then return end
+local function watchSoundContainer(container, player)
+	if watchedSoundContainers[container] then return end
+	local data = { player = player, connections = {} }
+	watchedSoundContainers[container] = data
 
-	-- A new sound on this tool: only an original counts, i.e. the first sound of its name under Handle.
-	local function consider(descendant)
-		if descendant:IsA("Sound") and overridesBySound[descendant.Name] then
-			local parent = descendant.Parent
-			if parent and parent.Name == "Handle" and parent:FindFirstChild(descendant.Name) == descendant then
-				applyOverride(descendant, tool)
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Tool") then
+			applyWeaponSoundToTool(child, player, container)
+		end
+	end
+
+	table.insert(data.connections, container.DescendantAdded:Connect(function(descendant)
+		if descendant:IsA("Tool") then
+			task.defer(applyWeaponSoundToTool, descendant, player, container)
+		elseif descendant:IsA("Sound") and descendant.Name == "ShootSound" then
+			local tool = findSoundTool(descendant)
+			if tool then applyWeaponSoundToTool(tool, player, container) end
+		end
+	end))
+
+	table.insert(data.connections, container.DescendantRemoving:Connect(function(descendant)
+		if descendant:IsA("Sound") then
+			restoreWeaponSound(descendant)
+		elseif descendant:IsA("Tool") then
+			for sound, soundData in pairs(activeWeaponSounds) do
+				if soundData.tool == descendant then restoreWeaponSound(sound) end
 			end
 		end
-	end
-	toolWatchers[tool] = tool.DescendantAdded:Connect(consider)
+	end))
+end
 
-	local handle = tool:FindFirstChild("Handle")
-	if handle then
-		for name in pairs(overridesBySound) do
-			local sound = handle:FindFirstChild(name)
-			if sound and sound:IsA("Sound") then applyOverride(sound, tool) end
-		end
+local function removeWeaponSoundPlayer(player)
+	local connections = weaponSoundPlayerConnections[player]
+	if connections then
+		disconnectList(connections)
+		weaponSoundPlayerConnections[player] = nil
+	end
+	for container, data in pairs(watchedSoundContainers) do
+		if data.player == player then unwatchSoundContainer(container) end
 	end
 end
 
-local function watchContainer(container, connections)
-	for _, child in ipairs(container:GetChildren()) do watchTool(child) end
-	table.insert(connections, container.ChildAdded:Connect(watchTool))
-end
-
-local function watchPlayer(player)
-	if playerWatchers[player] then return end
+local function watchWeaponSoundPlayer(player)
+	if weaponSoundPlayerConnections[player] then return end
 	local connections = {}
-	playerWatchers[player] = connections
+	weaponSoundPlayerConnections[player] = connections
 
 	table.insert(connections, player.CharacterAdded:Connect(function(character)
-		watchContainer(character, connections)
+		watchSoundContainer(character, player)
 	end))
-	if player.Character then watchContainer(player.Character, connections) end
+	table.insert(connections, player.CharacterRemoving:Connect(unwatchSoundContainer))
+	if player.Character then
+		watchSoundContainer(player.Character, player)
+	end
 
 	if player == LocalPlayer then
-		-- Other players' backpacks are not replicated; yours is recreated on every respawn.
 		local backpack = player:FindFirstChildOfClass("Backpack")
-		if backpack then watchContainer(backpack, connections) end
+		if backpack then watchSoundContainer(backpack, player) end
 		table.insert(connections, player.ChildAdded:Connect(function(child)
-			if child:IsA("Backpack") then watchContainer(child, connections) end
+			if child:IsA("Backpack") then watchSoundContainer(child, player) end
 		end))
 	end
 end
@@ -3188,20 +3237,10 @@ local function refreshWeaponShootSoundOverrides()
 	stopWeaponShootSoundOverrides()
 	if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
 	for _, player in ipairs(Players:GetPlayers()) do
-		if player == LocalPlayer or CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS then
-			watchPlayer(player)
-		end
+		watchWeaponSoundPlayer(player)
 	end
-	table.insert(globalConnections, Players.PlayerAdded:Connect(function(player)
-		if CW.Settings.WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS then watchPlayer(player) end
-	end))
-	table.insert(globalConnections, Players.PlayerRemoving:Connect(function(player)
-		local connections = playerWatchers[player]
-		if connections then
-			disconnectList(connections)
-			playerWatchers[player] = nil
-		end
-	end))
+	table.insert(weaponSoundGlobalConnections, Players.PlayerAdded:Connect(watchWeaponSoundPlayer))
+	table.insert(weaponSoundGlobalConnections, Players.PlayerRemoving:Connect(removeWeaponSoundPlayer))
 end
 
 local function scheduleWeaponShootSoundRefresh()
@@ -3216,9 +3255,9 @@ local function scheduleWeaponShootSoundRefresh()
 end
 
 -- value is what the weapon's dropdown shows: "Default" (the game's own sound) or a file label.
-local function setWeaponSound(overrides, weapon, value)
+local function setWeaponShootSound(weapon, value)
 	if value == WEAPON_SOUND_DEFAULT then
-		overrides[weapon] = nil
+		weaponSoundOverrides[weapon] = nil
 	else
 		local entry = weaponSoundCatalog[weapon]
 		local relative = entry and (entry.byLabel[value] or (entry.available[value] and value))
@@ -3226,13 +3265,10 @@ local function setWeaponSound(overrides, weapon, value)
 			CW.Warn("Choose a sound file from the WeaponSounds library for " .. tostring(weapon))
 			return
 		end
-		overrides[weapon] = relative
+		weaponSoundOverrides[weapon] = relative
 	end
 	scheduleWeaponShootSoundRefresh()
 end
-
-local function setWeaponShootSound(weapon, value) setWeaponSound(weaponSoundOverrides, weapon, value) end
-local function setWeaponReloadSound(weapon, value) setWeaponSound(reloadSoundOverrides, weapon, value) end
 
 ------------------------------------------------------------------------------
 -- Effects tab (hitmarker + tracers)
@@ -3310,8 +3346,7 @@ guarded("Effects", function()
 	})
 
 	-- Tracers
-	local TRACER_COLOR_KEYS = { "TRACER_COLOR", "TRACER_GLOW_COLOR", "TRACER_TASER_COLOR", "TRACER_SNIPER_COLOR" }
-	local tracerPalette = { -- only for the fallback dropdown and for reading old saved palette names
+	local tracerPalette = {
 		Violet = Color3.fromRGB(170, 0, 255),
 		Lilac = Color3.fromRGB(200, 100, 255),
 		Red = Color3.fromRGB(255, 64, 64),
@@ -3319,43 +3354,20 @@ guarded("Effects", function()
 		Cyan = Color3.fromRGB(64, 210, 255),
 		White = Color3.fromRGB(255, 255, 255),
 	}
-	local paletteNames = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" }
 
-	-- Colors are saved as hex (<KEY>_HEX, written by saveSettings). The palette names saved by older
-	-- versions (TRACER_COLOR_NAME, TRACER_GLOW_COLOR_NAME) are still read once. Both are consumed here
-	-- so they do not stay behind in CW.Settings and get written back.
-	for _, key in ipairs(TRACER_COLOR_KEYS) do
-		local hex = CW.Settings[key .. "_HEX"]
-		local parsed
-		if type(hex) == "string" then
-			local ok, color = pcall(Color3.fromHex, hex)
-			if ok and typeof(color) == "Color3" then parsed = color end
+	local function colorName(color)
+		for name, paletteColor in pairs(tracerPalette) do
+			if color == paletteColor then return name end
 		end
-		parsed = parsed or tracerPalette[CW.Settings[key .. "_NAME"]]
-		if parsed then CW.Settings[key] = parsed end
-		CW.Settings[key .. "_HEX"] = nil
-		CW.Settings[key .. "_NAME"] = nil
+		return "Violet"
 	end
+	CW.State.tracerColorName = colorName
 
-	-- A color picker row; with an older CWUI.lua (no picker) a palette dropdown is used instead.
-	local function addColor(section, title, key)
-		local picker = section:Colorpicker({
-			Title = title,
-			Default = CW.Settings[key],
-			Callback = function(color) CW.Settings[key] = color end,
-		})
-		if picker then return end
-		local current = "Violet"
-		for name, color in pairs(tracerPalette) do
-			if color == CW.Settings[key] then current = name end
-		end
-		section:Dropdown({
-			Title = title,
-			Options = paletteNames,
-			Default = current,
-			Callback = function(name) CW.Settings[key] = tracerPalette[name] end,
-		})
-	end
+	-- Colors are userdata and can't be serialised: they are saved by palette name.
+	local savedColor = tracerPalette[CW.Settings.TRACER_COLOR_NAME]
+	if savedColor then CW.Settings.TRACER_COLOR = savedColor end
+	local savedGlow = tracerPalette[CW.Settings.TRACER_GLOW_COLOR_NAME]
+	if savedGlow then CW.Settings.TRACER_GLOW_COLOR = savedGlow end
 
 	EffectsTab:Toggle({
 		Title = "Custom Bullet Tracers",
@@ -3363,16 +3375,25 @@ guarded("Effects", function()
 		Callback = function(s) CW.Settings.CUSTOM_BULLET_TRACERS = s end,
 	})
 
-	EffectsTab:Toggle({
-		Title = "Apply To Others",
-		Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
-		Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
+	EffectsTab:Dropdown({
+		Title = "Tracer Color",
+		Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
+		Default = colorName(CW.Settings.TRACER_COLOR),
+		Callback = function(name)
+			CW.Settings.TRACER_COLOR = tracerPalette[name]
+		end,
 	})
 
-	local bulletSection = EffectsTab:AddSubSection("Bullet Tracer", true)
-	addColor(bulletSection, "Tracer Color", "TRACER_COLOR")
-	addColor(bulletSection, "Glow Color", "TRACER_GLOW_COLOR")
-	bulletSection:Slider({
+	EffectsTab:Dropdown({
+		Title = "Glow Color",
+		Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
+		Default = colorName(CW.Settings.TRACER_GLOW_COLOR),
+		Callback = function(name)
+			CW.Settings.TRACER_GLOW_COLOR = tracerPalette[name]
+		end,
+	})
+
+	EffectsTab:Slider({
 		Title = "Tracer Width",
 		Min = 0.01,
 		Max = 0.5,
@@ -3380,7 +3401,8 @@ guarded("Effects", function()
 		Decimal = 2,
 		Callback = function(v) CW.Settings.TRACER_WIDTH = v end,
 	})
-	bulletSection:Slider({
+
+	EffectsTab:Slider({
 		Title = "Tracer Lifetime",
 		Min = 0.01,
 		Max = 1,
@@ -3389,17 +3411,18 @@ guarded("Effects", function()
 		Suffix = "s",
 		Callback = function(v) CW.Settings.TRACER_LIFETIME = v end,
 	})
-	bulletSection:Toggle({
+
+	EffectsTab:Toggle({
 		Title = "Tracer Light",
 		Default = CW.Settings.TRACER_POINT_LIGHT == true,
 		Callback = function(s) CW.Settings.TRACER_POINT_LIGHT = s == true end,
 	})
 
-	-- Taser and sniper keep the game's own width and timing: only the color is theirs.
-	local taserSection = EffectsTab:AddSubSection("Taser Tracer", false)
-	addColor(taserSection, "Tracer Color", "TRACER_TASER_COLOR")
-	local sniperSection = EffectsTab:AddSubSection("Sniper Tracer", false)
-	addColor(sniperSection, "Tracer Color", "TRACER_SNIPER_COLOR")
+	EffectsTab:Toggle({
+		Title = "Apply To Others",
+		Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
+		Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
+	})
 end)
 
 ------------------------------------------------------------------------------
@@ -3515,21 +3538,15 @@ guarded("Sounds", function()
 	for _, weaponName in ipairs(CW.WeaponList or {}) do
 		local weapon = weaponName
 		local entry = weaponSoundCatalog[weapon]
-		local options = entry and entry.options or { WEAPON_SOUND_DEFAULT }
-		local weaponSection = WeaponSection:AddSubSection(weapon, false)
-		local shootDropdown = weaponSection:Dropdown({
-			Title = "Shoot Sound",
-			Options = options,
+		local dropdown = WeaponSection:Dropdown({
+			Title = weapon .. " Shoot Sound",
+			Options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
 			Default = weaponSoundLabel(weapon, weaponSoundOverrides[weapon]),
-			Callback = function(value) setWeaponShootSound(weapon, value) end,
+			Callback = function(value)
+				setWeaponShootSound(weapon, value)
+			end,
 		})
-		local reloadDropdown = weaponSection:Dropdown({
-			Title = "Reload Sound",
-			Options = options,
-			Default = weaponSoundLabel(weapon, reloadSoundOverrides[weapon]),
-			Callback = function(value) setWeaponReloadSound(weapon, value) end,
-		})
-		table.insert(weaponSoundDropdowns, { weapon = weapon, shoot = shootDropdown, reload = reloadDropdown })
+		table.insert(weaponSoundDropdowns, { weapon = weapon, control = dropdown })
 	end
 
 	HitSoundDropdown = HitSection:Dropdown({
@@ -3655,25 +3672,14 @@ guarded("Utilities", function()
 		end,
 	})
 
-	-- The chat is only touched by the Z toggle below (never forced on at load).
-	-- This game uses TextChatService, so the chat window and the input bar are switched through its
-	-- configuration objects. The legacy calls stay as the fallback for places on the legacy chat.
-	local TextChatService = game:GetService("TextChatService")
+	-- The chat is no longer forced on at load: it is only touched by the Z toggle below.
 	local function setChatVisible(visible)
-		if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
-			pcall(function() TextChatService.ChatWindowConfiguration.Enabled = visible end)
-			pcall(function() TextChatService.ChatInputBarConfiguration.Enabled = visible end)
-		else
-			pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, visible) end)
-			pcall(function() StarterGui:SetCore("ChatActive", visible) end)
-		end
-	end
-
-	-- The game also uses Z to open and close the sniper's scope, so Z must not touch the chat then.
-	local function sniperEquipped()
-		local character = LocalPlayer.Character
-		local tool = character and character:FindFirstChildOfClass("Tool")
-		return tool ~= nil and tool:GetAttribute("Behavior") == "Sniper"
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, visible)
+		end)
+		pcall(function()
+			StarterGui:SetCore("ChatActive", visible)
+		end)
 	end
 
 	if CW.State.chatToggleConn then
@@ -3681,7 +3687,7 @@ guarded("Utilities", function()
 	end
 	CW.State.chatToggleConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if gameProcessed or not CW.Settings.CHAT_TOGGLE_ENABLED then return end
-		if input.KeyCode ~= Enum.KeyCode.Z or sniperEquipped() then return end
+		if input.KeyCode ~= Enum.KeyCode.Z then return end
 
 		chatHidden = not chatHidden
 		CW.State.chatHidden = chatHidden
@@ -3701,103 +3707,15 @@ guarded("Utilities", function()
 		end,
 	})
 
-	-- Auto reload (off by default)
-	local PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-		or LocalPlayer:WaitForChild("PlayerGui", 5)
-	assert(PlayerGui, "PlayerGui did not become available within 5 seconds")
+	-- Auto reload (off by default).
+	-- It reads the equipped gun's own attributes instead of the ammo text on screen: the game keeps
+	-- Local_CurrentAmmo (the client's count) and Local_ReloadSession (0 when idle, a timestamp while
+	-- reloading) on the tool, and the sniper's text ("1 | 14") is not a plain "x/y" anyway.
 	local VirtualInputManager
 	pcall(function()
 		VirtualInputManager = game:GetService("VirtualInputManager")
 	end)
-
-	local AMMO_LABEL_PATH = "Home.hud.BottomRightFrame.GunFrame.BulletsLabel"
-	CW.Settings.AUTO_RELOAD_LABEL_PATH = AMMO_LABEL_PATH
-	if CW.Settings.AUTO_RELOAD_ENABLED == nil then
-		CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED == true
-	end
-
-	if CW.State.clearAmmoLabelWatchers then
-		CW.State.clearAmmoLabelWatchers(true)
-	end
-
-	local ammoLabelConnections = {}
-	local ammoLabelStates = setmetatable({}, { __mode = "k" })
 	local autoReloadWarned = false
-	local autoReloadLabelWarned = false
-	local ammoScanGeneration = 0
-	local rebuildAmmoLabelWatchers
-
-	local function clearAmmoLabelWatchers(resetStates)
-		for _, connection in pairs(ammoLabelConnections) do
-			connection:Disconnect()
-		end
-		table.clear(ammoLabelConnections)
-		if resetStates then
-			table.clear(ammoLabelStates)
-		end
-	end
-	CW.State.clearAmmoLabelWatchers = clearAmmoLabelWatchers
-
-	-- The ammo label reads "x/y" for normal guns, "x | y" (current | stored) for the sniper, and "..."
-	-- while reloading. Returns current, the second number, and true for the sniper format.
-	local function parseAmmoText(text)
-		local label = tostring(text)
-		local current, capacity = label:match("^%s*(%d+)%s*/%s*(%d+)%s*$")
-		if current then return tonumber(current), tonumber(capacity), false end
-		local sniperCurrent, stored = label:match("^%s*(%d+)%s*|%s*(%d+)%s*$")
-		if sniperCurrent then return tonumber(sniperCurrent), tonumber(stored), true end
-		return nil
-	end
-
-	-- The game cannot reload a sniper without stored ammo ("0 | 0"), so no R is pressed then.
-	local function needsReload(current, second, isSniper)
-		return current == 0 and not (isSniper and second <= 0)
-	end
-
-	local function isTextGui(instance)
-		return instance:IsA("TextLabel") or instance:IsA("TextButton") or instance:IsA("TextBox")
-	end
-
-	local function isNamedAmmoLabel(instance)
-		local name = instance.Name:lower()
-		return name:find("ammo", 1, true) ~= nil
-			or name:find("magazine", 1, true) ~= nil
-			or name:find("magcount", 1, true) ~= nil
-			or name:find("clipammo", 1, true) ~= nil
-			or name:find("bullet", 1, true) ~= nil
-	end
-
-	local function findConfiguredAmmoLabel()
-		local current = PlayerGui
-		for part in AMMO_LABEL_PATH:gmatch("[^%.]+") do
-			current = current and current:FindFirstChild(part)
-		end
-
-		if current and isTextGui(current) then return current end
-		return nil
-	end
-
-	local function findAmmoLabels()
-		local configured = findConfiguredAmmoLabel()
-		if configured then return { configured } end
-
-		local namedLabels = {}
-		local fractionLabels = {}
-		for _, instance in ipairs(PlayerGui:GetDescendants()) do
-			if isTextGui(instance) then
-				if isNamedAmmoLabel(instance) then
-					table.insert(namedLabels, instance)
-				elseif parseAmmoText(instance.Text) then
-					table.insert(fractionLabels, instance)
-				end
-			end
-		end
-
-		if #namedLabels == 1 then return namedLabels end
-		if #namedLabels > 1 then return {} end
-		if #fractionLabels == 1 then return fractionLabels end
-		return {}
-	end
 
 	local function pressReloadKey()
 		if VirtualInputManager then
@@ -3848,115 +3766,74 @@ guarded("Utilities", function()
 		return false
 	end
 
-	local function attemptReload(label)
-		if not CW.Settings.AUTO_RELOAD_ENABLED or UserInputService:GetFocusedTextBox() then return end
-		if UserInputService:IsKeyDown(Enum.KeyCode.R) then return end
-		local character = LocalPlayer.Character
-		if not character or not character:FindFirstChildOfClass("Tool") then return end
+	if CW.Settings.AUTO_RELOAD_ENABLED == nil then
+		CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED == true
+	end
 
-		local state = ammoLabelStates[label]
-		local now = os.clock()
-		if state and now - state.lastReload < 0.3 then return end
-		state = state or { lastReload = 0 }
-		state.lastReload = now
-		ammoLabelStates[label] = state
+	-- True when the gun is empty, not already reloading, and the game would accept a reload
+	-- (the sniper cannot reload without stored ammo).
+	local function needsReload(tool)
+		if not CW.Settings.AUTO_RELOAD_ENABLED then return false end
+		if tool:GetAttribute("Local_CurrentAmmo") ~= 0 then return false end
+		if tool:GetAttribute("Local_ReloadSession") ~= 0 then return false end
+		if tool:GetAttribute("Behavior") == "Sniper" and (tool:GetAttribute("StoredAmmo") or 0) <= 0 then return false end
+		return true
+	end
 
+	local reloading = setmetatable({}, { __mode = "k" })
+	local function autoReload(tool)
+		if reloading[tool] then return end
+		reloading[tool] = true
 		task.spawn(function()
-			if not pressReloadKey() then return end
-			task.wait(0.15)
-			if not CW.Settings.AUTO_RELOAD_ENABLED or not label.Parent then return end
-			if UserInputService:GetFocusedTextBox() then return end
-			if needsReload(parseAmmoText(label.Text)) then
+			-- At most two presses; the second only if the first did not start a reload.
+			for _ = 1, 2 do
+				if not needsReload(tool) or tool.Parent ~= LocalPlayer.Character then break end
+				if UserInputService:GetFocusedTextBox() or UserInputService:IsKeyDown(Enum.KeyCode.R) then break end
 				pressReloadKey()
+				task.wait(0.15)
+				if tool:GetAttribute("Local_ReloadSession") ~= 0 then break end
 			end
+			reloading[tool] = nil
 		end)
 	end
 
-	local function onAmmoLabelChanged(label)
-		if not CW.Settings.AUTO_RELOAD_ENABLED then return end
-		local current, second, isSniper = parseAmmoText(label.Text)
-		if current == nil or second == nil then return end
-
-		local state = ammoLabelStates[label]
-		if not state or state.capacity ~= second then
-			state = { capacity = second, lastReload = 0 }
-			ammoLabelStates[label] = state
-		end
-
-		if needsReload(current, second, isSniper) then
-			attemptReload(label)
-		elseif current ~= 0 then
-			state.lastReload = 0
-		end
+	local function watchTool(tool)
+		if not tool:IsA("Tool") or tool:GetAttribute("ToolType") ~= "Gun" then return end
+		CW.track("autoReloadTool", tool:GetAttributeChangedSignal("Local_CurrentAmmo"):Connect(function()
+			if needsReload(tool) then autoReload(tool) end
+		end))
+		if needsReload(tool) then autoReload(tool) end
 	end
 
-	rebuildAmmoLabelWatchers = function()
-		clearAmmoLabelWatchers()
-		ammoScanGeneration = ammoScanGeneration + 1
-		local generation = ammoScanGeneration
-		if not CW.Settings.AUTO_RELOAD_ENABLED then return end
+	local function watchCharacter(character)
+		CW.track("autoReloadAdded", character.ChildAdded:Connect(watchTool))
+		CW.track("autoReloadRemoved", character.ChildRemoved:Connect(function(child)
+			if child:IsA("Tool") then CW.untrack("autoReloadTool") end
+		end))
+		for _, child in ipairs(character:GetChildren()) do watchTool(child) end
+	end
 
-		task.spawn(function()
-			for _ = 1, 20 do
-				if generation ~= ammoScanGeneration or not CW.Settings.AUTO_RELOAD_ENABLED then return end
-
-				local labels = findAmmoLabels()
-				if #labels > 0 then
-					autoReloadLabelWarned = false
-					for _, label in ipairs(labels) do
-						ammoLabelConnections[label] = label:GetPropertyChangedSignal("Text"):Connect(function()
-							onAmmoLabelChanged(label)
-						end)
-						onAmmoLabelChanged(label)
-					end
-					return
-				end
-
-				task.wait(0.5)
+	local function setAutoReload(enabled)
+		if enabled then
+			CW.track("autoReloadCharacter", LocalPlayer.CharacterAdded:Connect(watchCharacter))
+			if LocalPlayer.Character then watchCharacter(LocalPlayer.Character) end
+		else
+			for _, key in ipairs({ "autoReloadCharacter", "autoReloadAdded", "autoReloadRemoved", "autoReloadTool" }) do
+				CW.untrack(key)
 			end
-
-			if generation == ammoScanGeneration and not autoReloadLabelWarned then
-				autoReloadLabelWarned = true
-				CW.Warn("Auto Reload could not find the ammo label at PlayerGui." .. AMMO_LABEL_PATH)
-			end
-		end)
-	end
-
-	if CW.State.ammoGuiConn then
-		CW.State.ammoGuiConn:Disconnect()
-	end
-	CW.State.ammoGuiConn = PlayerGui.DescendantAdded:Connect(function(instance)
-		if not CW.Settings.AUTO_RELOAD_ENABLED or not isTextGui(instance) then return end
-		-- Already watching a live label: nothing to rebuild (checked before any string work).
-		for label in pairs(ammoLabelConnections) do
-			if label.Parent then return end
 		end
-		if not (isNamedAmmoLabel(instance) or parseAmmoText(instance.Text)) then return end
-		task.defer(rebuildAmmoLabelWatchers)
-	end)
-
-	if CW.State.ammoCharacterConn then
-		CW.State.ammoCharacterConn:Disconnect()
 	end
-	CW.State.ammoCharacterConn = LocalPlayer.CharacterAdded:Connect(function()
-		task.wait(1)
-		if CW.Settings.AUTO_RELOAD_ENABLED then
-			rebuildAmmoLabelWatchers()
-		end
-	end)
 
 	UtilityTab:Toggle({
 		Title = "Auto Reload at 0 Ammo",
 		Default = CW.Settings.AUTO_RELOAD_ENABLED == true,
 		Callback = function(enabled)
 			CW.Settings.AUTO_RELOAD_ENABLED = enabled == true
-			rebuildAmmoLabelWatchers()
+			setAutoReload(CW.Settings.AUTO_RELOAD_ENABLED)
 		end,
 	})
 
-	if CW.Settings.AUTO_RELOAD_ENABLED and ammoScanGeneration == 0 then
-		rebuildAmmoLabelWatchers()
-	end
+	setAutoReload(CW.Settings.AUTO_RELOAD_ENABLED == true)
 end)
 
 ------------------------------------------------------------------------------
@@ -3995,11 +3872,8 @@ local function refreshUIFromLibrary()
 	end
 	for _, entry in ipairs(weaponSoundDropdowns) do
 		local catalog = weaponSoundCatalog[entry.weapon]
-		local options = catalog and catalog.options or { WEAPON_SOUND_DEFAULT }
-		entry.shoot:Refresh(options)
-		entry.shoot:Set(weaponSoundLabel(entry.weapon, weaponSoundOverrides[entry.weapon]), true)
-		entry.reload:Refresh(options)
-		entry.reload:Set(weaponSoundLabel(entry.weapon, reloadSoundOverrides[entry.weapon]), true)
+		entry.control:Refresh(catalog and catalog.options or { WEAPON_SOUND_DEFAULT })
+		entry.control:Set(weaponSoundLabel(entry.weapon, weaponSoundOverrides[entry.weapon]), true)
 	end
 
 	refreshWeaponShootSoundOverrides()
@@ -4061,11 +3935,15 @@ guarded("Settings", function()
 			end
 		end
 
-		-- Tracer colors are Color3 (not serialisable): stored as hex, only when changed from the default.
-		for _, key in ipairs({ "TRACER_COLOR", "TRACER_GLOW_COLOR", "TRACER_TASER_COLOR", "TRACER_SNIPER_COLOR" }) do
-			local color = CW.Settings[key]
-			if typeof(color) == "Color3" and color ~= CW.Defaults[key] then
-				savedSettings[key .. "_HEX"] = color:ToHex()
+		-- Tracer colors are Color3 (not serialisable): store the palette name, only when changed.
+		local nameOf = CW.State.tracerColorName
+		if nameOf then
+			local color, glow = nameOf(CW.Settings.TRACER_COLOR), nameOf(CW.Settings.TRACER_GLOW_COLOR)
+			if CW.Defaults.TRACER_COLOR == nil or color ~= nameOf(CW.Defaults.TRACER_COLOR) then
+				savedSettings.TRACER_COLOR_NAME = color
+			end
+			if CW.Defaults.TRACER_GLOW_COLOR == nil or glow ~= nameOf(CW.Defaults.TRACER_GLOW_COLOR) then
+				savedSettings.TRACER_GLOW_COLOR_NAME = glow
 			end
 		end
 
