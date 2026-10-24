@@ -13,7 +13,7 @@
 
     ESTRUTURA
         Window -> Tab -> Section -> SubSection (aninhável) -> elementos
-        Elementos: Label, Button, Toggle, Slider, Textbox, Dropdown, Gallery
+        Elementos: Label, Button, Toggle, Slider, Textbox, Dropdown, Colorpicker, Gallery
 ]]
 
 local CW = { Version = "2.0.0" }
@@ -367,6 +367,145 @@ function Section:AddDropdown(o)
 	end
 	head.MouseButton1Click:Connect(function() setOpen(not open) end)
 	obj:Refresh(options)
+	return obj
+end
+
+--=============================================================================
+-- Colorpicker: quadrado de saturação/brilho + barra de matiz + campo hex
+--
+--   Section:AddColorpicker({
+--       Name     = "Cor",
+--       Default  = Color3.fromRGB(170, 0, 255),
+--       Callback = function(color) end,           -- Color3 (chamado enquanto arrasta)
+--   })
+--   Retorno: :Get() -> Color3    :Set(color3, silent)
+--=============================================================================
+function Section:AddColorpicker(o)
+	o = type(o) == "string" and { Name = o } or o or {}
+	local color = typeof(o.Default) == "Color3" and o.Default or Color3.new(1, 1, 1)
+	local h, s, v = color:ToHSV()
+	local open = false
+	local SV_HEIGHT = 118
+	local PANEL_HEIGHT = SV_HEIGHT + 8 + 24
+	local row = self:_row(36)
+	row.ClipsDescendants = true
+
+	local head = new("TextButton", { BackgroundTransparency = 1, Text = "", Size = UDim2.new(1, 0, 0, 36), Parent = row })
+	rowLabel(head, o.Name or "Color")
+	local swatch = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(38, 18),
+		BackgroundColor3 = color, BorderSizePixel = 0, Parent = head,
+	}, { corner(5), new("UIStroke", { Color = Theme.Divider, Thickness = 1 }) })
+
+	local panel = new("Frame", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 44), Size = UDim2.new(1, -20, 0, PANEL_HEIGHT), Parent = row,
+	})
+
+	-- quadrado: saturação (esquerda → direita) e brilho (cima → baixo)
+	local satVal = new("Frame", {
+		BackgroundColor3 = Color3.fromHSV(h, 1, 1), BorderSizePixel = 0, Size = UDim2.new(1, -28, 0, SV_HEIGHT), Parent = panel,
+	}, { corner(5) })
+	new("Frame", {
+		BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = satVal,
+	}, { corner(5), new("UIGradient", {
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) }),
+	}) })
+	new("Frame", {
+		BackgroundColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 3, Parent = satVal,
+	}, { corner(5), new("UIGradient", {
+		Rotation = 90,
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) }),
+	}) })
+	local svKnob = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(12, 12), BackgroundTransparency = 1, ZIndex = 4, Parent = satVal,
+	}, { circle(), new("UIStroke", { Color = Theme.Text, Thickness = 2 }) })
+
+	-- barra de matiz
+	local hueBar = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.new(0, 18, 0, SV_HEIGHT),
+		BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Parent = panel,
+	}, { corner(5), new("UIGradient", {
+		Rotation = 90,
+		Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
+			ColorSequenceKeypoint.new(1 / 6, Color3.fromRGB(255, 255, 0)),
+			ColorSequenceKeypoint.new(2 / 6, Color3.fromRGB(0, 255, 0)),
+			ColorSequenceKeypoint.new(3 / 6, Color3.fromRGB(0, 255, 255)),
+			ColorSequenceKeypoint.new(4 / 6, Color3.fromRGB(0, 0, 255)),
+			ColorSequenceKeypoint.new(5 / 6, Color3.fromRGB(255, 0, 255)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0)),
+		}),
+	}) })
+	local hueKnob = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.new(1, 4, 0, 4), BackgroundColor3 = Theme.Text,
+		BorderSizePixel = 0, ZIndex = 2, Parent = hueBar,
+	}, { corner(2), new("UIStroke", { Color = Theme.Shell, Thickness = 1 }) })
+
+	-- campo hex
+	local hexBox = new("TextBox", {
+		Position = UDim2.fromOffset(0, SV_HEIGHT + 8), Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = Theme.Track,
+		BorderSizePixel = 0, ClearTextOnFocus = false, Text = "", PlaceholderText = "#RRGGBB",
+		PlaceholderColor3 = Theme.SubText, TextColor3 = Theme.Text, TextSize = 14, Font = Enum.Font.Gotham, Parent = panel,
+	}, { corner(5), new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }) })
+
+	local obj = { Instance = row }
+
+	-- exact: a cor exata de um :Set (evita o erro de arredondamento de ir e voltar por HSV)
+	local function render(exact)
+		color = exact or Color3.fromHSV(h, s, v)
+		swatch.BackgroundColor3 = color
+		satVal.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
+		svKnob.Position = UDim2.fromScale(s, 1 - v)
+		hueKnob.Position = UDim2.fromScale(0.5, h)
+		hexBox.Text = "#" .. color:ToHex():upper()
+	end
+
+	function obj:Set(c, silent)
+		if typeof(c) ~= "Color3" then return end
+		h, s, v = c:ToHSV()
+		render(c)
+		if not silent then safeCall(o.Callback, color) end
+	end
+	function obj:Get() return color end
+
+	local function setOpen(state)
+		open = state
+		tween(row, { Size = UDim2.new(1, 0, 0, open and (36 + 8 + PANEL_HEIGHT + 8) or 36) }, 0.2)
+	end
+	head.MouseButton1Click:Connect(function() setOpen(not open) end)
+
+	local dragging -- "sv", "hue" ou nil
+	local function updateFrom(input)
+		if dragging == "sv" then
+			s = math.clamp((input.Position.X - satVal.AbsolutePosition.X) / math.max(satVal.AbsoluteSize.X, 1), 0, 1)
+			v = 1 - math.clamp((input.Position.Y - satVal.AbsolutePosition.Y) / math.max(satVal.AbsoluteSize.Y, 1), 0, 1)
+		elseif dragging == "hue" then
+			h = math.clamp((input.Position.Y - hueBar.AbsolutePosition.Y) / math.max(hueBar.AbsoluteSize.Y, 1), 0, 1)
+		else
+			return
+		end
+		render()
+		safeCall(o.Callback, color)
+	end
+	satVal.InputBegan:Connect(function(i) if isClick(i) then dragging = "sv" updateFrom(i) end end)
+	hueBar.InputBegan:Connect(function(i) if isClick(i) then dragging = "hue" updateFrom(i) end end)
+	self._window:_connect(UserInputService.InputChanged, function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			updateFrom(i)
+		end
+	end)
+	self._window:_connect(UserInputService.InputEnded, function(i) if isClick(i) then dragging = nil end end)
+
+	hexBox.FocusLost:Connect(function()
+		local ok, parsed = pcall(Color3.fromHex, hexBox.Text)
+		if ok and typeof(parsed) == "Color3" then
+			obj:Set(parsed)
+		else
+			render(color) -- texto inválido: volta ao valor atual
+		end
+	end)
+
+	render(color)
 	return obj
 end
 
