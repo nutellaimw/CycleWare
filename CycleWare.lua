@@ -6,7 +6,7 @@
 --   stand-in, so a single missing function disables one feature instead of aborting the
 --   whole script. What was found is stored in CW.Caps and reported once at startup.
 --=============================================================================
-local SCRIPT_VERSION = "phase-5"
+local SCRIPT_VERSION = "phase-6"
 
 local CAPS = {
 	files = type(isfile) == "function" and type(isfolder) == "function"
@@ -2778,7 +2778,31 @@ local scheduleSave = function() end
 --// Download the UI library
 local UI_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CWUI.lua"
 CW.Log("Downloading CycleWare UI from GitHub")
-local fetchOK, uiSource = pcall(CW.httpGet, UI_URL)
+local UI_CACHE_FILE = CW.Paths.CACHE_FOLDER .. "/CWUI.lua"
+local fetchOK, uiSource = false, nil
+local localUIFile = type(_cfg.UI_FILE) == "string" and _cfg.UI_FILE ~= "" and _cfg.UI_FILE or nil
+if localUIFile then
+	-- Teste local: getgenv().CW_CONFIG = { UI_FILE = "CWUI.lua" } (caminho no workspace do executor)
+	local readOK, data = pcall(readfile, localUIFile)
+	if readOK and type(data) == "string" and data ~= "" then
+		fetchOK, uiSource = true, data
+		CW.Log("Using the local UI file: " .. localUIFile)
+	else
+		CW.Warn("UI_FILE could not be read (" .. localUIFile .. "); downloading the UI instead")
+	end
+end
+if not fetchOK then
+	fetchOK, uiSource = pcall(CW.httpGet, UI_URL)
+	if fetchOK and type(uiSource) == "string" and uiSource:find("CreateWindow", 1, true) then
+		pcall(writefile, UI_CACHE_FILE, uiSource) -- guarda a última cópia boa
+	else
+		local cacheOK, cached = pcall(readfile, UI_CACHE_FILE)
+		if cacheOK and type(cached) == "string" and cached:find("CreateWindow", 1, true) then
+			CW.Warn("Could not download the UI (" .. tostring(uiSource) .. "); using the last saved copy")
+			fetchOK, uiSource = true, cached
+		end
+	end
+end
 assert(fetchOK and type(uiSource) == "string" and uiSource ~= "", "Could not download CWUI.lua from GitHub: " .. tostring(uiSource))
 
 local loadUI, compileError = loadstring(uiSource)
@@ -2789,7 +2813,19 @@ assert(type(CWUI) == "table" and type(CWUI.CreateWindow) == "function", "Invalid
 if CW.UIWindow and type(CW.UIWindow.Destroy) == "function" then
 	pcall(function() CW.UIWindow:Destroy() end)
 end
-local Window = CWUI:CreateWindow({ Title = "CW", ToggleKey = false })
+-- Ícones opcionais (caminho no workspace ou ID do Roblox). Exemplo, antes de executar o script:
+--   getgenv().CW_CONFIG = { UI_ICONS = { Logo = "CW/logo.png", Discord = 456, Info = 789, Settings = 123,
+--                                         Effects = 111, Visuals = 222, Sounds = 333, Utilities = 444 },
+--                           DISCORD_URL = "https://discord.gg/xxxx" }
+-- (Settings vale para o botão do rodapé e para a aba Settings; as outras abas usam o próprio nome.)
+local uiIcons = type(_cfg.UI_ICONS) == "table" and _cfg.UI_ICONS or {}
+local Window = CWUI:CreateWindow({
+	Title = "CW",
+	ToggleKey = false,
+	Logo = uiIcons.Logo,
+	Icons = { Settings = uiIcons.Settings, Discord = uiIcons.Discord, Info = uiIcons.Info },
+	Discord = type(_cfg.DISCORD_URL) == "string" and _cfg.DISCORD_URL or nil,
+})
 CW.UIWindow = Window
 Window.ToggleVisibility = Window.Toggle
 
@@ -2850,7 +2886,7 @@ end
 local function createCompatTab(options)
 	options = options or {}
 	local tabName = options.Title or options.Name or "Settings"
-	local tab = Window:AddTab({ Name = tabName })
+	local tab = Window:AddTab({ Name = tabName, Icon = options.Icon or uiIcons[tabName] })
 	return wrapSection(tab:AddSection({ Name = tabName, Open = true }))
 end
 
@@ -3234,6 +3270,15 @@ local function watchWeaponSoundPlayer(player)
 end
 
 local function refreshWeaponShootSoundOverrides()
+	-- Resolve os arquivos escolhidos em segundo plano (depois do refresh): o primeiro tiro já sai com o som trocado.
+	task.defer(function()
+		if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
+		for _, overrides in pairs(overridesBySound) do
+			for _, relative in pairs(overrides) do
+				if type(relative) == "string" then pcall(overrideAsset, relative) end
+			end
+		end
+	end)
 	stopWeaponShootSoundOverrides()
 	if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
 	for _, player in ipairs(Players:GetPlayers()) do
@@ -3500,7 +3545,7 @@ end)
 -- Controls and saved settings are the same as before, so nothing already saved is lost.
 ------------------------------------------------------------------------------
 guarded("Sounds", function()
-	local SoundsTab = Window:AddTab({ Name = "Sounds" })
+	local SoundsTab = Window:AddTab({ Name = "Sounds", Icon = uiIcons.Sounds })
 	local WeaponSection = wrapSection(SoundsTab:AddSection({ Name = "Weapon Sounds", Open = true }))
 	local HitSection = wrapSection(SoundsTab:AddSection({ Name = "Hit Sound", Open = true }))
 
@@ -3921,6 +3966,7 @@ guarded("Settings", function()
 		if type(value) == "table" then return next(value) == nil end
 		local default = CW.Defaults[key]
 		if default == nil and type(value) == "boolean" then default = false end
+		if type(value) == "number" and type(default) == "number" then return math.abs(value - default) < 1e-6 end
 		return value == default
 	end
 
