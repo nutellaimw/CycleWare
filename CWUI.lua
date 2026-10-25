@@ -1,5 +1,5 @@
 --[[
-    CW UI Library  v2.0
+    CW UI Library  v2.1
 
     IMAGENS
       Qualquer campo de imagem (Icon, Logo, Items...) aceita:
@@ -13,10 +13,10 @@
 
     ESTRUTURA
         Window -> Tab -> Section -> SubSection (aninhável) -> elementos
-        Elementos: Label, Button, Toggle, Slider, Textbox, Dropdown, Gallery
+        Elementos: Label, Button, Toggle, Slider, Textbox, Dropdown, Colorpicker, Gallery
 ]]
 
-local CW = { Version = "2.0.0" }
+local CW = { Version = "2.1.0" }
 
 --// Services ---------------------------------------------------------------
 local cloneref = cloneref or function(x) return x end
@@ -26,16 +26,13 @@ local CoreGui          = cloneref(game:GetService("CoreGui"))
 
 --// Tema ---------------------------------------------------------------------
 local Theme = {
-	Shell         = Color3.fromRGB(18, 19, 25),
-	SidebarTop    = Color3.fromRGB(62, 63, 68),
-	SidebarBottom = Color3.fromRGB(74, 75, 80),
-	LogoTop       = Color3.fromRGB(86, 88, 94),
-	LogoBottom    = Color3.fromRGB(92, 94, 100),
-	ContentTop    = Color3.fromRGB(28, 29, 34),
-	ContentBottom = Color3.fromRGB(32, 33, 38),
-	Selected      = Color3.fromRGB(23, 66, 118),
+	Shell         = Color3.fromRGB(18, 19, 23),
+	Sidebar       = Color3.fromRGB(63, 65, 70),   -- barra lateral (cinza liso, como no protótipo)
+	Logo          = Color3.fromRGB(87, 89, 93),   -- faixa do logo
+	Content       = Color3.fromRGB(28, 29, 34),   -- fundo da janela / área de conteúdo
+	Selected      = Color3.fromRGB(22, 67, 114),
 	TabHover      = Color3.fromRGB(88, 89, 95),
-	Header        = Color3.fromRGB(58, 59, 64),
+	Header        = Color3.fromRGB(56, 58, 62),
 	HeaderHover   = Color3.fromRGB(68, 69, 75),
 	Body          = Color3.fromRGB(38, 39, 44),
 	SubBody       = Color3.fromRGB(31, 32, 37),
@@ -46,7 +43,7 @@ local Theme = {
 	Accent        = Color3.fromRGB(31, 90, 166),
 	Text          = Color3.fromRGB(255, 255, 255),
 	SubText       = Color3.fromRGB(170, 171, 178),
-	Divider       = Color3.fromRGB(88, 89, 95),
+	Divider       = Color3.fromRGB(86, 88, 92),
 }
 CW.Theme = Theme
 
@@ -84,6 +81,21 @@ local function fmt(n) return tostring(math.floor(n * 1000 + 0.5) / 1000) end
 
 local function isClick(i)
 	return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch
+end
+
+-- input.Position e AbsolutePosition usam o mesmo espaço de coordenadas.
+local function insideGui(gui, pos)
+	local p, s = gui.AbsolutePosition, gui.AbsoluteSize
+	return pos.X >= p.X and pos.X <= p.X + s.X and pos.Y >= p.Y and pos.Y <= p.Y + s.Y
+end
+
+-- Casas decimais de um passo (0.01 -> 2). Usado para arredondar o valor do slider sem ruído de float.
+local function decimalsOf(step)
+	for d = 0, 6 do
+		local m = 10 ^ d
+		if math.abs(step * m - math.floor(step * m + 0.5)) < 1e-7 then return d end
+	end
+	return 6
 end
 
 --// Resolução de imagens: ID do Roblox ou arquivo da workspace ----------------
@@ -250,6 +262,7 @@ end
 
 function Section:AddSlider(o)
 	local min, max, inc = o.Min or 0, o.Max or 100, o.Increment or 1
+	local scale = 10 ^ math.max(decimalsOf(inc), decimalsOf(min))
 	local value = min
 	local row = self:_row(50)
 	local nameLbl = rowLabel(row, o.Name or "Slider")
@@ -272,7 +285,8 @@ function Section:AddSlider(o)
 
 	local obj = { Instance = row }
 	function obj:Set(v, silent)
-		v = math.clamp(math.floor((v - min) / inc + 0.5) * inc + min, min, max)
+		v = math.floor((v - min) / inc + 0.5) * inc + min
+		v = math.clamp(math.floor(v * scale + 0.5) / scale, min, max) -- sem ruído (0.35 e não 0.35000000000000003)
 		value = v
 		fill.Size = UDim2.fromScale(max == min and 0 or (v - min) / (max - min), 1)
 		valLbl.Text = fmt(v) .. (o.Suffix or "")
@@ -285,13 +299,17 @@ function Section:AddSlider(o)
 		local a = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
 		obj:Set(min + (max - min) * a)
 	end
-	hit.InputBegan:Connect(function(i) if isClick(i) then dragging = true update(i.Position.X) end end)
+	hit.InputBegan:Connect(function(i)
+		if isClick(i) then dragging = true self._window:_lockScroll(true) update(i.Position.X) end
+	end)
 	self._window:_connect(UserInputService.InputChanged, function(i)
 		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
 			update(i.Position.X)
 		end
 	end)
-	self._window:_connect(UserInputService.InputEnded, function(i) if isClick(i) then dragging = false end end)
+	self._window:_connect(UserInputService.InputEnded, function(i)
+		if isClick(i) and dragging then dragging = false self._window:_lockScroll(false) end
+	end)
 
 	obj:Set(o.Default or min, true)
 	return obj
@@ -336,7 +354,9 @@ function Section:AddDropdown(o)
 	local obj = { Instance = row }
 	local function listHeight() return math.min(#options * 28, maxList) end
 	local function height() return 36 + 8 + listHeight() end
+	local popup = { row = row, autoClose = true, isOpen = function() return open end }
 	local function setOpen(v)
+		if v and not open then self._window:_popupOpening(popup) end
 		open = v
 		list.Size = UDim2.new(1, -12, 0, listHeight())
 		tween(row, { Size = UDim2.new(1, 0, 0, open and height() or 36) }, 0.2)
@@ -366,7 +386,297 @@ function Section:AddDropdown(o)
 		if open then setOpen(true) end
 	end
 	head.MouseButton1Click:Connect(function() setOpen(not open) end)
+	popup.close = function() setOpen(false) end
+	self._window:_registerPopup(popup)
 	obj:Refresh(options)
+	return obj
+end
+
+--=============================================================================
+-- Colorpicker  (mesma estrutura do ColorPicker de referência, com o visual do CW)
+--
+--   Section:AddColorpicker({
+--       Name     = "Cor",
+--       Default  = Color3.fromRGB(170, 0, 255),
+--       Callback = function(color) end,     -- Color3; chamado enquanto arrasta ou digita
+--   })
+--   Retorno: :Get() -> Color3    :Set(color3, silent)    :SetOpen(bool)    :IsOpen()
+--
+--   Quadrado: matiz (esquerda -> direita) x saturação (em cima = 100%). Barra: brilho.
+--   Campos:   H 0-359 · S 0-255 · V 0-255 · R G B 0-255 · HEX (com ou sem #).
+--   Reset volta para a cor que estava quando o painel foi aberto; Done fecha o painel.
+--=============================================================================
+function Section:AddColorpicker(o)
+	o = type(o) == "string" and { Name = o } or o or {}
+	local window = self._window
+	local color = typeof(o.Default) == "Color3" and o.Default or Color3.new(1, 1, 1)
+	local h, s, v = color:ToHSV()
+	local startColor = color
+	local open = false
+
+	local HEAD, PANEL_H, SQUARE, BAR_W, FIELDS_X = 36, 128, 128, 16, 168
+	local OPEN_H = HEAD + 8 + PANEL_H + 10
+	local WHITE, BLACK = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
+
+	local row = self:_row(HEAD)
+	row.ClipsDescendants = true
+
+	--// cabeçalho: nome + amostra da cor
+	local head = new("TextButton", { BackgroundTransparency = 1, Text = "", Size = UDim2.new(1, 0, 0, HEAD), Parent = row })
+	rowLabel(head, o.Name or "Color")
+	local swatch = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(38, 18),
+		BackgroundColor3 = color, BorderSizePixel = 0, Parent = head,
+	}, { corner(5), new("UIStroke", { Color = Theme.Divider, Thickness = 1 }) })
+
+	local panel = new("Frame", {
+		Name = "Panel", BackgroundTransparency = 1, Position = UDim2.fromOffset(10, HEAD + 8),
+		Size = UDim2.new(1, -20, 0, PANEL_H), Parent = row,
+	})
+
+	--// quadrado: matiz (X) x saturação (Y). O gradiente de matiz é a cor do próprio quadrado
+	-- e uma camada branca (transparente em cima, opaca embaixo) tira a saturação.
+	local square = new("Frame", {
+		Name = "HueSat", BackgroundColor3 = WHITE, BorderSizePixel = 0, Size = UDim2.fromOffset(SQUARE, SQUARE), Parent = panel,
+	}, { corner(6), new("UIGradient", {
+		Rotation = 0,
+		Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
+			ColorSequenceKeypoint.new(1 / 6, Color3.fromRGB(255, 255, 0)),
+			ColorSequenceKeypoint.new(2 / 6, Color3.fromRGB(0, 255, 0)),
+			ColorSequenceKeypoint.new(3 / 6, Color3.fromRGB(0, 255, 255)),
+			ColorSequenceKeypoint.new(4 / 6, Color3.fromRGB(0, 0, 255)),
+			ColorSequenceKeypoint.new(5 / 6, Color3.fromRGB(255, 0, 255)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0)),
+		}),
+	}) })
+	new("Frame", {
+		Name = "Whiten", BackgroundColor3 = WHITE, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = square,
+	}, { corner(6), new("UIGradient", {
+		Rotation = 90,
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) }),
+	}) })
+	local squareKnob = new("Frame", {
+		Name = "Knob", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(14, 14),
+		BackgroundTransparency = 1, ZIndex = 4, Parent = square,
+	}, { circle(), new("UIStroke", { Color = BLACK, Thickness = 1 }) })
+	new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(10, 10),
+		BackgroundTransparency = 1, ZIndex = 4, Parent = squareKnob,
+	}, { circle(), new("UIStroke", { Color = Theme.Text, Thickness = 2 }) })
+
+	--// barra de brilho: do tom atual (em cima) até o preto (embaixo)
+	local bar = new("Frame", {
+		Name = "Value", Position = UDim2.fromOffset(SQUARE + 8, 0), Size = UDim2.fromOffset(BAR_W, PANEL_H),
+		BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = panel,
+	}, { corner(6), new("UIGradient", { Rotation = 90 }) })
+	local barGradient = bar:FindFirstChildOfClass("UIGradient")
+	local barKnob = new("Frame", {
+		Name = "Knob", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.new(1, 4, 0, 4),
+		BackgroundColor3 = Theme.Text, BorderSizePixel = 0, ZIndex = 2, Parent = bar,
+	}, { corner(2), new("UIStroke", { Color = BLACK, Thickness = 1 }) })
+
+	--// campos numéricos
+	local fields = new("Frame", {
+		Name = "Fields", BackgroundTransparency = 1, Position = UDim2.fromOffset(FIELDS_X, 0),
+		Size = UDim2.new(1, -FIELDS_X, 1, 0), Parent = panel,
+	})
+	local boxes = {}
+
+	local function makeBox(parent, props)
+		props.BackgroundColor3 = Theme.Track
+		props.BorderSizePixel = 0
+		props.ClearTextOnFocus = false
+		props.Text = ""
+		props.TextColor3 = Theme.Text
+		props.TextSize = 13
+		props.Font = Enum.Font.Gotham
+		props.Parent = parent
+		return new("TextBox", props, { corner(5) })
+	end
+
+	local function makeTag(parent, text, width)
+		return new("TextLabel", {
+			BackgroundTransparency = 1, Size = UDim2.new(0, width, 1, 0), Text = text, TextColor3 = Theme.SubText,
+			TextSize = 12, Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left, Parent = parent,
+		})
+	end
+
+	local function field(key, label, col, y)
+		local cell = new("Frame", {
+			BackgroundTransparency = 1, Position = UDim2.new(col / 3, 0, 0, y), Size = UDim2.new(1 / 3, -6, 0, 26), Parent = fields,
+		})
+		makeTag(cell, label, 14)
+		boxes[key] = makeBox(cell, { Name = key, Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -16, 1, 0) })
+	end
+	field("H", "H", 0, 0); field("S", "S", 1, 0); field("V", "V", 2, 0)
+	field("R", "R", 0, 32); field("G", "G", 1, 32); field("B", "B", 2, 32)
+
+	local hexRow = new("Frame", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 64), Size = UDim2.new(1, 0, 0, 26), Parent = fields,
+	})
+	makeTag(hexRow, "HEX", 28)
+	boxes.HEX = makeBox(hexRow, { Name = "HEX", Position = UDim2.fromOffset(30, 0), Size = UDim2.new(1, -(30 + 46), 1, 0) })
+	local preview = new("Frame", {
+		Name = "Preview", AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 0), Size = UDim2.fromOffset(40, 26),
+		BackgroundColor3 = color, BorderSizePixel = 0, Parent = hexRow,
+	}, { corner(5), new("UIStroke", { Color = Theme.Divider, Thickness = 1 }) })
+
+	local buttons = new("Frame", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 96), Size = UDim2.new(1, 0, 0, 26), Parent = fields,
+	})
+	local function makeButton(text, xScale, xOffset, base, hover)
+		local b = new("TextButton", {
+			Position = UDim2.new(xScale, xOffset, 0, 0), Size = UDim2.new(0.5, -3, 1, 0), BackgroundColor3 = base,
+			BorderSizePixel = 0, AutoButtonColor = false, Text = text, TextColor3 = Theme.Text, TextSize = 13,
+			Font = Enum.Font.GothamMedium, Parent = buttons,
+		}, { corner(5) })
+		b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = hover }) end)
+		b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = base }) end)
+		return b
+	end
+	local resetBtn = makeButton("Reset", 0, 0, Theme.Track, Theme.Header)
+	local doneBtn = makeButton("Done", 0.5, 3, Theme.Accent, Color3.fromRGB(41, 108, 190))
+
+	--// estado -> tela
+	local function render(exact)
+		color = exact or Color3.fromHSV(h, s, v)
+		swatch.BackgroundColor3 = color
+		preview.BackgroundColor3 = color
+		barGradient.Color = ColorSequence.new(Color3.fromHSV(h, s, 1), BLACK)
+		squareKnob.Position = UDim2.fromScale(h, 1 - s)
+		barKnob.Position = UDim2.fromScale(0.5, 1 - v)
+
+		local texts = {
+			H = tostring(math.floor(h * 359 + 0.5)),
+			S = tostring(math.floor(s * 255 + 0.5)),
+			V = tostring(math.floor(v * 255 + 0.5)),
+			R = tostring(math.floor(color.R * 255 + 0.5)),
+			G = tostring(math.floor(color.G * 255 + 0.5)),
+			B = tostring(math.floor(color.B * 255 + 0.5)),
+			HEX = color:ToHex():upper(),
+		}
+		for key, text in pairs(texts) do
+			local box = boxes[key]
+			if not box:IsFocused() then box.Text = text end -- não sobrescreve o que está sendo digitado
+		end
+	end
+
+	-- Cinza e preto não têm matiz/saturação próprios: mantém os que já estavam no quadrado.
+	local function fromColor(c)
+		local nh, ns, nv = c:ToHSV()
+		if nv > 0 and ns > 0 then h = nh end
+		if nv > 0 then s = ns end
+		v = nv
+		render(c)
+	end
+
+	local function changed() safeCall(o.Callback, color) end
+
+	local obj = { Instance = row }
+	function obj:Set(c, silent)
+		if typeof(c) ~= "Color3" then return end
+		fromColor(c)
+		if not silent then changed() end
+	end
+	function obj:Get() return color end
+
+	--// arrastar (quadrado e barra). input.Position e AbsolutePosition usam o mesmo espaço de coordenadas.
+	local dragging -- "square", "bar" ou nil
+	local function endDrag()
+		if dragging then
+			dragging = nil
+			window:_lockScroll(false)
+		end
+	end
+	local function updateFrom(pos)
+		if dragging == "square" then
+			local p, size = square.AbsolutePosition, square.AbsoluteSize
+			h = math.clamp((pos.X - p.X) / math.max(size.X, 1), 0, 1)
+			s = 1 - math.clamp((pos.Y - p.Y) / math.max(size.Y, 1), 0, 1)
+		elseif dragging == "bar" then
+			local p, size = bar.AbsolutePosition, bar.AbsoluteSize
+			v = 1 - math.clamp((pos.Y - p.Y) / math.max(size.Y, 1), 0, 1)
+		else
+			return
+		end
+		render()
+		changed()
+	end
+	local function beginDrag(kind, input)
+		if not isClick(input) then return end
+		dragging = kind
+		window:_lockScroll(true)
+		updateFrom(input.Position)
+	end
+	square.InputBegan:Connect(function(i) beginDrag("square", i) end)
+	bar.InputBegan:Connect(function(i) beginDrag("bar", i) end)
+	window:_connect(UserInputService.InputChanged, function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			updateFrom(i.Position)
+		end
+	end)
+	window:_connect(UserInputService.InputEnded, function(i) if isClick(i) then endDrag() end end)
+
+	--// digitar nos campos
+	local function commitHSV(key)
+		local n = tonumber(boxes[key].Text)
+		if not n then render(color) return end -- texto inválido: volta ao valor atual
+		if key == "H" then h = math.clamp(n, 0, 359) / 359
+		elseif key == "S" then s = math.clamp(n, 0, 255) / 255
+		else v = math.clamp(n, 0, 255) / 255 end
+		render()
+		changed()
+	end
+	local function commitRGB(key)
+		local n = tonumber(boxes[key].Text)
+		if not n then render(color) return end
+		n = math.clamp(n, 0, 255) / 255
+		local r, g, b = color.R, color.G, color.B
+		if key == "R" then r = n elseif key == "G" then g = n else b = n end
+		fromColor(Color3.new(r, g, b))
+		changed()
+	end
+	for _, key in ipairs({ "H", "S", "V" }) do
+		boxes[key].FocusLost:Connect(function() commitHSV(key) end)
+	end
+	for _, key in ipairs({ "R", "G", "B" }) do
+		boxes[key].FocusLost:Connect(function() commitRGB(key) end)
+	end
+	boxes.HEX.FocusLost:Connect(function()
+		local text = (boxes.HEX.Text:gsub("%s+", ""))
+		local ok, parsed = pcall(Color3.fromHex, text)
+		if ok and typeof(parsed) == "Color3" then
+			fromColor(parsed)
+			changed()
+		else
+			render(color)
+		end
+	end)
+
+	--// abrir / fechar
+	local popup = { row = row, autoClose = false, isOpen = function() return open end }
+	function obj:SetOpen(state)
+		state = state and true or false
+		if state == open then return end
+		if state then
+			window:_popupOpening(popup)
+			startColor = color
+		else
+			endDrag()
+		end
+		open = state
+		tween(row, { Size = UDim2.new(1, 0, 0, open and OPEN_H or HEAD) }, 0.2)
+	end
+	function obj:IsOpen() return open end
+	popup.close = function() obj:SetOpen(false) end
+	window:_registerPopup(popup)
+
+	head.MouseButton1Click:Connect(function() obj:SetOpen(not open) end)
+	resetBtn.MouseButton1Click:Connect(function() fromColor(startColor) changed() end)
+	doneBtn.MouseButton1Click:Connect(function() obj:SetOpen(false) end)
+
+	render(color)
 	return obj
 end
 
@@ -690,15 +1000,15 @@ function Section:AddGallery(o)
 	build()
 
 	if lazy then
-		task.spawn(function()
-			while not started and container.Parent do
-				if isShown() then
-					started = true
-					for _, e in ipairs(entries) do e.load() end
-					break
-				end
-				task.wait(0.25)
+		-- Um único vigia por janela (em vez de um loop por galeria); devolve true quando não precisa mais.
+		self._window:_registerLazy(function()
+			if started or not container.Parent then return true end
+			if isShown() then
+				started = true
+				for _, e in ipairs(entries) do e.load() end
+				return true
 			end
+			return false
 		end)
 	end
 	return obj
@@ -800,10 +1110,43 @@ function Window:_connect(signal, fn)
 	return c
 end
 
+-- Trava o scroll da aba enquanto um slider/colorpicker é arrastado (no toque, arrastar rolaria a página).
+function Window:_lockScroll(lock)
+	self._scrollLocks = math.max(0, self._scrollLocks + (lock and 1 or -1))
+	local tab = self._selected
+	if tab then tab._page.ScrollingEnabled = self._scrollLocks == 0 end
+end
+
+-- Popups (dropdown, colorpicker): abrir um fecha os outros; os com autoClose fecham ao clicar fora.
+function Window:_registerPopup(p) table.insert(self._popups, p) end
+function Window:_popupOpening(popup)
+	for _, p in ipairs(self._popups) do
+		if p ~= popup and p.isOpen() then pcall(p.close) end
+	end
+end
+
+-- Vigia único de carregamento preguiçoso das galerias.
+function Window:_registerLazy(fn)
+	table.insert(self._lazy, fn)
+	if self._lazyRunning then return end
+	self._lazyRunning = true
+	task.spawn(function()
+		while #self._lazy > 0 and not self._destroyed do
+			for i = #self._lazy, 1, -1 do
+				local ok, done = pcall(self._lazy[i])
+				if not ok or done then table.remove(self._lazy, i) end
+			end
+			if #self._lazy > 0 then task.wait(0.3) end
+		end
+		self._lazyRunning = false
+	end)
+end
+
 function Window:SelectTab(tab)
 	for _, t in ipairs(self._tabs) do
 		local on = (t == tab)
 		t._page.Visible = on
+		t._page.ScrollingEnabled = self._scrollLocks == 0
 		tween(t._btn, { BackgroundTransparency = on and 0 or 1, BackgroundColor3 = Theme.Selected }, 0.18)
 	end
 	self._selected = tab
@@ -857,7 +1200,9 @@ function Window:SetVisible(v) self._shell.Visible = v end
 function Window:Toggle() self._shell.Visible = not self._shell.Visible end
 
 function Window:Destroy()
+	self._destroyed = true
 	for _, c in ipairs(self._conns) do c:Disconnect() end
+	table.clear(self._conns)
 	self._gui:Destroy()
 end
 
@@ -871,10 +1216,15 @@ end
         ToggleKey  = Enum.KeyCode.RightShift,   -- false para desativar
         Size       = UDim2.fromOffset(712, 500),
     })
+
+    O rodapé só aparece se algum botão tiver ícone ou ação; sem nenhum, nem a linha divisória é desenhada.
+    A janela é um Frame comum com cores lisas (nada de CanvasGroup nem de gradiente nos fundos).
 ]]
 function CW:CreateWindow(cfg)
 	cfg = cfg or {}
-	local self = setmetatable({ _tabs = {}, _conns = {} }, Window)
+	local self = setmetatable({
+		_tabs = {}, _conns = {}, _popups = {}, _lazy = {}, _scrollLocks = 0,
+	}, Window)
 
 	local gui = new("ScreenGui", {
 		Name = cfg.Name or "CW_UI", ResetOnSpawn = false, IgnoreGuiInset = true,
@@ -884,30 +1234,46 @@ function CW:CreateWindow(cfg)
 	gui.Parent = (gethui and gethui()) or CoreGui
 	self._gui = gui
 
-	-- Só a interface: sem moldura escura. CanvasGroup faz os filhos respeitarem os cantos arredondados.
-	local window = new("CanvasGroup", {
-		Name = "Window", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-		Size = cfg.Size or UDim2.fromOffset(712, 500), BackgroundColor3 = Theme.ContentTop,
+	local RADIUS, SIDEBAR_W, LOGO_H = 8, 169, 66
+
+	-- Active = true: clicar na janela não "atravessa" para o jogo (não atira).
+	local window = new("Frame", {
+		Name = "Window", Active = true, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = cfg.Size or UDim2.fromOffset(712, 500), BackgroundColor3 = Theme.Content,
 		BorderSizePixel = 0, Parent = gui,
-	}, { corner(8) })
+	}, { corner(RADIUS) })
 	local shell = window
 	self._shell = window
 
 	local content = new("Frame", {
-		Name = "Content", Position = UDim2.fromOffset(169, 0), Size = UDim2.new(1, -169, 1, 0),
-		BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Parent = window,
-	}, { new("UIGradient", { Rotation = 90, Color = ColorSequence.new(Theme.ContentTop, Theme.ContentBottom) }) })
+		Name = "Content", BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.fromOffset(SIDEBAR_W, 0), Size = UDim2.new(1, -SIDEBAR_W, 1, 0), Parent = window,
+	})
 	self._content = content
 
+	-- Barra lateral: cantos arredondados só à esquerda (o lado direito é "quadrado" por uma faixa da mesma cor).
 	local sidebar = new("Frame", {
-		Name = "Sidebar", Size = UDim2.new(0, 169, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1),
+		Name = "Sidebar", Size = UDim2.new(0, SIDEBAR_W, 1, 0), BackgroundColor3 = Theme.Sidebar,
 		BorderSizePixel = 0, Parent = window,
-	}, { new("UIGradient", { Rotation = 90, Color = ColorSequence.new(Theme.SidebarTop, Theme.SidebarBottom) }) })
+	}, { corner(RADIUS) })
+	new("Frame", {
+		Name = "SquareRight", Position = UDim2.new(1, -RADIUS * 2, 0, 0), Size = UDim2.new(0, RADIUS * 2, 1, 0),
+		BackgroundColor3 = Theme.Sidebar, BorderSizePixel = 0, Parent = sidebar,
+	})
 
+	-- Faixa do logo: só o canto superior esquerdo é arredondado.
 	local logo = new("Frame", {
-		Name = "Logo", Size = UDim2.new(1, 0, 0, 66), BackgroundColor3 = Color3.new(1, 1, 1),
+		Name = "Logo", Size = UDim2.new(1, 0, 0, LOGO_H), BackgroundColor3 = Theme.Logo,
 		BorderSizePixel = 0, Parent = sidebar,
-	}, { new("UIGradient", { Rotation = 90, Color = ColorSequence.new(Theme.LogoTop, Theme.LogoBottom) }) })
+	}, { corner(RADIUS) })
+	new("Frame", {
+		Name = "SquareBottom", Position = UDim2.new(0, 0, 1, -RADIUS * 2), Size = UDim2.new(1, 0, 0, RADIUS * 2),
+		BackgroundColor3 = Theme.Logo, BorderSizePixel = 0, Parent = logo,
+	})
+	new("Frame", {
+		Name = "SquareRight", Position = UDim2.new(1, -RADIUS * 2, 0, 0), Size = UDim2.new(0, RADIUS * 2, 1, 0),
+		BackgroundColor3 = Theme.Logo, BorderSizePixel = 0, Parent = logo,
+	})
 
 	local logoAsset = resolveAsset(cfg.Logo)
 	if logoAsset then
@@ -922,37 +1288,57 @@ function CW:CreateWindow(cfg)
 		})
 	end
 
+	-- Rodapé: só os botões que têm ícone ou ação.
+	local footerIcons = cfg.Icons or {}
+	local footer = {}
+	if footerIcons.Settings or cfg.OnSettings then
+		table.insert(footer, { icon = footerIcons.Settings, glyph = "S", cb = cfg.OnSettings })
+	end
+	if footerIcons.Discord or cfg.Discord or cfg.OnDiscord then
+		table.insert(footer, { icon = footerIcons.Discord, glyph = "D", cb = function()
+			if cfg.Discord and setclipboard then pcall(setclipboard, cfg.Discord) end
+			safeCall(cfg.OnDiscord, cfg.Discord)
+		end })
+	end
+	if footerIcons.Info or cfg.OnInfo then
+		table.insert(footer, { icon = footerIcons.Info, glyph = "i", cb = cfg.OnInfo })
+	end
+	local hasFooter = #footer > 0
+
 	self._tabList = new("ScrollingFrame", {
-		Name = "Tabs", BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 66),
-		Size = UDim2.new(1, 0, 1, -140), CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-		ScrollBarThickness = 0, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = sidebar,
+		Name = "Tabs", BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(0, LOGO_H),
+		Size = UDim2.new(1, 0, 1, -(LOGO_H + (hasFooter and 74 or 8))), CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 0,
+		ScrollingDirection = Enum.ScrollingDirection.Y, Parent = sidebar,
 	}, {
 		new("UIListLayout", { Padding = UDim.new(0, 2.5), SortOrder = Enum.SortOrder.LayoutOrder }),
 		new("UIPadding", { PaddingTop = UDim.new(0, 4) }),
 	})
 
-	new("Frame", {
-		Position = UDim2.new(0, 12, 1, -76), Size = UDim2.new(1, -24, 0, 1),
-		BackgroundColor3 = Theme.Divider, BackgroundTransparency = 0.3, BorderSizePixel = 0, Parent = sidebar,
-	})
-	local footerIcons = cfg.Icons or {}
-	local function footerButton(x, icon, cb)
-		local b = new("TextButton", {
-			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, x, 1, -41.5), Size = UDim2.fromOffset(36, 36),
-			BackgroundColor3 = Theme.Text, BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = sidebar,
-		}, { circle(), new("UIStroke", { Color = Theme.Text, Thickness = 1.6 }) })
-		makeIcon(b, icon, 20, UDim2.fromScale(0.5, 0.5))
-		b.MouseEnter:Connect(function() tween(b, { BackgroundTransparency = 0.85 }) end)
-		b.MouseLeave:Connect(function() tween(b, { BackgroundTransparency = 1 }) end)
-		b.MouseButton1Click:Connect(function() safeCall(cb) end)
-		return b
+	if hasFooter then
+		new("Frame", {
+			Name = "Divider", Position = UDim2.new(0, 12, 1, -76), Size = UDim2.new(1, -24, 0, 1),
+			BackgroundColor3 = Theme.Divider, BorderSizePixel = 0, Parent = sidebar,
+		})
+		for index, item in ipairs(footer) do
+			local x = (index - (#footer + 1) / 2) * 50
+			local b = new("TextButton", {
+				AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, x, 1, -41.5), Size = UDim2.fromOffset(36, 36),
+				BackgroundColor3 = Theme.Text, BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = sidebar,
+			}, { circle(), new("UIStroke", { Color = Theme.Text, Thickness = 1.6 }) })
+			if item.icon then
+				makeIcon(b, item.icon, 20, UDim2.fromScale(0.5, 0.5))
+			else
+				b.Text = item.glyph
+				b.TextColor3 = Theme.Text
+				b.TextSize = 16
+				b.Font = Enum.Font.GothamBold
+			end
+			b.MouseEnter:Connect(function() tween(b, { BackgroundTransparency = 0.85 }) end)
+			b.MouseLeave:Connect(function() tween(b, { BackgroundTransparency = 1 }) end)
+			b.MouseButton1Click:Connect(function() safeCall(item.cb) end)
+		end
 	end
-	footerButton(-50, footerIcons.Settings, cfg.OnSettings)
-	footerButton(0, footerIcons.Discord, function()
-		if cfg.Discord and setclipboard then pcall(setclipboard, cfg.Discord) end
-		safeCall(cfg.OnDiscord, cfg.Discord)
-	end)
-	footerButton(50, footerIcons.Info, cfg.OnInfo)
 
 	-- arrastar pelo logo
 	local dragging, dragStart, startPos
@@ -966,6 +1352,14 @@ function CW:CreateWindow(cfg)
 		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
 			local d = i.Position - dragStart
 			shell.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+
+	-- clique fora de um dropdown aberto fecha ele
+	self:_connect(UserInputService.InputBegan, function(i)
+		if not isClick(i) then return end
+		for _, p in ipairs(self._popups) do
+			if p.autoClose and p.isOpen() and not insideGui(p.row, i.Position) then pcall(p.close) end
 		end
 	end)
 
