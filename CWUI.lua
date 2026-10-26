@@ -478,6 +478,9 @@ function Section:AddColorpicker(o)
 	local HEAD, PANEL_H, SQUARE, BAR_W, FIELDS_X = 36, 128, 128, 16, 168
 	local OPEN_H = HEAD + 8 + PANEL_H + 10
 	local WHITE, BLACK = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
+	-- Imagens enviadas ao Roblox (create.roblox.com): quadrado matiz x saturação (256x256) e barra de brilho (32x256).
+	local PALETTE_IMAGE = "rbxassetid://117078306072896"
+	local VALUE_IMAGE   = "rbxassetid://124282613421852"
 
 	local row = self:_row(HEAD)
 	row.ClipsDescendants = true
@@ -495,28 +498,12 @@ function Section:AddColorpicker(o)
 		Size = UDim2.new(1, -20, 0, PANEL_H), Parent = row,
 	})
 
-	--// quadrado: matiz (X) x saturação (Y). O gradiente de matiz é a cor do próprio quadrado
-	-- e uma camada branca (transparente em cima, opaca embaixo) tira a saturação.
-	local square = new("Frame", {
-		Name = "HueSat", BackgroundColor3 = WHITE, BorderSizePixel = 0, Size = UDim2.fromOffset(SQUARE, SQUARE), Parent = panel,
-	}, { corner(6), new("UIGradient", {
-		Rotation = 0,
-		Color = ColorSequence.new({
-			ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
-			ColorSequenceKeypoint.new(1 / 6, Color3.fromRGB(255, 255, 0)),
-			ColorSequenceKeypoint.new(2 / 6, Color3.fromRGB(0, 255, 0)),
-			ColorSequenceKeypoint.new(3 / 6, Color3.fromRGB(0, 255, 255)),
-			ColorSequenceKeypoint.new(4 / 6, Color3.fromRGB(0, 0, 255)),
-			ColorSequenceKeypoint.new(5 / 6, Color3.fromRGB(255, 0, 255)),
-			ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0)),
-		}),
-	}) })
-	new("Frame", {
-		Name = "Whiten", BackgroundColor3 = WHITE, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = square,
-	}, { corner(6), new("UIGradient", {
-		Rotation = 90,
-		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) }),
-	}) })
+	--// quadrado: matiz (X) x saturação (Y), desenhado pela imagem PALETTE_IMAGE (matiz da esquerda para a
+	-- direita, saturação 100% em cima até branco embaixo). Não é mais gerado por UIGradient.
+	local square = new("ImageLabel", {
+		Name = "HueSat", BackgroundTransparency = 1, BorderSizePixel = 0, Image = PALETTE_IMAGE,
+		ScaleType = Enum.ScaleType.Stretch, Size = UDim2.fromOffset(SQUARE, SQUARE), Parent = panel,
+	}, { corner(6) })
 	local squareKnob = new("Frame", {
 		Name = "Knob", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(14, 14),
 		BackgroundTransparency = 1, ZIndex = 4, Parent = square,
@@ -531,12 +518,13 @@ function Section:AddColorpicker(o)
 		Size = UDim2.fromScale(1, 1), ZIndex = 5, Parent = square,
 	})
 
-	--// barra de brilho: do tom atual (em cima) até o preto (embaixo)
-	local bar = new("Frame", {
+	--// barra de brilho: a imagem VALUE_IMAGE é cinza (branco em cima, preto embaixo); o ImageColor3 a pinta
+	-- com o tom atual, então fica do tom atual (em cima) até o preto (embaixo).
+	local bar = new("ImageLabel", {
 		Name = "Value", Position = UDim2.fromOffset(SQUARE + 8, 0), Size = UDim2.fromOffset(BAR_W, PANEL_H),
-		BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = panel,
-	}, { corner(6), new("UIGradient", { Rotation = 90 }) })
-	local barGradient = bar:FindFirstChildOfClass("UIGradient")
+		BackgroundTransparency = 1, BorderSizePixel = 0, Image = VALUE_IMAGE, ImageColor3 = WHITE,
+		ScaleType = Enum.ScaleType.Stretch, Parent = panel,
+	}, { corner(6) })
 	local barKnob = new("Frame", {
 		Name = "Knob", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.new(1, 4, 0, 4),
 		BackgroundColor3 = Theme.Text, BorderSizePixel = 0, ZIndex = 2, Parent = bar,
@@ -620,7 +608,7 @@ function Section:AddColorpicker(o)
 		color = exact or Color3.fromHSV(h, s, v)
 		swatch.BackgroundColor3 = color
 		preview.BackgroundColor3 = color
-		barGradient.Color = ColorSequence.new(Color3.fromHSV(h, s, 1), BLACK)
+		bar.ImageColor3 = Color3.fromHSV(h, s, 1)
 		squareKnob.Position = UDim2.fromScale(h, 1 - s)
 		barKnob.Position = UDim2.fromScale(0.5, 1 - v)
 
