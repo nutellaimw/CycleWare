@@ -2869,6 +2869,14 @@ local function wrapSection(section)
 		o.Callback = withSave(o.Callback)
 		return section:AddDropdown(o)
 	end
+	-- Color picker (CWUI 2.2+). Returns nil when the loaded CWUI has no picker, so the caller can
+	-- fall back to something else (an old copy of CWUI.lua may still be cached on disk).
+	function adapter:Colorpicker(control)
+		if type(section.AddColorpicker) ~= "function" then return nil end
+		local o = mapControlOptions(control)
+		o.Callback = withSave(o.Callback)
+		return section:AddColorpicker(o)
+	end
 	function adapter:Gallery(control)
 		local o = {}
 		for key, value in pairs(control) do o[key] = value end
@@ -3170,6 +3178,20 @@ local function applyWeaponSound(sound, targetId, tool, player, container)
 	setScaledVolume(sound, data)
 end
 
+-- Engine asset id of an override file (cached in weaponAssetIds), or nil when the file is
+-- missing or cannot be loaded. Shared by the tool hook and the background pre-load below.
+local function resolveWeaponAsset(relativePath)
+	local cached = weaponAssetIds[relativePath]
+	if cached then return cached end
+	local filePath = CW.Paths.LIBRARY_ROOT .. "/" .. relativePath
+	local okFile, exists = pcall(isfile, filePath)
+	if not (okFile and exists) then return nil end
+	local loaded, assetId = pcall(CW.Library.audioAsset, filePath)
+	if not loaded or type(assetId) ~= "string" then return nil end
+	weaponAssetIds[relativePath] = assetId
+	return assetId
+end
+
 local function applyWeaponSoundToTool(tool, player, container)
 	if not tool:IsA("Tool") then return end
 	if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
@@ -3177,15 +3199,8 @@ local function applyWeaponSoundToTool(tool, player, container)
 
 	local relativePath = weaponSoundOverrides[tool.Name]
 	if type(relativePath) ~= "string" then return end
-	local targetId = weaponAssetIds[relativePath]
-	if not targetId then
-		local filePath = CW.Paths.LIBRARY_ROOT .. "/" .. relativePath
-		if not isfile(filePath) then return end
-		local loaded, assetId = pcall(CW.Library.audioAsset, filePath)
-		if not loaded or type(assetId) ~= "string" then return end
-		weaponAssetIds[relativePath] = assetId
-		targetId = assetId
-	end
+	local targetId = resolveWeaponAsset(relativePath)
+	if not targetId then return end
 	for _, descendant in ipairs(tool:GetDescendants()) do
 		if descendant:IsA("Sound") and descendant.Name == "ShootSound" then
 			applyWeaponSound(descendant, targetId, tool, player, container)
@@ -3270,22 +3285,29 @@ local function watchWeaponSoundPlayer(player)
 end
 
 local function refreshWeaponShootSoundOverrides()
-	-- Resolve os arquivos escolhidos em segundo plano (depois do refresh): o primeiro tiro já sai com o som trocado.
-	task.defer(function()
-		if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
-		for _, overrides in pairs(overridesBySound) do
-			for _, relative in pairs(overrides) do
-				if type(relative) == "string" then pcall(overrideAsset, relative) end
-			end
-		end
-	end)
 	stopWeaponShootSoundOverrides()
 	if not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
+	local generation = weaponSoundRefreshGeneration -- taken after the stop: a newer refresh cancels this one
 	for _, player in ipairs(Players:GetPlayers()) do
 		watchWeaponSoundPlayer(player)
 	end
 	table.insert(weaponSoundGlobalConnections, Players.PlayerAdded:Connect(watchWeaponSoundPlayer))
 	table.insert(weaponSoundGlobalConnections, Players.PlayerRemoving:Connect(removeWeaponSoundPlayer))
+
+	-- Resolve the chosen files in the background, so the first shot of a weapon that is not in
+	-- hand yet already plays the replaced sound. (The old version of this block looped over
+	-- tables that never existed, which raised "invalid argument #1 to 'pairs'" on every refresh.)
+	task.defer(function()
+		-- Snapshot first: resolving can yield, and the player may change a dropdown meanwhile.
+		local pending = {}
+		for _, relative in pairs(weaponSoundOverrides) do
+			if type(relative) == "string" then table.insert(pending, relative) end
+		end
+		for _, relative in ipairs(pending) do
+			if generation ~= weaponSoundRefreshGeneration or not CW.Settings.WEAPON_SOUND_OVERRIDE_ENABLED then return end
+			pcall(resolveWeaponAsset, relative)
+		end
+	end)
 end
 
 local function scheduleWeaponShootSoundRefresh()
@@ -3400,19 +3422,35 @@ guarded("Effects", function()
 		White = Color3.fromRGB(255, 255, 255),
 	}
 
+	-- Only used by the palette dropdown, which is the fallback when the loaded CWUI has no color picker.
 	local function colorName(color)
 		for name, paletteColor in pairs(tracerPalette) do
 			if color == paletteColor then return name end
 		end
 		return "Violet"
 	end
-	CW.State.tracerColorName = colorName
 
-	-- Colors are userdata and can't be serialised: they are saved by palette name.
-	local savedColor = tracerPalette[CW.Settings.TRACER_COLOR_NAME]
-	if savedColor then CW.Settings.TRACER_COLOR = savedColor end
-	local savedGlow = tracerPalette[CW.Settings.TRACER_GLOW_COLOR_NAME]
-	if savedGlow then CW.Settings.TRACER_GLOW_COLOR = savedGlow end
+	-- Colors are userdata and can't be serialised: they are saved as hex strings (TRACER_COLOR_HEX,
+	-- TRACER_GLOW_COLOR_HEX). Files written by the old palette dropdown stored a palette name
+	-- (TRACER_COLOR_NAME): it is still understood, and the next save replaces it with hex.
+	local function colorFromHex(hex)
+		if type(hex) ~= "string" then return nil end
+		local ok, color = pcall(Color3.fromHex, hex)
+		if ok and typeof(color) == "Color3" then return color end
+		return nil
+	end
+	for _, entry in ipairs({
+		{ "TRACER_COLOR", "TRACER_COLOR_HEX", "TRACER_COLOR_NAME" },
+		{ "TRACER_GLOW_COLOR", "TRACER_GLOW_COLOR_HEX", "TRACER_GLOW_COLOR_NAME" },
+	}) do
+		local settingKey, hexKey, nameKey = entry[1], entry[2], entry[3]
+		CW.Settings[settingKey] = colorFromHex(CW.Settings[hexKey])
+			or tracerPalette[CW.Settings[nameKey]]
+			or CW.Settings[settingKey]
+		-- The saved values are consumed here. If they stayed in CW.Settings, the generic save loop would
+		-- write them back even after the player picks another color (or goes back to the default).
+		CW.Settings[hexKey], CW.Settings[nameKey] = nil, nil
+	end
 
 	EffectsTab:Toggle({
 		Title = "Custom Bullet Tracers",
@@ -3420,23 +3458,28 @@ guarded("Effects", function()
 		Callback = function(s) CW.Settings.CUSTOM_BULLET_TRACERS = s end,
 	})
 
-	EffectsTab:Dropdown({
-		Title = "Tracer Color",
-		Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
-		Default = colorName(CW.Settings.TRACER_COLOR),
-		Callback = function(name)
-			CW.Settings.TRACER_COLOR = tracerPalette[name]
-		end,
-	})
+	local function addTracerColor(title, settingKey)
+		local picker = EffectsTab:Colorpicker({
+			Title = title,
+			Default = CW.Settings[settingKey],
+			Callback = function(color)
+				CW.Settings[settingKey] = color
+			end,
+		})
+		if picker then return end
 
-	EffectsTab:Dropdown({
-		Title = "Glow Color",
-		Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
-		Default = colorName(CW.Settings.TRACER_GLOW_COLOR),
-		Callback = function(name)
-			CW.Settings.TRACER_GLOW_COLOR = tracerPalette[name]
-		end,
-	})
+		-- No color picker in the loaded CWUI: keep the old palette dropdown.
+		EffectsTab:Dropdown({
+			Title = title,
+			Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
+			Default = colorName(CW.Settings[settingKey]),
+			Callback = function(name)
+				CW.Settings[settingKey] = tracerPalette[name]
+			end,
+		})
+	end
+	addTracerColor("Tracer Color", "TRACER_COLOR")
+	addTracerColor("Glow Color", "TRACER_GLOW_COLOR")
 
 	EffectsTab:Slider({
 		Title = "Tracer Width",
@@ -3981,17 +4024,15 @@ guarded("Settings", function()
 			end
 		end
 
-		-- Tracer colors are Color3 (not serialisable): store the palette name, only when changed.
-		local nameOf = CW.State.tracerColorName
-		if nameOf then
-			local color, glow = nameOf(CW.Settings.TRACER_COLOR), nameOf(CW.Settings.TRACER_GLOW_COLOR)
-			if CW.Defaults.TRACER_COLOR == nil or color ~= nameOf(CW.Defaults.TRACER_COLOR) then
-				savedSettings.TRACER_COLOR_NAME = color
-			end
-			if CW.Defaults.TRACER_GLOW_COLOR == nil or glow ~= nameOf(CW.Defaults.TRACER_GLOW_COLOR) then
-				savedSettings.TRACER_GLOW_COLOR_NAME = glow
+		-- Tracer colors are Color3 (not serialisable): store them as hex, only when different from the default.
+		local function saveColor(settingKey, hexKey)
+			local color, default = CW.Settings[settingKey], CW.Defaults[settingKey]
+			if typeof(color) == "Color3" and (typeof(default) ~= "Color3" or color:ToHex() ~= default:ToHex()) then
+				savedSettings[hexKey] = color:ToHex()
 			end
 		end
+		saveColor("TRACER_COLOR", "TRACER_COLOR_HEX")
+		saveColor("TRACER_GLOW_COLOR", "TRACER_GLOW_COLOR_HEX")
 
 		local out = {
 			schemaVersion = 3,
