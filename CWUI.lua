@@ -23,9 +23,6 @@ local cloneref = cloneref or function(x) return x end
 local TweenService     = cloneref(game:GetService("TweenService"))
 local UserInputService = cloneref(game:GetService("UserInputService"))
 local CoreGui          = cloneref(game:GetService("CoreGui"))
-local GuiService       = cloneref(game:GetService("GuiService"))   -- conta-gotas do Colorpicker
-local RunService       = cloneref(game:GetService("RunService"))   -- conta-gotas do Colorpicker
-local Workspace        = cloneref(game:GetService("Workspace"))    -- conta-gotas do Colorpicker
 local Players          = cloneref(game:GetService("Players"))
 
 --// Tema ---------------------------------------------------------------------
@@ -91,15 +88,6 @@ end
 local function insideGui(gui, pos)
 	local p, s = gui.AbsolutePosition, gui.AbsoluteSize
 	return pos.X >= p.X and pos.X <= p.X + s.X and pos.Y >= p.Y and pos.Y <= p.Y + s.Y
-end
-
--- Falso se o objeto, ou qualquer ancestral até o ScreenGui, está invisível (aba trocada, janela escondida, seção fechada).
-local function isGuiShown(inst)
-	while inst and not inst:IsA("LayerCollector") do
-		if inst:IsA("GuiObject") and not inst.Visible then return false end
-		inst = inst.Parent
-	end
-	return inst ~= nil
 end
 
 -- Casas decimais de um passo (0.01 -> 2). Usado para arredondar o valor do slider sem ruído de float.
@@ -411,72 +399,30 @@ end
 --   Section:AddColorpicker({
 --       Name     = "Cor",
 --       Default  = Color3.fromRGB(170, 0, 255),
---       Callback = function(color) end,        -- Color3; chamado ao arrastar, digitar ou usar o conta-gotas
+--       Callback = function(color) end,        -- Color3; chamado na hora, a cada mudança (arrastar ou digitar)
 --       OnOpen   = function() end,             -- (opcional) painel aberto
---       OnClose  = function(canceled) end,     -- (opcional) painel fechado; canceled = true no botão Cancel
+--       OnClose  = function() end,             -- (opcional) painel fechado
 --   })
 --   Retorno: :Get() / :GetColor() -> Color3      :Set(color3, silent) / :SetColor(color3, silent)
---            :Start() / :SetOpen(bool)           :Cancel()      :IsOpen()      :Destroy()
+--            :Start() / :SetOpen(bool)           :IsOpen()      :Destroy()
 --
+--   Sem botões: a cor é aplicada assim que muda. O painel abre e fecha clicando no cabeçalho (ou ao abrir outro).
 --   Quadrado: matiz (esquerda -> direita) x saturação (em cima = 100%).  Barra: brilho (em cima = 100%).
---   Campos:   H 0-359 · S 0-255 · V 0-255 · R G B 0-255 · HEX (com ou sem #, 3 ou 6 dígitos).
---   Pick:     conta-gotas. Move o mouse sobre a tela: pega a cor do elemento de interface do jogo ou da peça do
---             mundo sob o cursor. Clique confirma; botão direito ou Esc cancela e volta para a cor anterior.
---   Cancel:   volta para a cor que estava quando o painel abriu e fecha.
---   OK:       fecha mantendo a cor (clicar no cabeçalho ou abrir outro painel também mantém).
+--   Campos:   H 0-359 · S 0-255 · V 0-255 · R G B 0-255 · HEX (com ou sem #, 3 ou 6 dígitos) + amostra da cor.
 --=============================================================================
-
--- Cor sob o cursor: primeiro a interface do jogo (PlayerGui), depois a peça do mundo. nil = nada útil ali.
-local function sampleGuiColor(pos)
-	local player = Players.LocalPlayer -- lido na hora: pode não existir quando a biblioteca é carregada
-	local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
-	if not playerGui then return nil end
-	local inset = GuiService:GetGuiInset()
-	local ok, objects = pcall(function()
-		return playerGui:GetGuiObjectsAtPosition(pos.X - inset.X, pos.Y - inset.Y)
-	end)
-	if not ok or type(objects) ~= "table" then return nil end
-	for _, gui in ipairs(objects) do -- do mais de cima para o mais de baixo
-		if gui.BackgroundTransparency < 0.95 then return gui.BackgroundColor3 end
-	end
-	return nil
-end
-
-local function sampleWorldColor(pos)
-	local camera = Workspace.CurrentCamera
-	if not camera then return nil end
-	local ray = camera:ViewportPointToRay(pos.X, pos.Y) -- GetMouseLocation já está no espaço da viewport
-	local ignore = {}
-	local player = Players.LocalPlayer
-	local character = player and player.Character
-	if character then ignore[1] = character end
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	for _ = 1, 8 do -- atravessa peças (quase) invisíveis
-		params.FilterDescendantsInstances = ignore
-		local result = Workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
-		if not result then return nil end
-		local inst = result.Instance
-		if inst:IsA("Terrain") then
-			local ok, c = pcall(function() return Workspace.Terrain:GetMaterialColor(result.Material) end)
-			return ok and c or nil
-		end
-		if inst:IsA("BasePart") and inst.Transparency < 0.95 then return inst.Color end
-		ignore[#ignore + 1] = inst
-	end
-	return nil
-end
 
 function Section:AddColorpicker(o)
 	o = type(o) == "string" and { Name = o } or o or {}
 	local window = self._window
 	local color = typeof(o.Default) == "Color3" and o.Default or Color3.new(1, 1, 1)
 	local h, s, v = color:ToHSV()
-	local startColor = color -- cor de quando o painel abriu (para onde o Cancel volta)
 	local open, destroyed = false, false
 
 	local HEAD, PANEL_H, SQUARE, BAR_W, FIELDS_X = 36, 128, 128, 16, 168
 	local OPEN_H = HEAD + 8 + PANEL_H + 10
+	-- três linhas de campos (26px) espalhadas por toda a altura do painel, alinhadas com o quadrado
+	local ROW2 = math.floor((PANEL_H - 26) / 2)
+	local ROW3 = PANEL_H - 26
 	local WHITE, BLACK = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
 	-- Imagens enviadas ao Roblox (create.roblox.com): quadrado matiz x saturação (256x256) e barra de brilho (32x256).
 	local PALETTE_IMAGE = "rbxassetid://117078306072896"
@@ -574,10 +520,10 @@ function Section:AddColorpicker(o)
 		boxes[key] = makeBox(cell, { Name = key, Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -16, 1, 0) })
 	end
 	field("H", "H", 0, 0); field("S", "S", 1, 0); field("V", "V", 2, 0)
-	field("R", "R", 0, 32); field("G", "G", 1, 32); field("B", "B", 2, 32)
+	field("R", "R", 0, ROW2); field("G", "G", 1, ROW2); field("B", "B", 2, ROW2)
 
 	local hexRow = new("Frame", {
-		BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 64), Size = UDim2.new(1, 0, 0, 26), Parent = fields,
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(0, ROW3), Size = UDim2.new(1, 0, 0, 26), Parent = fields,
 	})
 	makeTag(hexRow, "HEX", 28)
 	boxes.HEX = makeBox(hexRow, { Name = "HEX", Position = UDim2.fromOffset(30, 0), Size = UDim2.new(1, -(30 + 46), 1, 0) })
@@ -585,23 +531,6 @@ function Section:AddColorpicker(o)
 		Name = "Preview", AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 0), Size = UDim2.fromOffset(40, 26),
 		BackgroundColor3 = color, BorderSizePixel = 0, Parent = hexRow,
 	}, { corner(5), new("UIStroke", { Color = Theme.Divider, Thickness = 1 }) })
-
-	local buttons = new("Frame", {
-		BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 96), Size = UDim2.new(1, 0, 0, 26), Parent = fields,
-	})
-	local function makeButton(text, index, base, hover)
-		local b = new("TextButton", {
-			Position = UDim2.new((index - 1) / 3, (index - 1) * 2, 0, 0), Size = UDim2.new(1 / 3, -4, 1, 0),
-			BackgroundColor3 = base, BorderSizePixel = 0, AutoButtonColor = false, Text = text, TextColor3 = Theme.Text,
-			TextSize = 13, Font = Enum.Font.GothamMedium, Parent = buttons,
-		}, { corner(5) })
-		b.MouseEnter:Connect(function() tween(b, { BackgroundColor3 = hover }) end)
-		b.MouseLeave:Connect(function() tween(b, { BackgroundColor3 = base }) end)
-		return b
-	end
-	local pickBtn = makeButton("Pick", 1, Theme.Track, Theme.Header)
-	local cancelBtn = makeButton("Cancel", 2, Theme.Track, Theme.Header)
-	local okBtn = makeButton("OK", 3, Theme.Accent, Color3.fromRGB(41, 108, 190))
 
 	--// estado -> tela
 	local function render(exact)
@@ -718,104 +647,19 @@ function Section:AddColorpicker(o)
 		end
 	end)
 
-	--// conta-gotas
-	-- Uma camada transparente cobre a tela inteira enquanto ele está ativo: o clique de confirmar não chega
-	-- ao jogo (não atira) nem aos controles da janela. A cor é lida a cada frame sob o cursor.
-	local eyeActive, eyeStart, eyeConn, eyeOverlay, eyeTip = false, color, nil, nil, nil
-
-	local function endEyedrop(restore)
-		if not eyeActive then return end
-		eyeActive = false
-		if eyeConn then eyeConn:Disconnect() eyeConn = nil end
-		if eyeOverlay then eyeOverlay:Destroy() eyeOverlay, eyeTip = nil, nil end
-		pickBtn.Text = "Pick"
-		tween(pickBtn, { BackgroundColor3 = Theme.Track })
-		if restore then
-			fromColor(eyeStart)
-			changed()
-		end
-	end
-
-	local function eyeSample()
-		local pos = UserInputService:GetMouseLocation()
-		local c = sampleGuiColor(pos) or sampleWorldColor(pos)
-		if c and c ~= color then
-			fromColor(c)
-			changed()
-		end
-		return pos
-	end
-
-	local function startEyedrop()
-		if eyeActive or destroyed then return end
-		eyeActive, eyeStart = true, color
-		pickBtn.Text = "Picking..."
-		tween(pickBtn, { BackgroundColor3 = Theme.Accent })
-
-		eyeOverlay = new("TextButton", {
-			Name = "EyedropperOverlay", BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
-			Size = UDim2.fromScale(1, 1), ZIndex = 50, Parent = window._gui,
-		})
-		eyeTip = new("TextLabel", {
-			BackgroundColor3 = Theme.Track, BorderSizePixel = 0, AutomaticSize = Enum.AutomaticSize.XY,
-			Size = UDim2.fromOffset(0, 0), Text = "Click to pick  ·  Right-click / Esc to cancel",
-			TextColor3 = Theme.Text, TextSize = 12, Font = Enum.Font.GothamMedium, ZIndex = 51, Parent = eyeOverlay,
-		}, {
-			corner(5),
-			new("UIPadding", {
-				PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
-				PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5),
-			}),
-			new("UIStroke", { Color = Theme.Divider, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }),
-		})
-
-		eyeOverlay.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton2 then
-				endEyedrop(true)
-			elseif isClick(input) then
-				eyeSample() -- cor exata no momento do clique
-				endEyedrop(false)
-			end
-		end)
-
-		eyeConn = RunService.RenderStepped:Connect(function()
-			if destroyed or window._destroyed or not row.Parent or not isGuiShown(row)
-				or UserInputService:IsKeyDown(Enum.KeyCode.Escape) then
-				endEyedrop(true)
-				return
-			end
-			local pos = eyeSample()
-			if eyeTip then
-				local camera = Workspace.CurrentCamera
-				local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
-				local size = eyeTip.AbsoluteSize
-				local x, y = pos.X + 18, pos.Y + 20
-				if x + size.X > viewport.X then x = pos.X - 18 - size.X end
-				if y + size.Y > viewport.Y then y = pos.Y - 20 - size.Y end
-				eyeTip.Position = UDim2.fromOffset(x, y)
-			end
-		end)
-	end
-
 	--// abrir / fechar
 	local popup = { row = row, autoClose = false, isOpen = function() return open end }
-	local function setOpen(state, canceled)
+	local function setOpen(state)
 		state = state and true or false
 		if state == open or destroyed then return end
 		if state then
 			window:_popupOpening(popup)
-			startColor = color
 		else
-			endEyedrop(true)
 			endDrag()
-			if canceled then
-				fromColor(startColor)
-				changed()
-			end
 		end
 		open = state
 		tween(row, { Size = UDim2.new(1, 0, 0, open and OPEN_H or HEAD) }, 0.2)
-		if state then safeCall(o.OnOpen) else safeCall(o.OnClose, canceled == true) end
+		if state then safeCall(o.OnOpen) else safeCall(o.OnClose) end
 	end
 	popup.close = function() setOpen(false) end
 	window:_registerPopup(popup)
@@ -828,23 +672,18 @@ function Section:AddColorpicker(o)
 		if not silent then changed() end
 	end
 	obj.GetColor, obj.SetColor = obj.Get, obj.Set
-	function obj:SetOpen(state) setOpen(state, false) end
+	function obj:SetOpen(state) setOpen(state) end
 	function obj:IsOpen() return open end
-	function obj:Start() setOpen(true, false) end
-	function obj:Cancel() setOpen(false, true) end
+	function obj:Start() setOpen(true) end
 	function obj:Destroy()
 		if destroyed then return end
-		endEyedrop(false)
 		endDrag()
 		destroyed = true
 		window:_unregisterPopup(popup)
 		row:Destroy()
 	end
 
-	head.MouseButton1Click:Connect(function() setOpen(not open, false) end)
-	pickBtn.MouseButton1Click:Connect(startEyedrop)
-	cancelBtn.MouseButton1Click:Connect(function() setOpen(false, true) end)
-	okBtn.MouseButton1Click:Connect(function() setOpen(false, false) end)
+	head.MouseButton1Click:Connect(function() setOpen(not open) end)
 
 	render(color)
 	return obj
