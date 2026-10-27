@@ -5,6 +5,7 @@ Run from the repository root:  python3 make_manifest.py
 Folder layout it reads (same names the script uses):
   Cursors/<file>.png            Hitmarkers/<file>.png          HitSounds/<file>.mp3|ogg|wav|flac
   Textures/<Weapon>/<file>.png  WeaponSounds/<Weapon>/<file>.mp3|ogg|wav|flac
+  ReloadSounds/<Weapon>/<file>.mp3|ogg|wav|flac
 The output is deterministic (sorted, stable revision), so running it again without changes
 produces the exact same file and nothing new is committed.
 """
@@ -19,7 +20,8 @@ ROOT = Path(__file__).resolve().parent
 
 # Extensions the script accepts (images: PNG only; audio: mp3, ogg, wav, flac).
 FLAT = {"Cursors": {"png"}, "Hitmarkers": {"png"}, "HitSounds": {"mp3", "ogg", "wav", "flac"}}
-PER_WEAPON = {"Textures": {"png"}, "WeaponSounds": {"mp3", "ogg", "wav", "flac"}}
+AUDIO = {"mp3", "ogg", "wav", "flac"}
+PER_WEAPON = {"Textures": {"png"}, "WeaponSounds": AUDIO, "ReloadSounds": AUDIO}
 WEAPON_RE = re.compile(r"^[A-Za-z0-9_\-. ]+$")  # same rule as the script (validWeaponName)
 
 
