@@ -104,6 +104,18 @@
       {
         "crc32": "d1d435a4",
         "path": "Hitmarkers/default.png"
+      },
+      {
+        "crc32": "cf273c43",
+        "path": "Hitmarkers/hitmarker2.png"
+      },
+      {
+        "crc32": "b5ef4387",
+        "path": "Hitmarkers/purplehitmarker.png"
+      },
+      {
+        "crc32": "407beae1",
+        "path": "Hitmarkers/redhitmarker.png"
       }
     ],
     "Textures": {
@@ -203,6 +215,6 @@
       ]
     }
   },
-  "revision": "494e3af849ff",
+  "revision": "5f12c83c7170",
   "schemaVersion": 1
 }
