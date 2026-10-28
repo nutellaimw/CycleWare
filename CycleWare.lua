@@ -6,7 +6,7 @@
 --   stand-in, so a single missing function disables one feature instead of aborting the
 --   whole script. What was found is stored in CW.Caps and reported once at startup.
 --=============================================================================
-local SCRIPT_VERSION = "phase-9"
+local SCRIPT_VERSION = "phase-10"
 
 local CAPS = {
 	files = type(isfile) == "function" and type(isfolder) == "function"
@@ -3086,9 +3086,10 @@ if CW.UIWindow and type(CW.UIWindow.Destroy) == "function" then
 end
 -- Ícones opcionais (caminho no workspace ou ID do Roblox). Exemplo, antes de executar o script:
 --   getgenv().CW_CONFIG = { UI_ICONS = { Logo = "CW/logo.png", Discord = 456, Info = 789, Settings = 123,
---                                         Effects = 111, Visuals = 222, Sounds = 333, Utilities = 444 },
+--                                         Cursors = 111, Guns = 222, Utilities = 444 },
 --                           DISCORD_URL = "https://discord.gg/xxxx" }
--- (Settings vale para o botão do rodapé e para a aba Settings; as outras abas usam o próprio nome.)
+-- (Settings vale para o botão do rodapé e para a aba Settings; as outras abas usam o próprio nome.
+--  Effects e Visuals, os nomes antigos, ainda valem para as abas Cursors e Guns.)
 local uiIcons = type(_cfg.UI_ICONS) == "table" and _cfg.UI_ICONS or {}
 local Window = CWUI:CreateWindow({
 	Title = "CW",
@@ -3278,7 +3279,8 @@ end
 -- spec = {
 --   Category    = "WeaponSounds" | "ReloadSounds"   library folder: <Category>/<Weapon>/<file>
 --   SoundName   = "ShootSound" | "ReloadSound"      the Sound instance the game plays
---   OverridesKey, EnabledKey, OthersKey, VolumeKey  saved settings (names unchanged for the shoot sounds)
+--   OverridesKey, EnabledKey, OthersKey, VolumeKey  saved settings (names unchanged for the shoot sounds);
+--                                                   VolumeKey holds { [gun] = volume multiplier }
 --   ConfigKey                                       optional CW_CONFIG table: { ["AK-47"] = "WeaponSounds/AK-47/x.mp3" }
 --   BaseVolume(originalId, player)                  optional: volume the game itself plays this sound at
 -- }
@@ -3289,12 +3291,33 @@ local function createSoundChanger(spec)
 	-- Off by default: nothing changes in the game until the player turns it on.
 	if settings[spec.EnabledKey] == nil then settings[spec.EnabledKey] = _cfg[spec.EnabledKey] == true end
 	if settings[spec.OthersKey] == nil then settings[spec.OthersKey] = _cfg[spec.OthersKey] == true end
-	-- Volume multiplier for the replaced sounds, relative to the game's own volume.
-	settings[spec.VolumeKey] = math.clamp(tonumber(settings[spec.VolumeKey]) or 1, 0, 2)
-	CW.Defaults[spec.VolumeKey] = 1
+	-- Volume multiplier per gun, relative to the game's own volume (1 = untouched). Only the guns that
+	-- differ from 1 are stored: { ["AK-47"] = 0.5 }. It applies to the game's own sound as well as to a
+	-- replacement file. An older save kept one number for every gun: it becomes that number for each gun.
+	local volumes = {}
+	local migratedVolume = false
+	do
+		local saved = settings[spec.VolumeKey]
+		if type(saved) == "number" then
+			local all = math.clamp(saved, 0, 2)
+			if math.abs(all - 1) > 1e-6 then
+				for _, weapon in ipairs(soundWeaponNames()) do volumes[weapon] = all end
+			end
+			migratedVolume = true
+		elseif type(saved) == "table" then
+			for weapon, value in pairs(saved) do
+				local number = tonumber(value)
+				if type(weapon) == "string" and number then
+					number = math.clamp(number, 0, 2)
+					if math.abs(number - 1) > 1e-6 then volumes[weapon] = number end
+				end
+			end
+		end
+		settings[spec.VolumeKey] = volumes
+	end
 
 	local overrides = settings[spec.OverridesKey]
-	local changer = { spec = spec, overrides = overrides, catalog = {}, dropdowns = {}, migrated = false }
+	local changer = { spec = spec, overrides = overrides, volumes = volumes, catalog = {}, dropdowns = {}, migrated = migratedVolume }
 	local active = setmetatable({}, { __mode = "k" })     -- Sound -> data about what was changed
 	local watched = setmetatable({}, { __mode = "k" })    -- container -> { player, connections }
 	local playerConnections, globalConnections = {}, {}
@@ -3356,26 +3379,28 @@ local function createSoundChanger(spec)
 			table.sort(dropped)
 			changer.migrated = true
 			CW.Warn("A saved " .. spec.Label .. " sound selection did not point at the " .. spec.Category
-				.. " library and was removed for: " .. table.concat(dropped, ", ") .. ". Choose a new sound for them in the Sounds tab.")
+				.. " library and was removed for: " .. table.concat(dropped, ", ") .. ". Choose a new sound for them in the Guns tab.")
 		end
 	end
 	changer.refreshCatalog()
 
 	--// volume ---------------------------------------------------------------------------
-	-- baseVolume is the game's own volume for that sound; the sound plays at baseVolume * the slider.
+	local function volumeOf(weapon)
+		local value = tonumber(volumes[weapon])
+		if not value then return 1 end
+		return math.clamp(value, 0, 2)
+	end
+	changer.volumeOf = volumeOf
+
+	-- baseVolume is the game's own volume for that sound; the sound plays at baseVolume * the gun's volume.
 	-- If the game itself changes the volume later (distance, per-shot values), that new value becomes
-	-- the base, so the slider always scales the game's value.
+	-- the base, so the setting always scales the game's value.
 	local function setScaledVolume(sound, data)
-		local target = math.clamp(data.baseVolume * (settings[spec.VolumeKey] or 1), 0, 10)
+		local volume = data.tool and volumeOf(data.tool.Name) or 1
+		local target = math.clamp(data.baseVolume * volume, 0, 10)
 		data.lastVolume = target
 		if sound.Volume ~= target then
 			pcall(function() sound.Volume = target end)
-		end
-	end
-
-	function changer.updateVolumes()
-		for sound, data in pairs(active) do
-			if sound.Parent then setScaledVolume(sound, data) end
 		end
 	end
 
@@ -3416,18 +3441,26 @@ local function createSoundChanger(spec)
 	end
 
 	--// applying ---------------------------------------------------------------------------
+	-- targetId is the replacement file's asset id, or nil to keep the game's own sound and only scale its volume.
 	local function applySound(sound, targetId, tool, player, container)
 		local data = active[sound]
+		-- A sound that was set up for a replacement file and now only needs its volume (or the other way
+		-- round) is set up again from scratch.
+		if data and (data.targetId == nil) ~= (targetId == nil) then
+			restoreSound(sound)
+			data = nil
+		end
 		if not data then
 			local originalId, originalVolume = sound.SoundId, sound.Volume
 			local baseVolume = originalVolume
 
-			-- The game plays a CLONE of the Sound. The clone of a sound that was already replaced arrives
-			-- with the replacement id and the already scaled volume, so its original values (and the
-			-- base the volume slider scales) come from the sound it was cloned from: a sibling in the
-			-- same Handle. Without this the slider would be applied twice (0.5x would play at 0.25x).
+			-- The game plays a CLONE of the Sound. The clone of a sound that was already handled arrives
+			-- with the replacement id (when there is one) and the already scaled volume, so its original
+			-- values (and the base the volume setting scales) come from the sound it was cloned from: a
+			-- sibling in the same Handle. Without this the volume would be applied twice (0.5x would play at
+			-- 0.25x). A clone whose volume the game set itself on the way in keeps that volume as its base.
 			local sibling
-			if sound.SoundId == targetId then
+			if targetId == nil or sound.SoundId == targetId then
 				for other, otherData in pairs(active) do
 					if other ~= sound and other.Parent == sound.Parent and other.Name == sound.Name
 						and otherData.targetId == targetId then
@@ -3437,7 +3470,10 @@ local function createSoundChanger(spec)
 				end
 			end
 			if sibling then
-				originalId, originalVolume, baseVolume = sibling.originalId, sibling.originalVolume, sibling.baseVolume
+				if targetId ~= nil then originalId = sibling.originalId end
+				if math.abs(sound.Volume - sibling.lastVolume) <= 0.0001 then
+					originalVolume, baseVolume = sibling.originalVolume, sibling.baseVolume
+				end
 			elseif spec.BaseVolume then
 				baseVolume = spec.BaseVolume(sound.SoundId, player) or baseVolume
 			end
@@ -3453,15 +3489,17 @@ local function createSoundChanger(spec)
 				targetId = targetId,
 			}
 			active[sound] = data
-			local ok, connection = pcall(function()
-				return sound:GetPropertyChangedSignal("SoundId"):Connect(function()
-					local current = active[sound]
-					if current and sound.Parent and sound.SoundId ~= current.targetId then
-						pcall(function() sound.SoundId = current.targetId end)
-					end
+			if targetId ~= nil then
+				local ok, connection = pcall(function()
+					return sound:GetPropertyChangedSignal("SoundId"):Connect(function()
+						local current = active[sound]
+						if current and sound.Parent and sound.SoundId ~= current.targetId then
+							pcall(function() sound.SoundId = current.targetId end)
+						end
+					end)
 				end)
-			end)
-			if ok then data.connection = connection end
+				if ok then data.connection = connection end
+			end
 
 			local okVolume, volumeConnection = pcall(function()
 				return sound:GetPropertyChangedSignal("Volume"):Connect(function()
@@ -3478,10 +3516,9 @@ local function createSoundChanger(spec)
 			data.tool = tool
 			data.player = player
 			data.container = container
-			data.targetId = targetId
 		end
 
-		if sound.SoundId ~= targetId then
+		if targetId ~= nil and sound.SoundId ~= targetId then
 			pcall(function() sound.SoundId = targetId end)
 		end
 		setScaledVolume(sound, data)
@@ -3507,14 +3544,43 @@ local function createSoundChanger(spec)
 		if player ~= LocalPlayer and not settings[spec.OthersKey] then return end
 
 		local relativePath = overrides[tool.Name]
-		if type(relativePath) ~= "string" then return end
-		local targetId = resolveAsset(relativePath)
-		if not targetId then return end
+		local targetId = type(relativePath) == "string" and resolveAsset(relativePath) or nil
+		if not targetId and math.abs(volumeOf(tool.Name) - 1) < 1e-6 then
+			-- Nothing to change for this gun (no usable replacement file, and the game's own volume):
+			-- put back whatever was changed before.
+			for sound, data in pairs(active) do
+				if data.tool == tool then restoreSound(sound) end
+			end
+			return
+		end
 		for _, descendant in ipairs(tool:GetDescendants()) do
 			if descendant:IsA("Sound") and descendant.Name == spec.SoundName then
 				applySound(descendant, targetId, tool, player, container)
 			end
 		end
+	end
+
+	-- Applies the current volume of one gun (or of every gun) to the sounds already there, without a
+	-- full refresh: the sliders call this on every step while they are dragged.
+	function changer.updateVolumes(weapon)
+		if not settings[spec.EnabledKey] then return end
+		for container, data in pairs(watched) do
+			for _, child in ipairs(container:GetChildren()) do
+				if child:IsA("Tool") and (weapon == nil or child.Name == weapon) then
+					applyToTool(child, data.player, container)
+				end
+			end
+		end
+	end
+
+	function changer.setVolume(weapon, value)
+		value = math.clamp(tonumber(value) or 1, 0, 2)
+		if math.abs(value - 1) < 1e-6 then
+			volumes[weapon] = nil
+		else
+			volumes[weapon] = value
+		end
+		changer.updateVolumes(weapon)
 	end
 
 	local function unwatchContainer(container)
@@ -3682,429 +3748,163 @@ CW.State.stopWeaponShootSoundOverrides = function()
 end
 
 ------------------------------------------------------------------------------
--- Effects tab (hitmarker + tracers)
+-- Cursors tab: Hit Sound, Cursors, Hitmarkers
 ------------------------------------------------------------------------------
-guarded("Effects", function()
-	local EffectsTab = Window:Tab({ Title = "Effects" })
+guarded("Cursors", function()
+	local CursorsTab = Window:AddTab({ Name = "Cursors", Icon = uiIcons.Cursors or uiIcons.Effects })
+	local HitSoundSection = wrapSection(CursorsTab:AddSection({ Name = "Hit Sound", Open = true }))
+	local CursorSection = wrapSection(CursorsTab:AddSection({ Name = "Cursors", Open = true }))
+	local HitmarkerSection = wrapSection(CursorsTab:AddSection({ Name = "Hitmarkers", Open = true }))
 
-	local function applyHitmarkerFile(value)
-		if type(value) ~= "table" or type(value.Path) ~= "string" then return end
-		CW.Paths.HITMARKER_FILE = value.Path
-		CW.Library.setSelection("Hitmarkers", nil, CW.Library.relative(value.Path))
-		if CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
-	end
-
-	HitmarkerGallery = EffectsTab:Gallery({
-		Name = "Hitmarker Library",
-		Items = galleryItems("Hitmarkers"),
-		Default = CW.Paths.HITMARKER_FILE,
-		LazyLoad = true,
-		Columns = 4,
-		MaxHeight = 260,
-		Callback = applyHitmarkerFile,
-	})
-
-	EffectsTab:Slider({
-		Title = "Hitmarker Size",
-		Min = 8,
-		Max = 200,
-		Default = CW.Settings.HITMARKER_SIZE,
-		Suffix = "px",
-		Callback = function(v)
-			CW.Settings.HITMARKER_SIZE = v
-			if CW.HMTemplate then
-				CW.HMTemplate.Size = UDim2.new(0, v, 0, v)
-			end
-		end,
-	})
-
-	EffectsTab:Toggle({
-		Title = "Random Rotation",
-		Default = CW.Settings.HITMARKER_RANDOM_ROTATION,
-		Callback = function(s) CW.Settings.HITMARKER_RANDOM_ROTATION = s end,
-	})
-
-	EffectsTab:Toggle({
-		Title = "Follow Mouse",
-		Default = CW.Settings.HITMARKER_FOLLOW_MOUSE,
-		Callback = function(s) CW.Settings.HITMARKER_FOLLOW_MOUSE = s end,
-	})
-
-	EffectsTab:Slider({
-		Title = "Visible Duration",
-		Min = 0,
-		Max = 1,
-		Default = CW.Settings.HITMARKER_VISIBLE_DURATION,
-		Decimal = 2,
-		Suffix = "s",
-		Callback = function(v) CW.Settings.HITMARKER_VISIBLE_DURATION = v end,
-	})
-
-	EffectsTab:Toggle({
-		Title = "Fadeout",
-		Default = CW.Settings.HITMARKER_FADEOUT,
-		Callback = function(s) CW.Settings.HITMARKER_FADEOUT = s end,
-	})
-
-	EffectsTab:Slider({
-		Title = "Fadeout Duration",
-		Min = 0,
-		Max = 1,
-		Default = CW.Settings.HITMARKER_FADEOUT_DURATION,
-		Decimal = 2,
-		Suffix = "s",
-		Callback = function(v) CW.Settings.HITMARKER_FADEOUT_DURATION = v end,
-	})
-
-	-- Tracers
-	local tracerPalette = {
-		Violet = Color3.fromRGB(170, 0, 255),
-		Lilac = Color3.fromRGB(200, 100, 255),
-		Red = Color3.fromRGB(255, 64, 64),
-		Green = Color3.fromRGB(64, 220, 96),
-		Cyan = Color3.fromRGB(64, 210, 255),
-		White = Color3.fromRGB(255, 255, 255),
-	}
-
-	-- Only used by the palette dropdown, which is the fallback when the loaded CWUI has no color picker.
-	local function colorName(color)
-		for name, paletteColor in pairs(tracerPalette) do
-			if color == paletteColor then return name end
-		end
-		return "Violet"
-	end
-
-	-- Colors are userdata and can't be serialised: the Sniper and Taser colors are saved as hex strings
-	-- (TRACER_SNIPER_COLOR_HEX, ...). The bullet guns store their colors as hex inside their own maps.
-	local function colorFromHex(hex)
-		if type(hex) ~= "string" then return nil end
-		local ok, color = pcall(Color3.fromHex, hex)
-		if ok and typeof(color) == "Color3" then return color end
-		return nil
-	end
-	for _, entry in ipairs({
-		{ "TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX" },
-		{ "TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX" },
-	}) do
-		local settingKey, hexKey, nameKey = entry[1], entry[2], entry[3]
-		CW.Settings[settingKey] = colorFromHex(CW.Settings[hexKey])
-			or (nameKey and tracerPalette[CW.Settings[nameKey]])
-			or CW.Settings[settingKey]
-		-- The saved values are consumed here. If they stayed in CW.Settings, the generic save loop would
-		-- write them back even after the player picks another color (or goes back to the default).
-		CW.Settings[hexKey] = nil
-		if nameKey then CW.Settings[nameKey] = nil end
-	end
-
-	-- A colour control; returns a function that moves it to another colour without calling onChange.
-	local function addColorControl(section, title, initial, onChange)
-		local picker = section:Colorpicker({
-			Title = title,
-			Default = initial,
-			Callback = onChange,
+	guarded("Hit Sound", function()
+		HitSoundDropdown = HitSoundSection:Dropdown({
+			Title = "Hit Sound",
+			Options = hitSoundOptions,
+			Default = hitSoundLabel(CW.Paths.SOUND_FILE),
+			Callback = applySoundFile,
 		})
-		if picker then
-			return function(color) picker:Set(color, true) end
-		end
 
-		-- No color picker in the loaded CWUI: keep the old palette dropdown.
-		local dropdown = section:Dropdown({
-			Title = title,
-			Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
-			Default = colorName(initial),
-			Callback = function(name)
-				onChange(tracerPalette[name])
-			end,
-		})
-		return function(color) dropdown:Set(colorName(color), true) end
-	end
-
-	local function addTracerColor(section, title, settingKey)
-		return addColorControl(section, title, CW.Settings[settingKey], function(color)
-			CW.Settings[settingKey] = color
-		end)
-	end
-
-	-- Width, lifetime and transparency sliders for the tracer whose settings start with `prefix`.
-	local function addTracerSliders(section, prefix, maxLifetime)
-		section:Slider({
-			Title = "Tracer Width",
-			Min = 0.01,
-			Max = 0.5,
-			Default = CW.Settings[prefix .. "WIDTH"],
-			Decimal = 2,
-			Callback = function(v) CW.Settings[prefix .. "WIDTH"] = v end,
-		})
-		section:Slider({
-			Title = "Tracer Lifetime",
-			Min = 0.01,
-			Max = maxLifetime,
-			Default = CW.Settings[prefix .. "LIFETIME"],
-			Decimal = 2,
-			Suffix = "s",
-			Callback = function(v) CW.Settings[prefix .. "LIFETIME"] = v end,
-		})
-		section:Slider({
-			Title = "Tracer Transparency",
+		HitSoundSection:Slider({
+			Title = "Hit Sound Volume",
 			Min = 0,
-			Max = 1,
-			Default = CW.Settings[prefix .. "TRANSPARENCY"],
+			Max = 2,
+			Default = CW.Settings.SOUND_VOLUME,
 			Decimal = 2,
-			Callback = function(v) CW.Settings[prefix .. "TRANSPARENCY"] = v end,
+			Suffix = "x",
+			Callback = function(v) CW.Settings.SOUND_VOLUME = v end,
 		})
-	end
+	end)
 
-	EffectsTab:Toggle({
-		Title = "Tracers: Apply To Others",
-		Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
-		Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
-	})
-
-	--// bullet guns: every gun has its own tracer, edited one at a time
-	local gunNames = {}
-	for _, name in ipairs(soundWeaponNames()) do
-		if name ~= "M700" and name ~= "Taser" then table.insert(gunNames, name) end
-	end
-	if #gunNames == 0 then
-		gunNames = { "AK-47", "FAL", "M4A1", "M9", "MP5", "Remington 870", "Revolver" }
-	end
-
-	local GUN_FIELDS = { "ENABLED", "COLOR", "GLOW", "WIDTH", "LIFETIME", "TRANSPARENCY", "LIGHT" }
-	local D = CW.GunTracerDefaults
-	local selectedGun = gunNames[1]
-	local gunControls = {}
-	local setSniperColor, setTaserColor -- the Sniper and Taser color pickers, created further down
-
-	local function gunMap(field) -- the settings map of one field (created again if a saved file replaced it)
-		local key = "TRACER_GUN_" .. field
-		if type(CW.Settings[key]) ~= "table" then CW.Settings[key] = {} end
-		return CW.Settings[key]
-	end
-
-	local function gunColorValue(field, fallback)
-		return colorFromHex(gunMap(field)[selectedGun]) or fallback
-	end
-
-	local function gunNumber(field, fallback)
-		return tonumber(gunMap(field)[selectedGun]) or fallback
-	end
-
-	-- Shows the selected gun's values (its own, or the starting ones) without saving anything.
-	local function refreshGunControls()
-		gunControls.enabled:Set(gunMap("ENABLED")[selectedGun] == true, true)
-		gunControls.color(gunColorValue("COLOR", D.color))
-		gunControls.glow(gunColorValue("GLOW", D.glow))
-		gunControls.width:Set(gunNumber("WIDTH", D.width), true)
-		gunControls.lifetime:Set(gunNumber("LIFETIME", D.life), true)
-		gunControls.transparency:Set(gunNumber("TRANSPARENCY", D.transparency), true)
-		gunControls.light:Set(gunMap("LIGHT")[selectedGun] == true, true)
-	end
-
-	local GunSection = EffectsTab:AddSubSection("Gun Tracers", true)
-	GunSection:AddLabel("Pick a gun and turn its tracer on: every gun keeps its own settings. A gun that is off keeps the game's tracer. Other players' shots also need Tracers: Apply To Others.")
-
-	GunSection:Dropdown({
-		Title = "Gun",
-		Options = gunNames,
-		Default = selectedGun,
-		Callback = function(name)
-			selectedGun = name
-			refreshGunControls()
-		end,
-	})
-	gunControls.enabled = GunSection:Toggle({
-		Title = "Custom Tracer For This Gun",
-		Default = gunMap("ENABLED")[selectedGun] == true,
-		Callback = function(on)
-			gunMap("ENABLED")[selectedGun] = on and true or nil
-		end,
-	})
-	gunControls.color = addColorControl(GunSection, "Tracer Color",
-		gunColorValue("COLOR", D.color), function(color)
-			gunMap("COLOR")[selectedGun] = color:ToHex()
-		end)
-	gunControls.glow = addColorControl(GunSection, "Glow Color",
-		gunColorValue("GLOW", D.glow), function(color)
-			gunMap("GLOW")[selectedGun] = color:ToHex()
-		end)
-	gunControls.width = GunSection:Slider({
-		Title = "Tracer Width",
-		Min = 0.01,
-		Max = 0.5,
-		Default = gunNumber("WIDTH", D.width),
-		Decimal = 2,
-		Callback = function(v) gunMap("WIDTH")[selectedGun] = v end,
-	})
-	gunControls.lifetime = GunSection:Slider({
-		Title = "Tracer Lifetime",
-		Min = 0.01,
-		Max = 1,
-		Default = gunNumber("LIFETIME", D.life),
-		Decimal = 2,
-		Suffix = "s",
-		Callback = function(v) gunMap("LIFETIME")[selectedGun] = v end,
-	})
-	gunControls.transparency = GunSection:Slider({
-		Title = "Tracer Transparency",
-		Min = 0,
-		Max = 1,
-		Default = gunNumber("TRANSPARENCY", D.transparency),
-		Decimal = 2,
-		Callback = function(v) gunMap("TRANSPARENCY")[selectedGun] = v end,
-	})
-	gunControls.light = GunSection:Toggle({
-		Title = "Tracer Light",
-		Default = gunMap("LIGHT")[selectedGun] == true,
-		Callback = function(on)
-			gunMap("LIGHT")[selectedGun] = on and true or nil
-		end,
-	})
-	GunSection:Button({
-		Title = "Reset This Gun",
-		Callback = function()
-			for _, field in ipairs(GUN_FIELDS) do
-				gunMap(field)[selectedGun] = nil
-			end
-			refreshGunControls()
-			scheduleSave()
-		end,
-	})
-	GunSection:AddLabel("Apply To All Guns copies everything shown above (on/off, colors, width, lifetime, transparency, light) to every gun. The M700 and the Taser only get the tracer color.")
-	GunSection:Button({
-		Title = "Apply To All Guns",
-		Callback = function()
-			-- What the panel shows for this gun: its own value, or the starting one.
-			local color = gunColorValue("COLOR", D.color)
-			local values = {
-				ENABLED      = gunMap("ENABLED")[selectedGun] == true or nil,
-				COLOR        = color:ToHex(),
-				GLOW         = gunColorValue("GLOW", D.glow):ToHex(),
-				WIDTH        = gunNumber("WIDTH", D.width),
-				LIFETIME     = gunNumber("LIFETIME", D.life),
-				TRANSPARENCY = gunNumber("TRANSPARENCY", D.transparency),
-				LIGHT        = gunMap("LIGHT")[selectedGun] == true or nil,
-			}
-			for _, name in ipairs(gunNames) do
-				for _, field in ipairs(GUN_FIELDS) do
-					gunMap(field)[name] = values[field]
-				end
-			end
-
-			-- Sniper and Taser: only the color.
-			CW.Settings.TRACER_SNIPER_COLOR = color
-			CW.Settings.TRACER_TASER_COLOR = color
-			if setSniperColor then setSniperColor(color) end
-			if setTaserColor then setTaserColor(color) end
-
-			scheduleSave()
-			CW.Log("Applied the " .. selectedGun .. " tracer to all guns (M700 and Taser: color only).")
-		end,
-	})
-
-	--// Sniper (M700) and Taser: a tracer of their own each
-	local SniperSection = EffectsTab:AddSubSection("Sniper Tracer (M700)", false)
-	SniperSection:AddLabel("Off: the game's own tracer, with only the color below changed. On: width, lifetime and transparency apply too.")
-	SniperSection:Toggle({
-		Title = "Custom Sniper Tracer",
-		Default = CW.Settings.TRACER_SNIPER_ENABLED == true,
-		Callback = function(s) CW.Settings.TRACER_SNIPER_ENABLED = s == true end,
-	})
-	setSniperColor = addTracerColor(SniperSection, "Sniper Tracer Color", "TRACER_SNIPER_COLOR")
-	addTracerSliders(SniperSection, "TRACER_SNIPER_", 5)
-
-	local TaserSection = EffectsTab:AddSubSection("Taser Tracer", false)
-	TaserSection:AddLabel("Off: the game's own tracer, with only the color below changed. On: width, lifetime and transparency apply too.")
-	TaserSection:Toggle({
-		Title = "Custom Taser Tracer",
-		Default = CW.Settings.TRACER_TASER_ENABLED == true,
-		Callback = function(s) CW.Settings.TRACER_TASER_ENABLED = s == true end,
-	})
-	setTaserColor = addTracerColor(TaserSection, "Taser Tracer Color", "TRACER_TASER_COLOR")
-	addTracerSliders(TaserSection, "TRACER_TASER_", 3)
-end)
-
-------------------------------------------------------------------------------
--- Visuals tab (cursor + weapon textures)
-------------------------------------------------------------------------------
-guarded("Visuals", function()
-	local VisualsTab = Window:Tab({ Title = "Visuals" })
-
-	local function applyCursorFile(value)
-		if type(value) ~= "table" or type(value.Path) ~= "string" then return end
-		CW.Paths.CURSOR_FILE = value.Path
-		CW.Library.setSelection("Cursors", nil, CW.Library.relative(value.Path))
-		if CW.reloadCursor then CW.reloadCursor() end
-	end
-
-	local cursorSizeDebounceThread = nil
-
-	local function applyCursorSize(v)
-		CW.Settings.CURSOR_TARGET_SIZE = v
-
-		if cursorSizeDebounceThread then
-			task.cancel(cursorSizeDebounceThread)
-			cursorSizeDebounceThread = nil
+	guarded("Cursor", function()
+		local function applyCursorFile(value)
+			if type(value) ~= "table" or type(value.Path) ~= "string" then return end
+			CW.Paths.CURSOR_FILE = value.Path
+			CW.Library.setSelection("Cursors", nil, CW.Library.relative(value.Path))
+			if CW.reloadCursor then CW.reloadCursor() end
 		end
 
-		cursorSizeDebounceThread = task.delay(2, function()
-			cursorSizeDebounceThread = nil
-			if CW.reloadCursor then CW.reloadCursor() end
-		end)
-	end
+		local cursorSizeDebounceThread = nil
 
-	CursorGallery = VisualsTab:Gallery({
-		Name = "Cursor Library",
-		Items = galleryItems("Cursors"),
-		Default = CW.Paths.CURSOR_FILE,
-		LazyLoad = true,
-		Columns = 4,
-		MaxHeight = 260,
-		Callback = applyCursorFile,
-	})
+		local function applyCursorSize(v)
+			CW.Settings.CURSOR_TARGET_SIZE = v
 
-	VisualsTab:Slider({
-		Title = "Cursor Size",
-		Min = 16,
-		Max = 256,
-		Default = CW.Settings.CURSOR_TARGET_SIZE,
-		Suffix = "px",
-		Callback = applyCursorSize,
-	})
+			if cursorSizeDebounceThread then
+				task.cancel(cursorSizeDebounceThread)
+				cursorSizeDebounceThread = nil
+			end
 
-	for _, weaponName in ipairs(CW.WeaponList or {}) do
-		local weapon = weaponName
-		local weaponSection = VisualsTab:AddSubSection(weapon, false)
-		local selectedPath = CW.Library.selectedPath("Textures", weapon)
-		local gallery = weaponSection:Gallery({
-			Name = weapon .. " Textures",
-			Items = galleryItems("Textures", weapon),
-			Default = selectedPath,
-			AllowDeselect = true,
+			cursorSizeDebounceThread = task.delay(2, function()
+				cursorSizeDebounceThread = nil
+				if CW.reloadCursor then CW.reloadCursor() end
+			end)
+		end
+
+		CursorGallery = CursorSection:Gallery({
+			Name = "Cursor Library",
+			Items = galleryItems("Cursors"),
+			Default = CW.Paths.CURSOR_FILE,
 			LazyLoad = true,
 			Columns = 4,
 			MaxHeight = 260,
-			Callback = function(item)
-				CW.Library.setSelection("Textures", weapon,
-					type(item) == "table" and CW.Library.relative(item.Path) or nil)
-				if CW.reloadTextures then CW.reloadTextures() end
+			Callback = applyCursorFile,
+		})
+
+		CursorSection:Slider({
+			Title = "Cursor Size",
+			Min = 16,
+			Max = 256,
+			Default = CW.Settings.CURSOR_TARGET_SIZE,
+			Suffix = "px",
+			Callback = applyCursorSize,
+		})
+	end)
+
+	-- Hitmarkers: the library, then all the switches together, then all the sliders together.
+	guarded("Hitmarker", function()
+		local function applyHitmarkerFile(value)
+			if type(value) ~= "table" or type(value.Path) ~= "string" then return end
+			CW.Paths.HITMARKER_FILE = value.Path
+			CW.Library.setSelection("Hitmarkers", nil, CW.Library.relative(value.Path))
+			if CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
+		end
+
+		HitmarkerGallery = HitmarkerSection:Gallery({
+			Name = "Hitmarker Library",
+			Items = galleryItems("Hitmarkers"),
+			Default = CW.Paths.HITMARKER_FILE,
+			LazyLoad = true,
+			Columns = 4,
+			MaxHeight = 260,
+			Callback = applyHitmarkerFile,
+		})
+
+		HitmarkerSection:Toggle({
+			Title = "Random Rotation",
+			Default = CW.Settings.HITMARKER_RANDOM_ROTATION,
+			Callback = function(s) CW.Settings.HITMARKER_RANDOM_ROTATION = s end,
+		})
+
+		HitmarkerSection:Toggle({
+			Title = "Follow Mouse",
+			Default = CW.Settings.HITMARKER_FOLLOW_MOUSE,
+			Callback = function(s) CW.Settings.HITMARKER_FOLLOW_MOUSE = s end,
+		})
+
+		HitmarkerSection:Toggle({
+			Title = "Fadeout",
+			Default = CW.Settings.HITMARKER_FADEOUT,
+			Callback = function(s) CW.Settings.HITMARKER_FADEOUT = s end,
+		})
+
+		HitmarkerSection:Slider({
+			Title = "Hitmarker Size",
+			Min = 8,
+			Max = 200,
+			Default = CW.Settings.HITMARKER_SIZE,
+			Suffix = "px",
+			Callback = function(v)
+				CW.Settings.HITMARKER_SIZE = v
+				if CW.HMTemplate then
+					CW.HMTemplate.Size = UDim2.new(0, v, 0, v)
+				end
 			end,
 		})
-		table.insert(textureGalleries, { weapon = weapon, gallery = gallery })
-	end
+
+		HitmarkerSection:Slider({
+			Title = "Visible Duration",
+			Min = 0,
+			Max = 1,
+			Default = CW.Settings.HITMARKER_VISIBLE_DURATION,
+			Decimal = 2,
+			Suffix = "s",
+			Callback = function(v) CW.Settings.HITMARKER_VISIBLE_DURATION = v end,
+		})
+
+		HitmarkerSection:Slider({
+			Title = "Fadeout Duration",
+			Min = 0,
+			Max = 1,
+			Default = CW.Settings.HITMARKER_FADEOUT_DURATION,
+			Decimal = 2,
+			Suffix = "s",
+			Callback = function(v) CW.Settings.HITMARKER_FADEOUT_DURATION = v end,
+		})
+	end)
 end)
 
 ------------------------------------------------------------------------------
--- Sounds tab: one collapsible section per changer (Shoot Sounds, Reload Sounds) plus Hit Sound.
--- The Shoot Sounds controls and their saved settings are the same as before ("Weapon Sounds"),
--- so nothing already saved is lost.
+-- Guns tab: Shoot Sounds, Reload Sounds, Textures, Effects (tracers)
+-- The sound controls keep the saved settings they always had, so nothing already saved is lost.
 ------------------------------------------------------------------------------
-guarded("Sounds", function()
-	local SoundsTab = Window:AddTab({ Name = "Sounds", Icon = uiIcons.Sounds })
-	local ShootSection = wrapSection(SoundsTab:AddSection({ Name = "Shoot Sounds", Open = true }))
-	local ReloadSection = wrapSection(SoundsTab:AddSection({ Name = "Reload Sounds", Open = true }))
-	local HitSection = wrapSection(SoundsTab:AddSection({ Name = "Hit Sound", Open = true }))
+guarded("Guns", function()
+	local GunsTab = Window:AddTab({ Name = "Guns", Icon = uiIcons.Guns or uiIcons.Visuals })
+	local ShootSection = wrapSection(GunsTab:AddSection({ Name = "Shoot Sounds", Open = true }))
+	local ReloadSection = wrapSection(GunsTab:AddSection({ Name = "Reload Sounds", Open = true }))
+	local TextureSection = wrapSection(GunsTab:AddSection({ Name = "Textures", Open = true }))
+	local EffectsSection = wrapSection(GunsTab:AddSection({ Name = "Effects", Open = true }))
 
-	-- Same controls for every changer: enable, apply to others, volume, and one dropdown per gun.
+	-- Same controls for every changer: the two switches, then each gun's sound file with its own volume
+	-- (the volume also applies while the gun keeps the game's own sound).
 	local function buildChangerSection(section, changer, label)
 		local spec = changer.spec
 
@@ -4126,19 +3926,6 @@ guarded("Sounds", function()
 			end,
 		})
 
-		section:Slider({
-			Title = label .. " Sound Volume",
-			Min = 0,
-			Max = 2,
-			Default = CW.Settings[spec.VolumeKey],
-			Decimal = 2,
-			Suffix = "x",
-			Callback = function(v)
-				CW.Settings[spec.VolumeKey] = v
-				changer.updateVolumes()
-			end,
-		})
-
 		for _, weaponName in ipairs(soundWeaponNames()) do
 			local weapon = weaponName
 			local entry = changer.catalog[weapon]
@@ -4151,28 +3938,303 @@ guarded("Sounds", function()
 				end,
 			})
 			table.insert(changer.dropdowns, { weapon = weapon, control = dropdown })
+
+			section:Slider({
+				Title = weapon .. " " .. label .. " Volume",
+				Min = 0,
+				Max = 2,
+				Default = changer.volumeOf(weapon),
+				Decimal = 2,
+				Suffix = "x",
+				Callback = function(v)
+					changer.setVolume(weapon, v)
+				end,
+			})
 		end
 	end
 
-	buildChangerSection(ShootSection, shootSounds, "Shoot")
-	buildChangerSection(ReloadSection, reloadSounds, "Reload")
+	guarded("Shoot Sounds", function() buildChangerSection(ShootSection, shootSounds, "Shoot") end)
+	guarded("Reload Sounds", function() buildChangerSection(ReloadSection, reloadSounds, "Reload") end)
 
-	HitSoundDropdown = HitSection:Dropdown({
-		Title = "Hit Sound",
-		Options = hitSoundOptions,
-		Default = hitSoundLabel(CW.Paths.SOUND_FILE),
-		Callback = applySoundFile,
-	})
+	guarded("Textures", function()
+		for _, weaponName in ipairs(CW.WeaponList or {}) do
+			local weapon = weaponName
+			local weaponSection = TextureSection:AddSubSection(weapon, false)
+			local selectedPath = CW.Library.selectedPath("Textures", weapon)
+			local gallery = weaponSection:Gallery({
+				Name = weapon .. " Textures",
+				Items = galleryItems("Textures", weapon),
+				Default = selectedPath,
+				AllowDeselect = true,
+				LazyLoad = true,
+				Columns = 4,
+				MaxHeight = 260,
+				Callback = function(item)
+					CW.Library.setSelection("Textures", weapon,
+						type(item) == "table" and CW.Library.relative(item.Path) or nil)
+					if CW.reloadTextures then CW.reloadTextures() end
+				end,
+			})
+			table.insert(textureGalleries, { weapon = weapon, gallery = gallery })
+		end
+	end)
 
-	HitSection:Slider({
-		Title = "Hit Sound Volume",
-		Min = 0,
-		Max = 2,
-		Default = CW.Settings.SOUND_VOLUME,
-		Decimal = 2,
-		Suffix = "x",
-		Callback = function(v) CW.Settings.SOUND_VOLUME = v end,
-	})
+	-- Effects: one set of tracer controls for every gun (the Sniper M700 and the Taser included), shown
+	-- for the gun picked in the Gun dropdown. The switches come first, then the sliders, then the colors.
+	guarded("Effects", function()
+		local tracerPalette = {
+			Violet = Color3.fromRGB(170, 0, 255),
+			Lilac = Color3.fromRGB(200, 100, 255),
+			Red = Color3.fromRGB(255, 64, 64),
+			Green = Color3.fromRGB(64, 220, 96),
+			Cyan = Color3.fromRGB(64, 210, 255),
+			White = Color3.fromRGB(255, 255, 255),
+		}
+
+		-- Only used by the palette dropdown, which is the fallback when the loaded CWUI has no color picker.
+		local function colorName(color)
+			for name, paletteColor in pairs(tracerPalette) do
+				if color == paletteColor then return name end
+			end
+			return "Violet"
+		end
+
+		-- Colors are userdata and can't be serialised: the Sniper and Taser colors are saved as hex strings
+		-- (TRACER_SNIPER_COLOR_HEX, ...). The bullet guns store their colors as hex inside their own maps.
+		local function colorFromHex(hex)
+			if type(hex) ~= "string" then return nil end
+			local ok, color = pcall(Color3.fromHex, hex)
+			if ok and typeof(color) == "Color3" then return color end
+			return nil
+		end
+		for _, entry in ipairs({
+			{ "TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX" },
+			{ "TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX" },
+		}) do
+			local settingKey, hexKey = entry[1], entry[2]
+			CW.Settings[settingKey] = colorFromHex(CW.Settings[hexKey]) or CW.Settings[settingKey]
+			-- The saved values are consumed here. If they stayed in CW.Settings, the generic save loop would
+			-- write them back even after the player picks another color (or goes back to the default).
+			CW.Settings[hexKey] = nil
+		end
+
+		-- A colour control. Returns a function that moves it to another colour without calling onChange,
+		-- and the control itself.
+		local function addColorControl(section, title, initial, onChange)
+			local picker = section:Colorpicker({
+				Title = title,
+				Default = initial,
+				Callback = onChange,
+			})
+			if picker then
+				return function(color) picker:Set(color, true) end, picker
+			end
+
+			-- No color picker in the loaded CWUI: keep the old palette dropdown.
+			local dropdown = section:Dropdown({
+				Title = title,
+				Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
+				Default = colorName(initial),
+				Callback = function(name)
+					onChange(tracerPalette[name])
+				end,
+			})
+			return function(color) dropdown:Set(colorName(color), true) end, dropdown
+		end
+
+		local gunNames = {}
+		for _, name in ipairs(soundWeaponNames()) do table.insert(gunNames, name) end
+		if #gunNames == 0 then
+			gunNames = { "AK-47", "FAL", "M4A1", "M9", "MP5", "Remington 870", "Revolver", "M700", "Taser" }
+		end
+
+		-- The Sniper and the Taser keep their settings in TRACER_SNIPER_* / TRACER_TASER_*; every other gun
+		-- keeps them in the TRACER_GUN_* maps (gun name -> value).
+		local SPECIAL = { M700 = "TRACER_SNIPER_", Taser = "TRACER_TASER_" }
+		local KEYS = {
+			enabled = "ENABLED", color = "COLOR", glow = "GLOW", width = "WIDTH",
+			life = "LIFETIME", transparency = "TRANSPARENCY", light = "LIGHT",
+		}
+		local D = CW.GunTracerDefaults
+		local selectedGun = gunNames[1]
+		local controls = {}
+
+		local function gunMap(field) -- the settings map of one field (created again if a saved file replaced it)
+			local key = "TRACER_GUN_" .. KEYS[field]
+			if type(CW.Settings[key]) ~= "table" then CW.Settings[key] = {} end
+			return CW.Settings[key]
+		end
+
+		-- The value of one field for one gun: its own, or the starting one.
+		local function getFor(gun, field)
+			local prefix = SPECIAL[gun]
+			if prefix then
+				local value = CW.Settings[prefix .. KEYS[field]]
+				if field == "enabled" then return value == true end
+				if field == "light" or field == "glow" then return nil end -- these two do not apply to them
+				if value == nil then return D[field] end
+				return value
+			end
+			local stored = gunMap(field)[gun]
+			if field == "enabled" or field == "light" then return stored == true end
+			if field == "color" or field == "glow" then return colorFromHex(stored) or D[field] end
+			return tonumber(stored) or D[field]
+		end
+
+		local function setFor(gun, field, value)
+			local prefix = SPECIAL[gun]
+			if prefix then
+				if field == "light" or field == "glow" then return end
+				if field == "enabled" then value = value == true end
+				CW.Settings[prefix .. KEYS[field]] = value
+				return
+			end
+			if field == "enabled" or field == "light" then
+				value = value and true or nil
+			elseif field == "color" or field == "glow" then
+				value = value:ToHex()
+			end
+			gunMap(field)[gun] = value
+		end
+
+		local function setVisible(control, visible)
+			local instance = control and control.Instance
+			if instance then instance.Visible = visible end
+		end
+
+		-- Shows the selected gun's values without saving anything, and hides what does not apply to it:
+		-- the Sniper and the Taser have no glow and no light, and a longer lifetime range.
+		local function refresh()
+			local special = SPECIAL[selectedGun] ~= nil
+			controls.enabled:Set(getFor(selectedGun, "enabled"), true)
+			controls.light:Set(getFor(selectedGun, "light") == true, true)
+			controls.width:Set(getFor(selectedGun, "width"), true)
+			if special then
+				controls.lifeLong:Set(getFor(selectedGun, "life"), true)
+			else
+				controls.life:Set(getFor(selectedGun, "life"), true)
+			end
+			controls.transparency:Set(getFor(selectedGun, "transparency"), true)
+			controls.setColor(getFor(selectedGun, "color"))
+			if not special then controls.setGlow(getFor(selectedGun, "glow")) end
+
+			setVisible(controls.light, not special)
+			setVisible(controls.life, not special)
+			setVisible(controls.lifeLong, special)
+			setVisible(controls.glow, not special)
+		end
+
+		-- Copies the selected gun's settings to every gun. The Sniper and the Taser only get the color.
+		local function applyToAll()
+			local special = SPECIAL[selectedGun] ~= nil
+			local look = {
+				enabled = getFor(selectedGun, "enabled"),
+				color = getFor(selectedGun, "color"),
+				width = getFor(selectedGun, "width"),
+				life = getFor(selectedGun, "life"),
+				transparency = getFor(selectedGun, "transparency"),
+			}
+			if not special then
+				look.glow = getFor(selectedGun, "glow")
+				look.light = getFor(selectedGun, "light")
+			end
+
+			for _, name in ipairs(gunNames) do
+				if name ~= selectedGun then
+					setFor(name, "color", look.color)
+					if not SPECIAL[name] then
+						setFor(name, "enabled", look.enabled)
+						setFor(name, "width", math.clamp(look.width, 0.01, 0.5))
+						setFor(name, "life", math.clamp(look.life, 0.01, 1))
+						setFor(name, "transparency", math.clamp(look.transparency, 0, 1))
+						if look.glow ~= nil then setFor(name, "glow", look.glow) end
+						if look.light ~= nil then setFor(name, "light", look.light) end
+					end
+				end
+			end
+
+			scheduleSave()
+			CW.Log("Applied the " .. selectedGun .. " tracer to all guns (M700 and Taser: color only).")
+		end
+
+		EffectsSection:Dropdown({
+			Title = "Gun",
+			Options = gunNames,
+			Default = selectedGun,
+			Callback = function(name)
+				selectedGun = name
+				refresh()
+			end,
+		})
+
+		-- switches
+		controls.enabled = EffectsSection:Toggle({
+			Title = "Apply Custom Tracer For This Gun",
+			Default = getFor(selectedGun, "enabled"),
+			Callback = function(on) setFor(selectedGun, "enabled", on) end,
+		})
+		controls.light = EffectsSection:Toggle({
+			Title = "Tracer Light",
+			Default = getFor(selectedGun, "light") == true,
+			Callback = function(on) setFor(selectedGun, "light", on) end,
+		})
+		EffectsSection:Toggle({
+			Title = "Tracers: Apply To Others",
+			Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
+			Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
+		})
+
+		-- sliders
+		controls.width = EffectsSection:Slider({
+			Title = "Tracer Width",
+			Min = 0.01,
+			Max = 0.5,
+			Default = getFor(selectedGun, "width"),
+			Decimal = 2,
+			Callback = function(v) setFor(selectedGun, "width", v) end,
+		})
+		controls.life = EffectsSection:Slider({
+			Title = "Tracer Lifetime",
+			Min = 0.01,
+			Max = 1,
+			Default = getFor(selectedGun, "life"),
+			Decimal = 2,
+			Suffix = "s",
+			Callback = function(v) setFor(selectedGun, "life", v) end,
+		})
+		-- (the Sniper's tracer fades out over seconds, so it gets a longer range; only one of the two
+		-- lifetime sliders is visible at a time)
+		controls.lifeLong = EffectsSection:Slider({
+			Title = "Tracer Lifetime",
+			Min = 0.01,
+			Max = 5,
+			Default = D.life,
+			Decimal = 2,
+			Suffix = "s",
+			Callback = function(v) setFor(selectedGun, "life", v) end,
+		})
+		controls.transparency = EffectsSection:Slider({
+			Title = "Tracer Transparency",
+			Min = 0,
+			Max = 1,
+			Default = getFor(selectedGun, "transparency"),
+			Decimal = 2,
+			Callback = function(v) setFor(selectedGun, "transparency", v) end,
+		})
+
+		-- colors
+		controls.setColor = addColorControl(EffectsSection, "Tracer Color",
+			getFor(selectedGun, "color"), function(color) setFor(selectedGun, "color", color) end)
+		controls.setGlow, controls.glow = addColorControl(EffectsSection, "Glow Color",
+			getFor(selectedGun, "glow") or D.glow, function(color) setFor(selectedGun, "glow", color) end)
+
+		EffectsSection:Button({
+			Title = "Apply To All Guns",
+			Callback = applyToAll,
+		})
+
+		refresh()
+	end)
 end)
 
 ------------------------------------------------------------------------------
