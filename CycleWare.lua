@@ -6,7 +6,7 @@
 --   stand-in, so a single missing function disables one feature instead of aborting the
 --   whole script. What was found is stored in CW.Caps and reported once at startup.
 --=============================================================================
-local SCRIPT_VERSION = "phase-8"
+local SCRIPT_VERSION = "phase-9"
 
 local CAPS = {
 	files = type(isfile) == "function" and type(isfolder) == "function"
@@ -115,6 +115,12 @@ CW.Mouse       = Mouse
 CW.PreviousVersion = CW.Version
 CW.Version         = SCRIPT_VERSION
 CW.Caps            = CAPS
+
+-- Every bullet gun has its own tracer. A field a gun never set starts from these values.
+CW.GunTracerDefaults = {
+	color = Color3.fromRGB(170, 0, 255), glow = Color3.fromRGB(200, 100, 255),
+	width = 0.05, life = 0.05, transparency = 0.1, light = false,
+}
 
 if CW.Debug == nil then CW.Debug = true end
 CW.Debug = boolOr(_cfg.DEBUG, CW.Debug)
@@ -287,9 +293,6 @@ if settingsFileExists then
 					Hitmarker_FadeoutDuration = "HITMARKER_FADEOUT_DURATION",
 					Cursor_Size = "CURSOR_TARGET_SIZE",
 					Sound_Volume = "SOUND_VOLUME",
-					Tracer_Enabled = "CUSTOM_BULLET_TRACERS",
-					Tracer_Width = "TRACER_WIDTH",
-					Tracer_Lifetime = "TRACER_LIFETIME",
 					Tracer_ApplyToOthers = "TRACER_APPLY_TO_OTHERS",
 					Sprint_ToggleEnabled = "SHIFT_TOGGLE_ENABLED",
 					Chat_ToggleEnabled = "CHAT_TOGGLE_ENABLED",
@@ -300,18 +303,6 @@ if settingsFileExists then
 				for flag, key in pairs(legacyFlags) do
 					local entry = data[flag]
 					if type(entry) == "table" then values[key] = entry[2] end
-				end
-				if type(data.Tracer_Color) == "table" then
-					local color = data.Tracer_Color[2]
-					if type(color) == "table" and color.R and color.G and color.B then
-						values.TRACER_COLOR = Color3.new(color.R, color.G, color.B)
-					end
-				end
-				if type(data.Tracer_GlowColor) == "table" then
-					local color = data.Tracer_GlowColor[2]
-					if type(color) == "table" and color.R and color.G and color.B then
-						values.TRACER_GLOW_COLOR = Color3.new(color.R, color.G, color.B)
-					end
 				end
 			end
 
@@ -2272,18 +2263,12 @@ local function unitOr(v, default) -- a number from 0 to 1 (transparency)
 	return math.clamp(numOr(v, default), 0, 1)
 end
 
-CW.Settings.CUSTOM_BULLET_TRACERS  = boolOr(cfgValue("CUSTOM_BULLET_TRACERS", "customBulletTracers"), false)
-CW.Settings.TRACER_COLOR           = cfgValue("TRACER_COLOR", "tracerColor") or Color3.fromRGB(170, 0, 255)
-CW.Settings.TRACER_GLOW_COLOR      = cfgValue("TRACER_GLOW_COLOR", "glowColor") or Color3.fromRGB(200, 100, 255)
-CW.Settings.TRACER_WIDTH           = numOr(cfgValue("TRACER_WIDTH", "tracerWidth"), 0.05, 0.01)
-CW.Settings.TRACER_LIFETIME        = numOr(cfgValue("TRACER_LIFETIME", "tracerLifetime"), 0.05, 0.01)
-CW.Settings.TRACER_TRANSPARENCY    = unitOr(cfgValue("TRACER_TRANSPARENCY", "tracerTransparency"), 0.1)
 CW.Settings.TRACER_APPLY_TO_OTHERS = boolOr(cfgValue("TRACER_APPLY_TO_OTHERS", "applyToOthers"), false)
-CW.Settings.TRACER_POINT_LIGHT     = boolOr(cfgValue("TRACER_POINT_LIGHT", "pointLight"), false)
 
--- The Sniper (M700) and the Taser have a tracer of their own. Every other gun is covered by the
--- settings above. A kind's own settings only apply while its ENABLED setting is on; the starting
--- values are the game's own (colour, width, how long the fade takes, starting transparency).
+-- The Sniper (M700) and the Taser have a tracer of their own. Every other gun has one too (the
+-- TRACER_GUN_* maps below). A kind's width, lifetime and transparency only apply while its ENABLED
+-- setting is on; its colour also applies to the game's own tracer. The starting values are the
+-- game's own (colour, width, how long the fade takes, starting transparency).
 local KIND_DEFAULTS = {
 	Sniper = { color = Color3.fromRGB(163, 162, 165), width = 0.17, lifetime = 2.8, transparency = 0.5 },
 	Taser  = { color = Color3.fromRGB(4, 175, 236),   width = 0.2,  lifetime = 0.8, transparency = 0.5 },
@@ -2304,8 +2289,8 @@ end
 
 -- Per-gun tracers (every gun except the Sniper and the Taser, which have their own above). Each setting
 -- is a map from the gun's name to a value, so it is saved as it is: ENABLED[gun] = true, COLOR[gun] and
--- GLOW[gun] = "rrggbb", WIDTH[gun], LIFETIME[gun], TRANSPARENCY[gun]. A field that was never set for a
--- gun follows the shared Bullet Tracers settings.
+-- GLOW[gun] = "rrggbb", WIDTH[gun], LIFETIME[gun], TRANSPARENCY[gun], LIGHT[gun] = true. A field that
+-- was never set for a gun starts from CW.GunTracerDefaults. A gun without ENABLED keeps the game's tracer.
 local function copyMap(source)
 	local map = {}
 	if type(source) == "table" then
@@ -2315,14 +2300,13 @@ local function copyMap(source)
 	end
 	return map
 end
-for _, field in ipairs({ "ENABLED", "COLOR", "GLOW", "WIDTH", "LIFETIME", "TRANSPARENCY" }) do
+for _, field in ipairs({ "ENABLED", "COLOR", "GLOW", "WIDTH", "LIFETIME", "TRANSPARENCY", "LIGHT" }) do
 	CW.Settings["TRACER_GUN_" .. field] = copyMap(_cfg["TRACER_GUN_" .. field])
 end
 
 CW.Defaults = CW.Defaults or {}
 for _, key in ipairs({
-	"CUSTOM_BULLET_TRACERS", "TRACER_COLOR", "TRACER_GLOW_COLOR",
-	"TRACER_WIDTH", "TRACER_LIFETIME", "TRACER_TRANSPARENCY", "TRACER_APPLY_TO_OTHERS", "TRACER_POINT_LIGHT",
+	"TRACER_APPLY_TO_OTHERS",
 	"TRACER_SNIPER_ENABLED", "TRACER_SNIPER_COLOR", "TRACER_SNIPER_WIDTH", "TRACER_SNIPER_LIFETIME", "TRACER_SNIPER_TRANSPARENCY",
 	"TRACER_TASER_ENABLED", "TRACER_TASER_COLOR", "TRACER_TASER_WIDTH", "TRACER_TASER_LIFETIME", "TRACER_TASER_TRANSPARENCY",
 }) do
@@ -2430,13 +2414,14 @@ end
 -- The look of one gun's tracer, or nil when that gun has no tracer of its own turned on.
 local function gunStyle(weapon)
 	if gunValue("ENABLED", weapon) ~= true then return nil end
-	local S = CW.Settings
+	local D = CW.GunTracerDefaults
 	return {
-		color        = gunColor(gunValue("COLOR", weapon), S.TRACER_COLOR),
-		glow         = gunColor(gunValue("GLOW", weapon), S.TRACER_GLOW_COLOR),
-		width        = math.max(0.01, tonumber(gunValue("WIDTH", weapon)) or S.TRACER_WIDTH),
-		life         = math.max(0.01, tonumber(gunValue("LIFETIME", weapon)) or S.TRACER_LIFETIME),
-		transparency = math.clamp(tonumber(gunValue("TRANSPARENCY", weapon)) or S.TRACER_TRANSPARENCY, 0, 1),
+		color        = gunColor(gunValue("COLOR", weapon), D.color),
+		glow         = gunColor(gunValue("GLOW", weapon), D.glow),
+		width        = math.max(0.01, tonumber(gunValue("WIDTH", weapon)) or D.width),
+		life         = math.max(0.01, tonumber(gunValue("LIFETIME", weapon)) or D.life),
+		transparency = math.clamp(tonumber(gunValue("TRANSPARENCY", weapon)) or D.transparency, 0, 1),
+		light        = gunValue("LIGHT", weapon) == true,
 	}
 end
 
@@ -2454,7 +2439,7 @@ end
 
 -- Part pool: tracer parts are reused instead of created and destroyed for every bullet
 -- (shotgun pellets and automatic weapons make many per second). The PointLight is optional
--- (TRACER_POINT_LIGHT, off by default): it is created once per pooled part and only switched
+-- (a gun's LIGHT setting, off by default): it is created once per pooled part and only switched
 -- on or off afterwards, so enabling it never creates a new light per bullet.
 local MAX_POOL = 48
 local pool = CW.State.tracerPool
@@ -2502,18 +2487,16 @@ local function releasePart(part)
 	end
 end
 
--- style (optional): { color, glow, width, life, transparency } of one gun; without it the shared
--- Bullet Tracers settings are used.
+-- style: { color, glow, width, life, transparency, light } of one gun (see gunStyle).
 local function createEnergyTracer(startPos, endPos, style)
 	local camera = Workspace.CurrentCamera
 	if not camera then error("no current camera", 0) end
 
-	local S = CW.Settings
-	local color        = style and style.color or S.TRACER_COLOR
-	local glowColor    = style and style.glow or S.TRACER_GLOW_COLOR
-	local width        = style and style.width or S.TRACER_WIDTH
-	local life         = style and style.life or S.TRACER_LIFETIME
-	local transparency = style and style.transparency or S.TRACER_TRANSPARENCY
+	local color        = style.color
+	local glowColor    = style.glow
+	local width        = style.width
+	local life         = style.life
+	local transparency = style.transparency
 
 	local distance = (startPos - endPos).Magnitude
 	local midpoint = (startPos + endPos) / 2
@@ -2526,7 +2509,7 @@ local function createEnergyTracer(startPos, endPos, style)
 	core.Transparency = transparency
 
 	local light = core:FindFirstChild("CW_Light")
-	if CW.Settings.TRACER_POINT_LIGHT then
+	if style.light then
 		if not light then
 			light = Instance.new("PointLight")
 			light.Name       = "CW_Light"
@@ -2604,9 +2587,9 @@ local function createKindTracer(kind, startPos, endPos)
 end
 
 -- Without the kind's own tracer the taser and sniper keep the game's width, fade and lifetime and
--- only their color changes (to TRACER_COLOR, while custom tracers are on). The game's functions
--- create one part named "RayPart" and parent it to the camera, so the new tracer is the RayPart
--- that was not there before the call.
+-- only their color changes (to the kind's color setting, once it is not the game's own color).
+-- The game's functions create one part named "RayPart" and parent it to the camera, so the new
+-- tracer is the RayPart that was not there before the call.
 local function snapshotRayParts()
 	local seen = {}
 	local camera = Workspace.CurrentCamera
@@ -2618,22 +2601,26 @@ local function snapshotRayParts()
 	return seen
 end
 
-local function recolorNewRayParts(before)
+local function recolorNewRayParts(before, color)
 	local camera = Workspace.CurrentCamera
 	if not camera then return end
 	for _, child in ipairs(camera:GetChildren()) do
 		if child.Name == "RayPart" and not before[child] then
-			child.Color = CW.Settings.TRACER_COLOR
+			child.Color = color
 			local light = child:FindFirstChildOfClass("SurfaceLight") -- the taser has one
-			if light then light.Color = CW.Settings.TRACER_COLOR end
+			if light then light.Color = color end
 		end
 	end
 end
 
-local function shouldUseCustom(startPos)
-	if not CW.Settings.CUSTOM_BULLET_TRACERS then return false end
-	if CW.Settings.TRACER_APPLY_TO_OTHERS then return true end
-	return isLocalPlayerShot(startPos)
+-- The colour to give the game's own tracer of this kind, or nil to leave it alone: the colour setting
+-- is still the game's own, or the shot is another player's and "apply to others" is off.
+local function kindRecolor(kind, startPos)
+	local color, default = CW.Settings[KINDS[kind].prefix .. "COLOR"], KIND_DEFAULTS[kind].color
+	if typeof(color) ~= "Color3" then return nil end
+	if color.R == default.R and color.G == default.G and color.B == default.B then return nil end
+	if CW.Settings.TRACER_APPLY_TO_OTHERS or isLocalPlayerShot(startPos) then return color end
+	return nil
 end
 
 local function warnTracerFailure(err)
@@ -2645,9 +2632,9 @@ end
 -- The wrappers run on the game's own thread, so they must never throw into the game's gun
 -- code: a failing custom tracer falls back to the game's own function. The game always calls
 -- the three tracer functions with exactly two arguments (start, end).
+-- Bullet guns: the firing gun's own tracer when it has one turned on, otherwise the game's tracer.
 local function makeTracerWrapper(originalKey)
 	return function(startPos, endPos)
-		-- 1) the firing gun has a tracer of its own turned on
 		if hasGunTracers() then
 			local okStyle, style = pcall(bulletShotStyle, startPos)
 			if okStyle and style then
@@ -2657,33 +2644,25 @@ local function makeTracerWrapper(originalKey)
 			end
 		end
 
-		-- 2) the shared Bullet Tracers settings
-		local okUse, useCustom = pcall(shouldUseCustom, startPos)
-		if okUse and useCustom then
-			local okDraw, err = pcall(createEnergyTracer, startPos, endPos)
-			if okDraw then return end
-			warnTracerFailure(err)
-		end
-
-		-- 3) the game's own tracer
 		local original = CW[originalKey]
 		if original then return original(startPos, endPos) end
 	end
 end
 
--- Taser and sniper without their own tracer: the game's tracer, recolored afterwards when custom tracers apply.
-local function makeRecolorWrapper(originalKey)
+-- Taser and sniper without their own tracer: the game's tracer, recolored afterwards when the color applies.
+local function makeRecolorWrapper(kind)
+	local originalKey = KINDS[kind].original
 	return function(startPos, endPos)
-		local okUse, useCustom = pcall(shouldUseCustom, startPos)
+		local okUse, color = pcall(kindRecolor, kind, startPos)
 		local before
-		if okUse and useCustom then
+		if okUse and color then
 			local okSnapshot, snapshot = pcall(snapshotRayParts)
 			if okSnapshot then before = snapshot end
 		end
 		local original = CW[originalKey]
 		if original then original(startPos, endPos) end
 		if before then
-			local ok, err = pcall(recolorNewRayParts, before)
+			local ok, err = pcall(recolorNewRayParts, before, color)
 			if not ok then warnTracerFailure(err) end
 		end
 	end
@@ -2693,7 +2672,7 @@ end
 -- "apply to others" is on); otherwise the recolor behaviour above. Never throws into the game.
 local function makeKindWrapper(kind)
 	local info = KINDS[kind]
-	local fallback = makeRecolorWrapper(info.original)
+	local fallback = makeRecolorWrapper(kind)
 	return function(startPos, endPos)
 		if CW.Settings[info.prefix .. "ENABLED"] == true then
 			local okOwn, own = pcall(function()
@@ -3795,9 +3774,8 @@ guarded("Effects", function()
 		return "Violet"
 	end
 
-	-- Colors are userdata and can't be serialised: they are saved as hex strings (TRACER_COLOR_HEX,
-	-- TRACER_GLOW_COLOR_HEX, ...). Files written by the old palette dropdown stored a palette name
-	-- (TRACER_COLOR_NAME): it is still understood, and the next save replaces it with hex.
+	-- Colors are userdata and can't be serialised: the Sniper and Taser colors are saved as hex strings
+	-- (TRACER_SNIPER_COLOR_HEX, ...). The bullet guns store their colors as hex inside their own maps.
 	local function colorFromHex(hex)
 		if type(hex) ~= "string" then return nil end
 		local ok, color = pcall(Color3.fromHex, hex)
@@ -3805,8 +3783,6 @@ guarded("Effects", function()
 		return nil
 	end
 	for _, entry in ipairs({
-		{ "TRACER_COLOR", "TRACER_COLOR_HEX", "TRACER_COLOR_NAME" },
-		{ "TRACER_GLOW_COLOR", "TRACER_GLOW_COLOR_HEX", "TRACER_GLOW_COLOR_NAME" },
 		{ "TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX" },
 		{ "TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX" },
 	}) do
@@ -3884,45 +3860,7 @@ guarded("Effects", function()
 		Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
 	})
 
-	--// every gun except the Sniper and the Taser
-	local BulletSection = EffectsTab:AddSubSection("Bullet Tracers (all other guns)", true)
-
-	BulletSection:Toggle({
-		Title = "Custom Bullet Tracers",
-		Default = CW.Settings.CUSTOM_BULLET_TRACERS,
-		Callback = function(s) CW.Settings.CUSTOM_BULLET_TRACERS = s end,
-	})
-	addTracerColor(BulletSection, "Tracer Color", "TRACER_COLOR")
-	addTracerColor(BulletSection, "Glow Color", "TRACER_GLOW_COLOR")
-	addTracerSliders(BulletSection, "TRACER_", 1)
-	BulletSection:Toggle({
-		Title = "Tracer Light",
-		Default = CW.Settings.TRACER_POINT_LIGHT == true,
-		Callback = function(s) CW.Settings.TRACER_POINT_LIGHT = s == true end,
-	})
-
-	--// Sniper (M700) and Taser: a tracer of their own each
-	local SniperSection = EffectsTab:AddSubSection("Sniper Tracer (M700)", false)
-	SniperSection:AddLabel("Off: the game's own tracer (recolored by the Tracer Color above while Custom Bullet Tracers is on).")
-	SniperSection:Toggle({
-		Title = "Custom Sniper Tracer",
-		Default = CW.Settings.TRACER_SNIPER_ENABLED == true,
-		Callback = function(s) CW.Settings.TRACER_SNIPER_ENABLED = s == true end,
-	})
-	addTracerColor(SniperSection, "Sniper Tracer Color", "TRACER_SNIPER_COLOR")
-	addTracerSliders(SniperSection, "TRACER_SNIPER_", 5)
-
-	local TaserSection = EffectsTab:AddSubSection("Taser Tracer", false)
-	TaserSection:AddLabel("Off: the game's own tracer (recolored by the Tracer Color above while Custom Bullet Tracers is on).")
-	TaserSection:Toggle({
-		Title = "Custom Taser Tracer",
-		Default = CW.Settings.TRACER_TASER_ENABLED == true,
-		Callback = function(s) CW.Settings.TRACER_TASER_ENABLED = s == true end,
-	})
-	addTracerColor(TaserSection, "Taser Tracer Color", "TRACER_TASER_COLOR")
-	addTracerSliders(TaserSection, "TRACER_TASER_", 3)
-
-	--// every other gun, one at a time
+	--// bullet guns: every gun has its own tracer, edited one at a time
 	local gunNames = {}
 	for _, name in ipairs(soundWeaponNames()) do
 		if name ~= "M700" and name ~= "Taser" then table.insert(gunNames, name) end
@@ -3931,11 +3869,11 @@ guarded("Effects", function()
 		gunNames = { "AK-47", "FAL", "M4A1", "M9", "MP5", "Remington 870", "Revolver" }
 	end
 
-	local GunSection = EffectsTab:AddSubSection("Per-Gun Tracers", false)
-	GunSection:AddLabel("Pick a gun and turn its own tracer on. Anything you do not change follows the Bullet Tracers above. Other players' guns also need Tracers: Apply To Others.")
-
+	local GUN_FIELDS = { "ENABLED", "COLOR", "GLOW", "WIDTH", "LIFETIME", "TRANSPARENCY", "LIGHT" }
+	local D = CW.GunTracerDefaults
 	local selectedGun = gunNames[1]
 	local gunControls = {}
+	local setSniperColor, setTaserColor -- the Sniper and Taser color pickers, created further down
 
 	local function gunMap(field) -- the settings map of one field (created again if a saved file replaced it)
 		local key = "TRACER_GUN_" .. field
@@ -3947,15 +3885,23 @@ guarded("Effects", function()
 		return colorFromHex(gunMap(field)[selectedGun]) or fallback
 	end
 
-	-- Shows the selected gun's values (its own, or the shared ones it follows) without saving anything.
+	local function gunNumber(field, fallback)
+		return tonumber(gunMap(field)[selectedGun]) or fallback
+	end
+
+	-- Shows the selected gun's values (its own, or the starting ones) without saving anything.
 	local function refreshGunControls()
 		gunControls.enabled:Set(gunMap("ENABLED")[selectedGun] == true, true)
-		gunControls.color(gunColorValue("COLOR", CW.Settings.TRACER_COLOR))
-		gunControls.glow(gunColorValue("GLOW", CW.Settings.TRACER_GLOW_COLOR))
-		gunControls.width:Set(tonumber(gunMap("WIDTH")[selectedGun]) or CW.Settings.TRACER_WIDTH, true)
-		gunControls.lifetime:Set(tonumber(gunMap("LIFETIME")[selectedGun]) or CW.Settings.TRACER_LIFETIME, true)
-		gunControls.transparency:Set(tonumber(gunMap("TRANSPARENCY")[selectedGun]) or CW.Settings.TRACER_TRANSPARENCY, true)
+		gunControls.color(gunColorValue("COLOR", D.color))
+		gunControls.glow(gunColorValue("GLOW", D.glow))
+		gunControls.width:Set(gunNumber("WIDTH", D.width), true)
+		gunControls.lifetime:Set(gunNumber("LIFETIME", D.life), true)
+		gunControls.transparency:Set(gunNumber("TRANSPARENCY", D.transparency), true)
+		gunControls.light:Set(gunMap("LIGHT")[selectedGun] == true, true)
 	end
+
+	local GunSection = EffectsTab:AddSubSection("Gun Tracers", true)
+	GunSection:AddLabel("Pick a gun and turn its tracer on: every gun keeps its own settings. A gun that is off keeps the game's tracer. Other players' shots also need Tracers: Apply To Others.")
 
 	GunSection:Dropdown({
 		Title = "Gun",
@@ -3974,18 +3920,18 @@ guarded("Effects", function()
 		end,
 	})
 	gunControls.color = addColorControl(GunSection, "Tracer Color",
-		gunColorValue("COLOR", CW.Settings.TRACER_COLOR), function(color)
+		gunColorValue("COLOR", D.color), function(color)
 			gunMap("COLOR")[selectedGun] = color:ToHex()
 		end)
 	gunControls.glow = addColorControl(GunSection, "Glow Color",
-		gunColorValue("GLOW", CW.Settings.TRACER_GLOW_COLOR), function(color)
+		gunColorValue("GLOW", D.glow), function(color)
 			gunMap("GLOW")[selectedGun] = color:ToHex()
 		end)
 	gunControls.width = GunSection:Slider({
 		Title = "Tracer Width",
 		Min = 0.01,
 		Max = 0.5,
-		Default = tonumber(gunMap("WIDTH")[selectedGun]) or CW.Settings.TRACER_WIDTH,
+		Default = gunNumber("WIDTH", D.width),
 		Decimal = 2,
 		Callback = function(v) gunMap("WIDTH")[selectedGun] = v end,
 	})
@@ -3993,7 +3939,7 @@ guarded("Effects", function()
 		Title = "Tracer Lifetime",
 		Min = 0.01,
 		Max = 1,
-		Default = tonumber(gunMap("LIFETIME")[selectedGun]) or CW.Settings.TRACER_LIFETIME,
+		Default = gunNumber("LIFETIME", D.life),
 		Decimal = 2,
 		Suffix = "s",
 		Callback = function(v) gunMap("LIFETIME")[selectedGun] = v end,
@@ -4002,20 +3948,79 @@ guarded("Effects", function()
 		Title = "Tracer Transparency",
 		Min = 0,
 		Max = 1,
-		Default = tonumber(gunMap("TRANSPARENCY")[selectedGun]) or CW.Settings.TRACER_TRANSPARENCY,
+		Default = gunNumber("TRANSPARENCY", D.transparency),
 		Decimal = 2,
 		Callback = function(v) gunMap("TRANSPARENCY")[selectedGun] = v end,
+	})
+	gunControls.light = GunSection:Toggle({
+		Title = "Tracer Light",
+		Default = gunMap("LIGHT")[selectedGun] == true,
+		Callback = function(on)
+			gunMap("LIGHT")[selectedGun] = on and true or nil
+		end,
 	})
 	GunSection:Button({
 		Title = "Reset This Gun",
 		Callback = function()
-			for _, field in ipairs({ "ENABLED", "COLOR", "GLOW", "WIDTH", "LIFETIME", "TRANSPARENCY" }) do
+			for _, field in ipairs(GUN_FIELDS) do
 				gunMap(field)[selectedGun] = nil
 			end
 			refreshGunControls()
 			scheduleSave()
 		end,
 	})
+	GunSection:AddLabel("Apply To All Guns copies everything shown above (on/off, colors, width, lifetime, transparency, light) to every gun. The M700 and the Taser only get the tracer color.")
+	GunSection:Button({
+		Title = "Apply To All Guns",
+		Callback = function()
+			-- What the panel shows for this gun: its own value, or the starting one.
+			local color = gunColorValue("COLOR", D.color)
+			local values = {
+				ENABLED      = gunMap("ENABLED")[selectedGun] == true or nil,
+				COLOR        = color:ToHex(),
+				GLOW         = gunColorValue("GLOW", D.glow):ToHex(),
+				WIDTH        = gunNumber("WIDTH", D.width),
+				LIFETIME     = gunNumber("LIFETIME", D.life),
+				TRANSPARENCY = gunNumber("TRANSPARENCY", D.transparency),
+				LIGHT        = gunMap("LIGHT")[selectedGun] == true or nil,
+			}
+			for _, name in ipairs(gunNames) do
+				for _, field in ipairs(GUN_FIELDS) do
+					gunMap(field)[name] = values[field]
+				end
+			end
+
+			-- Sniper and Taser: only the color.
+			CW.Settings.TRACER_SNIPER_COLOR = color
+			CW.Settings.TRACER_TASER_COLOR = color
+			if setSniperColor then setSniperColor(color) end
+			if setTaserColor then setTaserColor(color) end
+
+			scheduleSave()
+			CW.Log("Applied the " .. selectedGun .. " tracer to all guns (M700 and Taser: color only).")
+		end,
+	})
+
+	--// Sniper (M700) and Taser: a tracer of their own each
+	local SniperSection = EffectsTab:AddSubSection("Sniper Tracer (M700)", false)
+	SniperSection:AddLabel("Off: the game's own tracer, with only the color below changed. On: width, lifetime and transparency apply too.")
+	SniperSection:Toggle({
+		Title = "Custom Sniper Tracer",
+		Default = CW.Settings.TRACER_SNIPER_ENABLED == true,
+		Callback = function(s) CW.Settings.TRACER_SNIPER_ENABLED = s == true end,
+	})
+	setSniperColor = addTracerColor(SniperSection, "Sniper Tracer Color", "TRACER_SNIPER_COLOR")
+	addTracerSliders(SniperSection, "TRACER_SNIPER_", 5)
+
+	local TaserSection = EffectsTab:AddSubSection("Taser Tracer", false)
+	TaserSection:AddLabel("Off: the game's own tracer, with only the color below changed. On: width, lifetime and transparency apply too.")
+	TaserSection:Toggle({
+		Title = "Custom Taser Tracer",
+		Default = CW.Settings.TRACER_TASER_ENABLED == true,
+		Callback = function(s) CW.Settings.TRACER_TASER_ENABLED = s == true end,
+	})
+	setTaserColor = addTracerColor(TaserSection, "Taser Tracer Color", "TRACER_TASER_COLOR")
+	addTracerSliders(TaserSection, "TRACER_TASER_", 3)
 end)
 
 ------------------------------------------------------------------------------
@@ -4547,8 +4552,6 @@ guarded("Settings", function()
 				savedSettings[hexKey] = color:ToHex()
 			end
 		end
-		saveColor("TRACER_COLOR", "TRACER_COLOR_HEX")
-		saveColor("TRACER_GLOW_COLOR", "TRACER_GLOW_COLOR_HEX")
 		saveColor("TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX")
 		saveColor("TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX")
 
