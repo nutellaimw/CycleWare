@@ -2954,6 +2954,7 @@ function CW.cleanup()
 		local contextActions = game:GetService("ContextActionService")
 		contextActions:UnbindAction("CycleWareSprintToggle")
 		contextActions:UnbindAction("CycleWareProtectSprint")
+		contextActions:UnbindAction("CycleWareCrouchFromSprint")
 	end)
 	pcall(CW.untrackAll)
 	CW.ActiveFollowClones = {}
@@ -3158,7 +3159,8 @@ local function wrapSection(section)
 	function adapter:Button(control) return section:AddButton(mapControlOptions(control)) end
 	function adapter:AddLabel(text) return section:AddLabel(text) end
 	function adapter:AddSubSection(name, open)
-		return wrapSection(section:AddSubSection({ Name = name, Open = open == nil and true or open }))
+		-- Subsections are collapsed unless the caller explicitly asks for them open.
+		return wrapSection(section:AddSubSection({ Name = name, Open = open == true }))
 	end
 	return adapter
 end
@@ -3167,7 +3169,7 @@ local function createCompatTab(options)
 	options = options or {}
 	local tabName = options.Title or options.Name or "Settings"
 	local tab = Window:AddTab({ Name = tabName, Icon = options.Icon or uiIcons[tabName] })
-	return wrapSection(tab:AddSection({ Name = tabName, Open = true }))
+	return wrapSection(tab:AddSection({ Name = tabName, Open = false }))
 end
 
 Window.Tab = function(_, options) return createCompatTab(options) end
@@ -3752,9 +3754,11 @@ end
 ------------------------------------------------------------------------------
 guarded("Cursors", function()
 	local CursorsTab = Window:AddTab({ Name = "Cursors", Icon = uiIcons.Cursors or uiIcons.Effects })
-	local HitSoundSection = wrapSection(CursorsTab:AddSection({ Name = "Hit Sound", Open = true }))
-	local CursorSection = wrapSection(CursorsTab:AddSection({ Name = "Cursors", Open = true }))
-	local HitmarkerSection = wrapSection(CursorsTab:AddSection({ Name = "Hitmarkers", Open = true }))
+	-- Section order on the page is the creation order: Cursors first, then Hit Sound, then Hitmarkers.
+	-- Every section starts collapsed.
+	local CursorSection = wrapSection(CursorsTab:AddSection({ Name = "Cursors", Open = false }))
+	local HitSoundSection = wrapSection(CursorsTab:AddSection({ Name = "Hit Sound", Open = false }))
+	local HitmarkerSection = wrapSection(CursorsTab:AddSection({ Name = "Hitmarkers", Open = false }))
 
 	guarded("Hit Sound", function()
 		HitSoundDropdown = HitSoundSection:Dropdown({
@@ -3898,10 +3902,10 @@ end)
 ------------------------------------------------------------------------------
 guarded("Guns", function()
 	local GunsTab = Window:AddTab({ Name = "Guns", Icon = uiIcons.Guns or uiIcons.Visuals })
-	local ShootSection = wrapSection(GunsTab:AddSection({ Name = "Shoot Sounds", Open = true }))
-	local ReloadSection = wrapSection(GunsTab:AddSection({ Name = "Reload Sounds", Open = true }))
-	local TextureSection = wrapSection(GunsTab:AddSection({ Name = "Textures", Open = true }))
-	local EffectsSection = wrapSection(GunsTab:AddSection({ Name = "Effects", Open = true }))
+	local ShootSection = wrapSection(GunsTab:AddSection({ Name = "Shoot Sounds", Open = false }))
+	local ReloadSection = wrapSection(GunsTab:AddSection({ Name = "Reload Sounds", Open = false }))
+	local TextureSection = wrapSection(GunsTab:AddSection({ Name = "Textures", Open = false }))
+	local EffectsSection = wrapSection(GunsTab:AddSection({ Name = "Effects", Open = false }))
 
 	-- Same controls for every changer: the two switches, then each gun's sound file with its own volume
 	-- (the volume also applies while the gun keeps the game's own sound).
@@ -4251,6 +4255,159 @@ guarded("Utilities", function()
 	local allowSprintRelease = false
 	local heldShiftKeys = {}
 
+	-- Crouch while the sprint toggle is on.
+	-- The game only lets you crouch when its own "isRunning" flag is false, and that flag only clears
+	-- when it sees LeftShift being released. The toggle swallows that release on purpose (it keeps you
+	-- running), so C used to do nothing until Shift was pressed again. The C handler below fixes that:
+	-- it releases Shift for the game, waits for the run speed to drop, replays C so the game crouches,
+	-- and presses Shift again once you stand up.
+	local sprintKeyInput
+	pcall(function()
+		sprintKeyInput = game:GetService("VirtualInputManager")
+	end)
+	local KEY_VK = { [Enum.KeyCode.LeftShift] = 0xA0, [Enum.KeyCode.C] = 0x43 }
+	local canSendKeys = sprintKeyInput ~= nil
+		or (type(keypress) == "function" and type(keyrelease) == "function")
+
+	local resumeAfterCrouch = false     -- we crouched out of a toggled sprint: run again after standing
+	local syntheticShiftPending = false -- the next LeftShift press is ours, not the player's
+	local replayingCrouchKey = false    -- the next C press is ours, let it reach the game
+	local crouchSequenceBusy = false
+	local standToken = 0
+
+	local function sendKey(keyCode, down)
+		if sprintKeyInput then
+			local ok = pcall(function()
+				sprintKeyInput:SendKeyEvent(down, keyCode, false, game)
+			end)
+			if ok then return true end
+		end
+		local fn = down and keypress or keyrelease
+		local vk = KEY_VK[keyCode]
+		if type(fn) == "function" and vk then
+			return (pcall(fn, vk))
+		end
+		return false
+	end
+
+	local function getHumanoid()
+		local character = LocalPlayer.Character
+		return character and character:FindFirstChildOfClass("Humanoid")
+	end
+
+	-- The game lowers CameraOffset to -2.5 the moment it starts crouching and resets it when it stands.
+	local function isCrouching()
+		local humanoid = getHumanoid()
+		return humanoid ~= nil and humanoid.CameraOffset.Y < -1
+	end
+
+	local function resetSprintState()
+		sprinting = false
+		allowSprintRelease = false
+		resumeAfterCrouch = false
+		syntheticShiftPending = false
+		replayingCrouchKey = false
+		crouchSequenceBusy = false
+		standToken += 1
+		table.clear(heldShiftKeys)
+	end
+
+	-- Presses LeftShift for the game and marks the toggle as running, without waiting for a release.
+	local function resumeSprint()
+		if not CW.Settings.SHIFT_TOGGLE_ENABLED or isCrouching() then return end
+		syntheticShiftPending = true
+		if not sendKey(Enum.KeyCode.LeftShift, true) then
+			syntheticShiftPending = false
+			return
+		end
+		sprinting = true
+		allowSprintRelease = false
+		task.delay(0.5, function() syntheticShiftPending = false end)
+	end
+
+	local function crouchFromSprint()
+		crouchSequenceBusy = true
+		local token = standToken
+
+		-- 1) let the game see Shift go up, so its isRunning flag clears
+		sprinting = false
+		allowSprintRelease = true
+		sendKey(Enum.KeyCode.LeftShift, false)
+
+		local humanoid = getHumanoid()
+		local startedAt = os.clock()
+		repeat
+			task.wait()
+		until token ~= standToken or not humanoid or humanoid.Parent == nil
+			or humanoid.WalkSpeed <= 16.5 or os.clock() - startedAt > 0.3
+		if token ~= standToken then return end
+
+		-- 2) replay C, now that the game no longer thinks we are running
+		replayingCrouchKey = true
+		sendKey(Enum.KeyCode.C, true)
+		task.wait(0.02)
+		sendKey(Enum.KeyCode.C, false)
+
+		startedAt = os.clock()
+		repeat
+			task.wait()
+		until token ~= standToken or isCrouching() or os.clock() - startedAt > 0.3
+		if token ~= standToken then return end
+		replayingCrouchKey = false
+
+		-- 3) crouched: run again after standing. The game refused (busy, seated...): keep running.
+		if isCrouching() then
+			resumeAfterCrouch = true
+		else
+			resumeSprint()
+		end
+		crouchSequenceBusy = false
+	end
+
+	-- Called when the player presses C to stand up. The game may refuse ("You can't stand up here!"),
+	-- so the sprint only resumes once the camera offset is back; otherwise the flag stays for next time.
+	local function watchStandUp()
+		standToken += 1
+		local mine = standToken
+		task.spawn(function()
+			local startedAt = os.clock()
+			repeat
+				task.wait()
+			until mine ~= standToken or not isCrouching() or os.clock() - startedAt > 1.5
+			if mine ~= standToken then return end
+			if not isCrouching() and resumeAfterCrouch then
+				resumeAfterCrouch = false
+				resumeSprint()
+			end
+		end)
+	end
+
+	local function onCrouchKey(_, inputState)
+		if inputState ~= Enum.UserInputState.Begin then
+			return Enum.ContextActionResult.Pass
+		end
+		if replayingCrouchKey then
+			return Enum.ContextActionResult.Pass
+		end
+		if not CW.Settings.SHIFT_TOGGLE_ENABLED or not canSendKeys then
+			return Enum.ContextActionResult.Pass
+		end
+		if crouchSequenceBusy then
+			return Enum.ContextActionResult.Sink
+		end
+
+		if isCrouching() then
+			if resumeAfterCrouch then watchStandUp() end
+			return Enum.ContextActionResult.Pass
+		end
+
+		if sprinting then
+			task.spawn(crouchFromSprint)
+			return Enum.ContextActionResult.Sink
+		end
+		return Enum.ContextActionResult.Pass
+	end
+
 	local function onSprintShift(_, inputState, inputObject)
 		local keyCode = inputObject and inputObject.KeyCode
 
@@ -4259,9 +4416,20 @@ guarded("Utilities", function()
 				return Enum.ContextActionResult.Pass
 			end
 
+			-- Our own press from resumeSprint: the state was already updated there.
+			if syntheticShiftPending then
+				syntheticShiftPending = false
+				return Enum.ContextActionResult.Pass
+			end
+
 			local anotherShiftHeld = next(heldShiftKeys) ~= nil
 			if keyCode then heldShiftKeys[keyCode] = true end
 			if anotherShiftHeld or not CW.Settings.SHIFT_TOGGLE_ENABLED then
+				return Enum.ContextActionResult.Pass
+			end
+
+			-- The game ignores Shift while crouched, so it must not flip the toggle either.
+			if isCrouching() then
 				return Enum.ContextActionResult.Pass
 			end
 
@@ -4324,11 +4492,18 @@ guarded("Utilities", function()
 	if CW.State.sprintCharacterConn then
 		CW.State.sprintCharacterConn:Disconnect()
 	end
-	CW.State.sprintCharacterConn = LocalPlayer.CharacterAdded:Connect(function()
-		sprinting = false
-		allowSprintRelease = false
-		table.clear(heldShiftKeys)
-	end)
+	CW.State.sprintCharacterConn = LocalPlayer.CharacterAdded:Connect(resetSprintState)
+
+	-- C is only intercepted while a toggled sprint is active (or while our own crouch is in progress);
+	-- in every other case it passes straight through to the game.
+	ContextActionService:UnbindAction("CycleWareCrouchFromSprint")
+	ContextActionService:BindActionAtPriority(
+		"CycleWareCrouchFromSprint",
+		onCrouchKey,
+		false,
+		Enum.ContextActionPriority.High.Value,
+		Enum.KeyCode.C
+	)
 
 	UtilityTab:Toggle({
 		Title = "Toggle Sprint with Shift",
@@ -4338,6 +4513,11 @@ guarded("Utilities", function()
 			if not CW.Settings.SHIFT_TOGGLE_ENABLED then
 				allowSprintRelease = sprinting or allowSprintRelease
 				sprinting = false
+				resumeAfterCrouch = false
+				syntheticShiftPending = false
+				replayingCrouchKey = false
+				crouchSequenceBusy = false
+				standToken += 1
 			end
 		end,
 	})
