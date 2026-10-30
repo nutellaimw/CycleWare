@@ -4271,23 +4271,32 @@ guarded("Utilities", function()
 
 	local resumeAfterCrouch = false     -- we crouched out of a toggled sprint: run again after standing
 	local syntheticShiftPending = false -- the next LeftShift press is ours, not the player's
-	local replayingCrouchKey = false    -- the next C press is ours, let it reach the game
+	local expectedCrouchReplays = 0     -- C presses we sent ourselves that must still reach the game
 	local crouchSequenceBusy = false
+	local crouchFailureWarned = false
 	local standToken = 0
 
-	local function sendKey(keyCode, down)
-		if sprintKeyInput then
-			local ok = pcall(function()
+	-- Sends a key to the game. VirtualInputManager first; the executor's own keypress/keyrelease
+	-- (a real OS key event) when it is missing or when preferOs is set. Returns true if one accepted it.
+	local function sendKey(keyCode, down, preferOs)
+		local function viaVirtualInput()
+			if not sprintKeyInput then return false end
+			return (pcall(function()
 				sprintKeyInput:SendKeyEvent(down, keyCode, false, game)
-			end)
-			if ok then return true end
+			end))
 		end
-		local fn = down and keypress or keyrelease
-		local vk = KEY_VK[keyCode]
-		if type(fn) == "function" and vk then
+		local function viaExecutor()
+			local fn
+			if down then fn = keypress else fn = keyrelease end
+			local vk = KEY_VK[keyCode]
+			if type(fn) ~= "function" or not vk then return false end
 			return (pcall(fn, vk))
 		end
-		return false
+
+		if preferOs then
+			return viaExecutor() or viaVirtualInput()
+		end
+		return viaVirtualInput() or viaExecutor()
 	end
 
 	local function getHumanoid()
@@ -4306,7 +4315,7 @@ guarded("Utilities", function()
 		allowSprintRelease = false
 		resumeAfterCrouch = false
 		syntheticShiftPending = false
-		replayingCrouchKey = false
+		expectedCrouchReplays = 0
 		crouchSequenceBusy = false
 		standToken += 1
 		table.clear(heldShiftKeys)
@@ -4342,23 +4351,45 @@ guarded("Utilities", function()
 			or humanoid.WalkSpeed <= 16.5 or os.clock() - startedAt > 0.3
 		if token ~= standToken then return end
 
-		-- 2) replay C, now that the game no longer thinks we are running
-		replayingCrouchKey = true
-		sendKey(Enum.KeyCode.C, true)
-		task.wait(0.02)
-		sendKey(Enum.KeyCode.C, false)
-
+		-- 2) The real C is still physically down at this point, and the engine ignores a second "key
+		-- down" for a key it already sees as down. Wait for the player to let go before replaying it.
 		startedAt = os.clock()
-		repeat
+		while UserInputService:IsKeyDown(Enum.KeyCode.C)
+			and os.clock() - startedAt < 0.5 and token == standToken do
 			task.wait()
-		until token ~= standToken or isCrouching() or os.clock() - startedAt > 0.3
+		end
 		if token ~= standToken then return end
-		replayingCrouchKey = false
+		task.wait(0.03)
 
-		-- 3) crouched: run again after standing. The game refused (busy, seated...): keep running.
+		-- 3) replay C now that the game no longer thinks we are running. Up to three tries, and
+		-- never one after the character is already crouched (that would stand it back up).
+		-- Try 1 and 3 go through VirtualInputManager, try 2 through the executor's real key press.
+		for attempt = 1, 3 do
+			if token ~= standToken then return end
+			if isCrouching() then break end
+
+			expectedCrouchReplays = 1
+			local viaExecutor = attempt == 2
+			sendKey(Enum.KeyCode.C, true, viaExecutor)
+			task.wait(0.05)
+			sendKey(Enum.KeyCode.C, false, viaExecutor)
+
+			startedAt = os.clock()
+			repeat
+				task.wait()
+			until token ~= standToken or isCrouching() or os.clock() - startedAt > 0.25
+			expectedCrouchReplays = 0
+		end
+		if token ~= standToken then return end
+
+		-- 4) crouched: run again after standing. The game refused (busy, seated...): keep running.
 		if isCrouching() then
 			resumeAfterCrouch = true
 		else
+			if not crouchFailureWarned then
+				crouchFailureWarned = true
+				CW.Warn("Crouch while sprinting: the game did not crouch after the key was replayed.")
+			end
 			resumeSprint()
 		end
 		crouchSequenceBusy = false
@@ -4386,7 +4417,10 @@ guarded("Utilities", function()
 		if inputState ~= Enum.UserInputState.Begin then
 			return Enum.ContextActionResult.Pass
 		end
-		if replayingCrouchKey then
+		-- One of our own replays: let it through to the game. Anything else pressed while the
+		-- sequence runs is swallowed, so a second real C cannot toggle the crouch back off.
+		if expectedCrouchReplays > 0 then
+			expectedCrouchReplays -= 1
 			return Enum.ContextActionResult.Pass
 		end
 		if not CW.Settings.SHIFT_TOGGLE_ENABLED or not canSendKeys then
@@ -4515,7 +4549,7 @@ guarded("Utilities", function()
 				sprinting = false
 				resumeAfterCrouch = false
 				syntheticShiftPending = false
-				replayingCrouchKey = false
+				expectedCrouchReplays = 0
 				crouchSequenceBusy = false
 				standToken += 1
 			end
