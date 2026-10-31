@@ -23,15 +23,7 @@ The only thing in usage as imagelabel is the hitmarker. But we plan to change th
 
 You executor must support these sUNC functions:
 
-Full File API,
-getcustomasset,
-getgenv,
-gethui,
-hookmetamethod,
-newcclosure,
-checkcaller,
-getnamecallmethod.
-
+TO BE ADDED
 
 ## Other
 
