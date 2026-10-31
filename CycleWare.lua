@@ -4258,16 +4258,9 @@ guarded("Utilities", function()
 	-- Crouch while the sprint toggle is on.
 	-- The game only lets you crouch when its own "isRunning" flag is false, and that flag only clears
 	-- when it sees LeftShift being released. The toggle swallows that release on purpose (it keeps you
-	-- running), so C used to do nothing until Shift was pressed again. The C handler below fixes that.
-	--
-	-- Fast path (executor with getconnections + debug.getupvalues): the game keeps its input state in
-	-- one local table (isRunning, isCrouching, seated...) that its InputBegan handler captures. We find
-	-- that table and clear isRunning ourselves, in the same instant C is pressed and before the game's
-	-- own C handler reads it, so the real C goes straight through: no replayed keys, no delay. The same
-	-- table lets us resume the sprint the moment you stand up, and stop it when the toggle is disabled.
-	--
-	-- Fallback (no such functions): release Shift for the game, wait for the run speed to drop, replay C
-	-- and press Shift again once you stand up. It works, but it takes a noticeable moment.
+	-- running), so C used to do nothing until Shift was pressed again. The C handler below fixes that:
+	-- it releases Shift for the game, waits for the run speed to drop, replays C so the game crouches,
+	-- and presses Shift again once you stand up.
 	local sprintKeyInput
 	pcall(function()
 		sprintKeyInput = game:GetService("VirtualInputManager")
@@ -4311,68 +4304,8 @@ guarded("Utilities", function()
 		return character and character:FindFirstChildOfClass("Humanoid")
 	end
 
-	-- The game's input state table, found through the upvalues of its InputBegan handler.
-	local gameState, gameStateCharacter, lastStateSearch = nil, nil, 0
-
-	local function findGameState()
-		local getUpvalues = (type(debug) == "table" and debug.getupvalues) or getupvalues
-		if type(getconnections) ~= "function" or type(getUpvalues) ~= "function" then
-			return nil
-		end
-
-		local found
-		pcall(function()
-			for _, connection in ipairs(getconnections(UserInputService.InputBegan)) do
-				local fn = connection.Function
-				if type(fn) == "function" then
-					local _, ours = pcall(isexecutorclosure or function() return false end, fn)
-					if not ours then
-						local _, upvalues = pcall(getUpvalues, fn)
-						for _, upvalue in pairs(type(upvalues) == "table" and upvalues or {}) do
-							if type(upvalue) == "table"
-								and rawget(upvalue, "isRunning") ~= nil
-								and rawget(upvalue, "isCrouching") ~= nil then
-								found = upvalue
-								return
-							end
-						end
-					end
-				end
-			end
-		end)
-		return found
-	end
-
-	-- Cached per character (the game's script is recreated on every respawn).
-	local function getGameState()
-		local character = LocalPlayer.Character
-		if not character then return nil end
-		if gameState and gameStateCharacter == character then return gameState end
-
-		gameState = nil
-		if os.clock() - lastStateSearch < 0.5 then return nil end
-		lastStateSearch = os.clock()
-
-		gameState = findGameState()
-		gameStateCharacter = gameState and character or nil
-		return gameState
-	end
-
-	-- True when any flag other than the ignored ones is set (the game's own isBusy rule).
-	local function stateIsBusy(state, ignoredA, ignoredB)
-		for key, value in pairs(state) do
-			if value and key ~= ignoredA and key ~= ignoredB then
-				return true
-			end
-		end
-		return false
-	end
-
-	-- The game's flag when we have it; otherwise the camera offset, which the game lowers to -2.5 the
-	-- moment it starts crouching and resets when it stands.
+	-- The game lowers CameraOffset to -2.5 the moment it starts crouching and resets it when it stands.
 	local function isCrouching()
-		local state = getGameState()
-		if state then return state.isCrouching == true end
 		local humanoid = getHumanoid()
 		return humanoid ~= nil and humanoid.CameraOffset.Y < -1
 	end
@@ -4384,27 +4317,13 @@ guarded("Utilities", function()
 		syntheticShiftPending = false
 		expectedCrouchReplays = 0
 		crouchSequenceBusy = false
-		gameState, gameStateCharacter = nil, nil
 		standToken += 1
 		table.clear(heldShiftKeys)
 	end
 
-	-- Starts running again and marks the toggle as running.
+	-- Presses LeftShift for the game and marks the toggle as running, without waiting for a release.
 	local function resumeSprint()
 		if not CW.Settings.SHIFT_TOGGLE_ENABLED or isCrouching() then return end
-
-		local state = getGameState()
-		local humanoid = getHumanoid()
-		if state and humanoid then
-			-- What the game does when Shift goes down, unless something else (arrest, taze...) is active.
-			if stateIsBusy(state, "isRunning") then return end
-			state.isRunning = true
-			humanoid.WalkSpeed = 24
-			sprinting = true
-			allowSprintRelease = false
-			return
-		end
-
 		syntheticShiftPending = true
 		if not sendKey(Enum.KeyCode.LeftShift, true) then
 			syntheticShiftPending = false
@@ -4413,22 +4332,6 @@ guarded("Utilities", function()
 		sprinting = true
 		allowSprintRelease = false
 		task.delay(0.5, function() syntheticShiftPending = false end)
-	end
-
-	-- Stops the game's sprint right now, as if Shift had been released (used when the toggle is turned
-	-- off while it is holding a sprint).
-	local function stopSprint()
-		local state = getGameState()
-		local humanoid = getHumanoid()
-		if state and humanoid then
-			-- The game's own release rule: it leaves the speed alone while crouched, tazed, etc.
-			if not stateIsBusy(state, "isRunning", "seated") then
-				state.isRunning = false
-				humanoid.WalkSpeed = 16
-			end
-			return
-		end
-		sendKey(Enum.KeyCode.LeftShift, false)
 	end
 
 	local function crouchFromSprint()
@@ -4510,54 +4413,17 @@ guarded("Utilities", function()
 		end)
 	end
 
-	-- Fast path. Runs inside the C press, before the game's own C handler: clearing isRunning here
-	-- makes that handler see a player who is not running, so the real C crouches immediately.
-	local function crouchDirect(state)
-		-- Something else is active (fighting, arrested...): the game will refuse to crouch, so the
-		-- sprint is left alone.
-		if stateIsBusy(state, "isRunning") then
-			return Enum.ContextActionResult.Pass
-		end
-
-		state.isRunning = false
-		local humanoid = getHumanoid()
-		if humanoid then humanoid.WalkSpeed = 16 end
-		sprinting = false
-		allowSprintRelease = false
-		resumeAfterCrouch = false
-
-		standToken += 1
-		local mine = standToken
-		task.spawn(function()
-			local startedAt = os.clock()
-			repeat
-				task.wait()
-			until mine ~= standToken or isCrouching() or os.clock() - startedAt > 0.25
-			if mine ~= standToken then return end
-			if isCrouching() then
-				resumeAfterCrouch = true -- run again when standing up
-			else
-				resumeSprint()           -- the game refused after all: keep running
-			end
-		end)
-		return Enum.ContextActionResult.Pass
-	end
-
 	local function onCrouchKey(_, inputState)
 		if inputState ~= Enum.UserInputState.Begin then
 			return Enum.ContextActionResult.Pass
 		end
-		-- One of our own replays (fallback path): let it through to the game. Anything else pressed
-		-- while that sequence runs is swallowed, so a second real C cannot toggle the crouch back off.
+		-- One of our own replays: let it through to the game. Anything else pressed while the
+		-- sequence runs is swallowed, so a second real C cannot toggle the crouch back off.
 		if expectedCrouchReplays > 0 then
 			expectedCrouchReplays -= 1
 			return Enum.ContextActionResult.Pass
 		end
-		if not CW.Settings.SHIFT_TOGGLE_ENABLED then
-			return Enum.ContextActionResult.Pass
-		end
-		local state = getGameState()
-		if not state and not canSendKeys then
+		if not CW.Settings.SHIFT_TOGGLE_ENABLED or not canSendKeys then
 			return Enum.ContextActionResult.Pass
 		end
 		if crouchSequenceBusy then
@@ -4570,15 +4436,9 @@ guarded("Utilities", function()
 		end
 
 		if sprinting then
-			if state then
-				return crouchDirect(state)
-			end
 			task.spawn(crouchFromSprint)
 			return Enum.ContextActionResult.Sink
 		end
-
-		-- A crouch that did not start from a sprint must not bring one back when standing up.
-		resumeAfterCrouch = false
 		return Enum.ContextActionResult.Pass
 	end
 
@@ -4668,8 +4528,8 @@ guarded("Utilities", function()
 	end
 	CW.State.sprintCharacterConn = LocalPlayer.CharacterAdded:Connect(resetSprintState)
 
-	-- C always reaches the game, except on the fallback path where the first press of a toggled sprint
-	-- is held back and replayed.
+	-- C is only intercepted while a toggled sprint is active (or while our own crouch is in progress);
+	-- in every other case it passes straight through to the game.
 	ContextActionService:UnbindAction("CycleWareCrouchFromSprint")
 	ContextActionService:BindActionAtPriority(
 		"CycleWareCrouchFromSprint",
@@ -4685,7 +4545,6 @@ guarded("Utilities", function()
 		Callback = function(enabled)
 			CW.Settings.SHIFT_TOGGLE_ENABLED = enabled == true
 			if not CW.Settings.SHIFT_TOGGLE_ENABLED then
-				local wasSprinting = sprinting
 				allowSprintRelease = sprinting or allowSprintRelease
 				sprinting = false
 				resumeAfterCrouch = false
@@ -4693,12 +4552,6 @@ guarded("Utilities", function()
 				expectedCrouchReplays = 0
 				crouchSequenceBusy = false
 				standToken += 1
-
-				-- Turning the toggle off must also end the sprint it was holding. If Shift is
-				-- physically down, the game keeps sprinting by itself until it is released.
-				if wasSprinting and not UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
-					stopSprint()
-				end
 			end
 		end,
 	})
