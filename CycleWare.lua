@@ -16,6 +16,7 @@ local CAPS = {
 	getgenv = type(getgenv) == "function",
 	gethui = type(gethui) == "function",
 	hook = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function",
+	signals = type(firesignal) == "function" or type(getconnections) == "function",
 	request = (type(request) == "function" and request)
 		or (type(http_request) == "function" and http_request)
 		or (syn and type(syn.request) == "function" and syn.request)
@@ -204,6 +205,7 @@ do
 	if not CAPS.files then table.insert(missing, "file functions (asset library, cursor, textures, sounds and saved settings are disabled)") end
 	if not CAPS.customAsset then table.insert(missing, "getcustomasset (custom images and sounds are disabled)") end
 	if not CAPS.hook then table.insert(missing, "hookmetamethod/getnamecallmethod (hitmarker and hit sound detection is disabled)") end
+	if not CAPS.signals then table.insert(missing, "firesignal/getconnections (Auto Reload presses R instead of reloading instantly)") end
 	if not CAPS.gethui then table.insert(missing, "gethui (using CoreGui instead)") end
 	if not CAPS.httpGet and not CAPS.request then table.insert(missing, "HTTP (asset sync and the UI download are disabled)") end
 	if #missing > 0 then
@@ -4249,6 +4251,7 @@ guarded("Utilities", function()
 
 	local StarterGui = game:GetService("StarterGui")
 	local ContextActionService = game:GetService("ContextActionService")
+	local RunService = game:GetService("RunService")
 	-- Kept in CW.State so a re-run still knows that the chat was hidden with Z.
 	local chatHidden = CW.State.chatHidden == true
 	-- >>> SPRINT TOGGLE BEGIN
@@ -4270,7 +4273,6 @@ guarded("Utilities", function()
 	-- Pausing: the game sets the "BackpackEnabled" attribute of the player to false while it crouches, is
 	-- tased, arrested or in a camera, and back to true when that ends. A latched sprint pauses while it is
 	-- false and resumes by itself afterwards, so standing up from a crouch keeps you running.
-	local RunService = game:GetService("RunService")
 	local WALK_SPEED, SPRINT_SPEED = 16, 24
 
 	local sprintLatched = false -- the toggle is holding a sprint
@@ -4475,10 +4477,41 @@ guarded("Utilities", function()
 		end,
 	})
 
+	-- >>> AUTO RELOAD BEGIN
 	-- Auto reload (off by default).
-	-- It reads the equipped gun's own attributes instead of the ammo text on screen: the game keeps
-	-- Local_CurrentAmmo (the client's count) and Local_ReloadSession (0 when idle, a timestamp while
-	-- reloading) on the tool, and the sniper's text ("1 | 14") is not a plain "x/y" anyway.
+	--
+	-- How the game handles a reload (ReplicatedStorage.Scripts.ToolScripts.GunController):
+	--   * Every gun keeps Local_CurrentAmmo (the client's count) and Local_ReloadSession (0 when idle, a
+	--     timestamp while a reload counts down). reload() only checks that no reload is running. It does NOT
+	--     check that the magazine is empty, so any call on a full gun starts a whole reload (animation, "..."
+	--     label, a request to the server, the cooldown).
+	--   * reload() is reached by the R key (InputBegan) and by GunFrame.TouchReloadButton.MouseButton1Down,
+	--     whose handler is just "reload()". The button path needs no key event, so it runs in the same frame
+	--     it is fired and is not subject to gameProcessed or to a focused chat box.
+	--   * Equipping is done by Character.ChildAdded, and it overwrites Local_CurrentAmmo with the server's
+	--     CurrentAmmo (synchronously, no yield before it). Until that handler has run, Local_CurrentAmmo still
+	--     holds the value from the last time the gun was held, and the order of two handlers on the same event
+	--     is not guaranteed.
+	--   * Unequipping does not cancel a reload: the countdown goes on and refills the gun only if it is held
+	--     again by the time it ends. The equip handler also writes the server's count into the label, which
+	--     replaces the "..." the game itself wanted to show.
+	--
+	-- Speed: the reload is requested in the same frame the last bullet is fired. The change of
+	-- Local_CurrentAmmo to 0 queues a check with task.defer (it runs right after the game's shooting code
+	-- yields, so the game cannot overwrite the "..." label afterwards), and the check fires the game's own
+	-- reload button signal. A per-frame check stays on as a safety net and handles retries.
+	--
+	-- Safety: the first versions pressed R from an event handler and sometimes read the stale 0 left in
+	-- Local_CurrentAmmo from the previous time the gun was held, before the game's equip handler had refreshed
+	-- it (an extra reload after unequip/equip). Now every check is deferred until the game's handlers have run,
+	-- and a 0 that was only found by looking (not one the gun just changed to) is trusted once the count matches
+	-- the server's (the game copies it at equip) or after a short settle time. A 0 that arrives as a change
+	-- while the gun is being watched is a real shot and needs no wait. Everything is read again right before
+	-- the request.
+	--
+	-- Executors: the button signal is fired with firesignal (or getconnections). If neither exists, the startup
+	-- report says so and the R key is used. If they exist but fail, that error is kept, warned once, and the
+	-- R key is used instead.
 	local VirtualInputManager
 	pcall(function()
 		VirtualInputManager = game:GetService("VirtualInputManager")
@@ -4538,6 +4571,11 @@ guarded("Utilities", function()
 		CW.Settings.AUTO_RELOAD_ENABLED = _cfg.AUTO_RELOAD_ENABLED == true
 	end
 
+	local RELOAD_EQUIP_SETTLE = 0.15 -- longest wait to trust a 0 that was found by looking right after equipping
+	local RELOAD_RETRY_DELAY = 0.1   -- seconds to wait for the game to start the reload we asked for
+	local RELOAD_MAX_TRIES = 3       -- requests for one empty gun before backing off
+	local RELOAD_BACKOFF = 2         -- seconds without requests after that
+
 	-- True when the gun is empty, not already reloading, and the game would accept a reload
 	-- (the sniper cannot reload without stored ammo).
 	local function needsReload(tool)
@@ -4548,45 +4586,213 @@ guarded("Utilities", function()
 		return true
 	end
 
-	local reloading = setmetatable({}, { __mode = "k" })
-	local function autoReload(tool)
-		if reloading[tool] then return end
-		reloading[tool] = true
-		task.spawn(function()
-			-- At most two presses; the second only if the first did not start a reload.
-			for _ = 1, 2 do
-				if not needsReload(tool) or tool.Parent ~= LocalPlayer.Character then break end
-				if UserInputService:GetFocusedTextBox() or UserInputService:IsKeyDown(Enum.KeyCode.R) then break end
-				pressReloadKey()
-				task.wait(0.15)
-				if tool:GetAttribute("Local_ReloadSession") ~= 0 then break end
+	local function reloadStarted(tool)
+		local session = tool:GetAttribute("Local_ReloadSession")
+		return session ~= nil and session ~= 0
+	end
+
+	-- Elements of the game's gun HUD, found when first needed.
+	local hudCache = {}
+	local function gunHud(name)
+		local cached = hudCache[name]
+		if cached and cached.Parent then return cached end
+		local node = LocalPlayer:FindFirstChild("PlayerGui")
+		for _, step in ipairs({ "Home", "hud", "BottomRightFrame", "GunFrame", name }) do
+			node = node and node:FindFirstChild(step)
+		end
+		hudCache[name] = node
+		return node
+	end
+
+	-- Runs the handlers connected to a signal of the game, each in its own thread (a handler such as
+	-- reload() waits for the cooldown, so it must not run in ours).
+	local function fireGameSignal(signal)
+		if type(firesignal) == "function" then
+			firesignal(signal)
+			return
+		end
+		if type(getconnections) == "function" then
+			local fired = false
+			for _, connection in ipairs(getconnections(signal)) do
+				if type(connection.Fire) == "function" then
+					connection:Fire()
+					fired = true
+				elseif type(connection.Function) == "function" then
+					task.spawn(connection.Function)
+					fired = true
+				end
 			end
-			reloading[tool] = nil
+			if fired then return end
+		end
+		error("neither firesignal nor getconnections can run the game's reload button")
+	end
+
+	-- CW.Caps.signals is false when the executor has neither firesignal nor getconnections (reported once at
+	-- startup); the R key is used then.
+	local directReloadEnabled = CW.Caps.signals == true
+	local directFailures = 0
+	local directError
+
+	-- Asks the game to reload this gun. Fastest first: the game's own reload button, which runs reload()
+	-- right here; the R key when that is unavailable or has stopped working. Returns false when nothing
+	-- could be sent (chat has focus, or the player is holding R), so the attempt is not counted.
+	local function triggerReload(tool)
+		if directReloadEnabled then
+			local button = gunHud("TouchReloadButton")
+			if button then
+				local ok, err = pcall(fireGameSignal, button.MouseButton1Down)
+				if ok then
+					-- reload() sets Local_ReloadSession before its first yield, so a working executor
+					-- shows it at once. Allow a couple of frames for one that runs the handlers later.
+					local waited = 0
+					while not reloadStarted(tool) and waited < 2 do
+						RunService.Heartbeat:Wait()
+						waited += 1
+					end
+					if reloadStarted(tool) then
+						directFailures = 0
+						return true
+					end
+				else
+					directError = tostring(err)
+				end
+
+				directFailures += 1
+				if not ok or directFailures >= 4 then
+					directReloadEnabled = false
+					CW.Warn("Auto Reload: instant reload is off (" .. tostring(directError or "no effect four times in a row")
+						.. "); using the R key instead.")
+				end
+			end
+		end
+
+		-- The key goes through the chat if it has focus, and does nothing while R is already down.
+		if UserInputService:GetFocusedTextBox() or UserInputService:IsKeyDown(Enum.KeyCode.R) then return false end
+		pressReloadKey()
+		return true
+	end
+
+	-- A 0 found by looking at a gun that was just equipped is trusted once its count matches the server's
+	-- (the game copied it at equip) or once the settle time has passed.
+	local function gunReady(tool, seenAt, now)
+		if now - seenAt >= RELOAD_EQUIP_SETTLE then return true end
+		return tool:GetAttribute("Local_CurrentAmmo") == tool:GetAttribute("CurrentAmmo")
+	end
+
+	local reloadWatch = {
+		character = nil, tool = nil, seenAt = 0, pressedAt = -math.huge, tries = 0, holdUntil = 0,
+		labelFixed = false, busy = false, fresh = false,
+	}
+	local safeStep -- forward: the events below queue it
+
+	local function autoReloadStep()
+		local watch = reloadWatch
+		local character = LocalPlayer.Character
+		if character ~= watch.character then
+			watch.character = character
+			if character then
+				-- Check in the same frame a gun is equipped (after the game's own equip handler).
+				CW.track("autoReloadAdded", character.ChildAdded:Connect(function() task.defer(safeStep) end))
+			else
+				CW.untrack("autoReloadAdded")
+			end
+		end
+
+		local tool = character and character:FindFirstChildWhichIsA("Tool")
+		if tool and tool:GetAttribute("ToolType") ~= "Gun" then tool = nil end
+
+		local now = os.clock()
+		if tool ~= watch.tool then
+			-- A gun was equipped, unequipped or swapped: start from scratch for it.
+			watch.tool, watch.seenAt = tool, now
+			watch.pressedAt, watch.tries, watch.holdUntil, watch.labelFixed, watch.fresh = -math.huge, 0, 0, false, false
+			if tool then
+				-- Check in the same frame the last bullet is fired. The change to 0 comes after the game's
+				-- equip handler (which only ever writes the real count), so it needs no settle time.
+				CW.track("autoReloadAmmo", tool:GetAttributeChangedSignal("Local_CurrentAmmo"):Connect(function()
+					local empty = tool:GetAttribute("Local_CurrentAmmo") == 0
+					reloadWatch.fresh = empty
+					if empty then task.defer(safeStep) end
+				end))
+			else
+				CW.untrack("autoReloadAmmo")
+			end
+		end
+		if not tool or watch.busy then return end
+
+		if reloadStarted(tool) then
+			-- A reload is counting down, maybe one that began before this gun was equipped again. The game's
+			-- equip handler wrote the server's ammo into the label, which says "loaded" while the gun still
+			-- cannot fire; put its own "..." back until the reload ends (it writes the final count then).
+			watch.tries = 0
+			if not watch.labelFixed then
+				watch.labelFixed = true
+				local label = gunHud("BulletsLabel")
+				if label then
+					pcall(function()
+						if label.Text ~= "..." then label.Text = "..." end
+					end)
+				end
+			end
+			return
+		end
+
+		if not needsReload(tool) then
+			watch.tries = 0
+			return
+		end
+		if not (watch.fresh or gunReady(tool, watch.seenAt, now)) then return end
+		if now < watch.holdUntil or now - watch.pressedAt < RELOAD_RETRY_DELAY then return end
+
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if not humanoid or humanoid.Health <= 0 then return end
+
+		if watch.tries >= RELOAD_MAX_TRIES then
+			watch.tries = 0
+			watch.holdUntil = now + RELOAD_BACKOFF
+			return
+		end
+
+		watch.tries += 1
+		watch.pressedAt = now
+		watch.busy = true
+		task.spawn(function()
+			local ok, result = pcall(triggerReload, tool)
+			watch.busy = false
+			if not ok then
+				if not autoReloadWarned then
+					autoReloadWarned = true
+					CW.Warn("Auto Reload request failed: " .. tostring(result))
+				end
+			elseif result == false then
+				watch.tries = math.max(0, watch.tries - 1) -- nothing was sent: try again without using up a try
+			end
 		end)
 	end
 
-	local function watchTool(tool)
-		if not tool:IsA("Tool") or tool:GetAttribute("ToolType") ~= "Gun" then return end
-		CW.track("autoReloadTool", tool:GetAttributeChangedSignal("Local_CurrentAmmo"):Connect(function()
-			if needsReload(tool) then autoReload(tool) end
-		end))
-		if needsReload(tool) then autoReload(tool) end
-	end
-
-	local function watchCharacter(character)
-		CW.track("autoReloadAdded", character.ChildAdded:Connect(watchTool))
-		CW.track("autoReloadRemoved", character.ChildRemoved:Connect(function(child)
-			if child:IsA("Tool") then CW.untrack("autoReloadTool") end
-		end))
-		for _, child in ipairs(character:GetChildren()) do watchTool(child) end
+	local autoReloadStepWarned = false
+	safeStep = function()
+		local ok, err = pcall(autoReloadStep)
+		if not ok and not autoReloadStepWarned then
+			autoReloadStepWarned = true
+			CW.Warn("Auto Reload step failed: " .. tostring(err))
+		end
 	end
 
 	local function setAutoReload(enabled)
+		-- Connections of the previous implementations, in case an older build is still loaded.
+		for _, key in ipairs({ "autoReloadRemoved", "autoReloadTool" }) do
+			CW.untrack(key)
+		end
+
 		if enabled then
-			CW.track("autoReloadCharacter", LocalPlayer.CharacterAdded:Connect(watchCharacter))
-			if LocalPlayer.Character then watchCharacter(LocalPlayer.Character) end
+			local watch = reloadWatch
+			watch.character, watch.tool, watch.tries, watch.holdUntil, watch.busy, watch.fresh = nil, nil, 0, 0, false, false
+			CW.track("autoReloadCharacter", LocalPlayer.CharacterAdded:Connect(function() task.defer(safeStep) end))
+			CW.track("autoReloadStep", RunService.Heartbeat:Connect(safeStep))
+			safeStep() -- an empty gun that is already in hand
 		else
-			for _, key in ipairs({ "autoReloadCharacter", "autoReloadAdded", "autoReloadRemoved", "autoReloadTool" }) do
+			for _, key in ipairs({ "autoReloadStep", "autoReloadCharacter", "autoReloadAdded", "autoReloadAmmo" }) do
 				CW.untrack(key)
 			end
 		end
@@ -4602,6 +4808,7 @@ guarded("Utilities", function()
 	})
 
 	setAutoReload(CW.Settings.AUTO_RELOAD_ENABLED == true)
+	-- <<< AUTO RELOAD END
 end)
 
 ------------------------------------------------------------------------------
