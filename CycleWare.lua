@@ -830,7 +830,13 @@ function CW.Library.audioAsset(path)
 	if type(path) ~= "string" then return nil, "invalid path" end
 	local cached = audioAssetCache[path]
 	if cached then return cached end
-	while audioPending[path] do task.wait(0.05) end
+	-- Another thread is already preparing this file: wait for it, but not forever (a cancelled
+	-- thread never clears its flag).
+	local waitDeadline = os.clock() + 60
+	while audioPending[path] do
+		if os.clock() > waitDeadline then return nil, "timed out waiting for another load of this file" end
+		task.wait(0.05)
+	end
 	cached = audioAssetCache[path]
 	if cached then return cached end
 
@@ -1140,7 +1146,11 @@ end
 -- Only one sync at a time; concurrent callers wait for the running one.
 function CW.Library.sync()
 	if CW.State.syncing then
-		while CW.State.syncing do task.wait(0.1) end
+		local waitDeadline = os.clock() + 180
+		while CW.State.syncing do
+			if os.clock() > waitDeadline then return false end -- the running sync is stuck: report "incomplete"
+			task.wait(0.1)
+		end
 		return CW.State.lastSyncResult == true
 	end
 	CW.State.syncing = true
@@ -1234,6 +1244,7 @@ function CW.encodePNG(px, w, h)
 end
 
 local COLOR_CHANNELS = {[0]=1, [2]=3, [3]=1, [4]=2, [6]=4}
+local MAX_PNG_PIXELS = 2048 * 2048 -- the largest PNG in the library is 728x728
 
 local function inflate(data)
 	local bytes = {}
@@ -1308,9 +1319,12 @@ local function inflate(data)
 			if sym < 256 then out[opos]=sym; opos=opos+1
 			elseif sym == 256 then break
 			else
+				assert(LBASE[sym-256], "inflate: invalid length symbol")
 				local len  = LBASE[sym-256] + readbits(LEXT[sym-256])
 				local dc   = decode(ddt, mD)
+				assert(DBASE[dc+1], "inflate: invalid distance symbol")
 				local dist = DBASE[dc+1] + readbits(DEXT[dc+1])
+				assert(dist <= opos - 1, "inflate: distance reaches before the start of the data")
 				local src  = opos - dist
 				for _ = 1, len do out[opos]=out[src]; opos=opos+1; src=src+1 end
 			end
@@ -1327,7 +1341,9 @@ local function inflate(data)
 			if partial > 0 then readbits(partial) end
 			pos = pos - floor(bitcount / 8)
 			bitbuf, bitcount = 0, 0
+			assert(pos + 3 <= #bytes, "inflate: truncated stored block header")
 			local len = bytes[pos] + bytes[pos+1]*256; pos = pos+4
+			assert(pos + len - 1 <= #bytes, "inflate: truncated stored block")
 			for i = 0, len-1 do out[opos]=bytes[pos+i]; opos=opos+1 end
 			pos = pos+len
 		elseif btype == 1 then decodeBlock(FLL, FDT, 9, 5)
@@ -1343,10 +1359,13 @@ local function inflate(data)
 			while ci < hlit+hdist do
 				local s = decode(CLT, 7)
 				if s <= 15 then combined[ci]=s; ci=ci+1
-				elseif s == 16 then local r=readbits(2)+3; for _=1,r do combined[ci]=combined[ci-1]; ci=ci+1 end
+				elseif s == 16 then
+					assert(ci > 0, "inflate: repeat code without a previous length")
+					local r=readbits(2)+3; for _=1,r do combined[ci]=combined[ci-1]; ci=ci+1 end
 				elseif s == 17 then local r=readbits(3)+3; for _=1,r do combined[ci]=0; ci=ci+1 end
 				else local r=readbits(7)+11; for _=1,r do combined[ci]=0; ci=ci+1 end end
 			end
+			assert(ci == hlit+hdist, "inflate: code lengths overflow the table")
 			local llLens, distLens, mLL, mD = {}, {}, 0, 0
 			for i=0,hlit-1  do llLens[i]=combined[i];       if combined[i]>(mLL or 0) then mLL=combined[i] end end
 			for i=0,hdist-1 do distLens[i]=combined[hlit+i]; if combined[hlit+i]>(mD or 0) then mD=combined[hlit+i] end end
@@ -1368,18 +1387,23 @@ function CW.parsePNG(data)
 	local idatParts, palette, transAlpha = {}, {}, {}
 
 	while pos <= #data do
+		assert(pos + 7 <= #data, "parsePNG: truncated chunk header")
 		local len   = sbyte(data,pos)*16777216 + sbyte(data,pos+1)*65536
 					+ sbyte(data,pos+2)*256    + sbyte(data,pos+3)
 		local typ   = data:sub(pos+4, pos+7)
+		assert(pos + 8 + len - 1 <= #data, "parsePNG: truncated " .. typ .. " chunk")
 		local chunk = data:sub(pos+8, pos+8+len-1)
 		pos = pos + 12 + len
 
 		if typ == "IHDR" then
+			assert(#chunk >= 13, "parsePNG: invalid IHDR")
 			w         = sbyte(chunk,1)*16777216+sbyte(chunk,2)*65536+sbyte(chunk,3)*256+sbyte(chunk,4)
 			h         = sbyte(chunk,5)*16777216+sbyte(chunk,6)*65536+sbyte(chunk,7)*256+sbyte(chunk,8)
 			bitDepth  = sbyte(chunk,9)
 			colorType = sbyte(chunk,10)
 			interlace = sbyte(chunk,13)
+			-- A header is cheap to forge: refuse sizes that would allocate gigabytes of pixel tables.
+			assert(w > 0 and h > 0 and w * h <= MAX_PNG_PIXELS, "parsePNG: unsupported image size " .. w .. "x" .. h)
 			assert(bitDepth == 8, "parsePNG: unsupported bit depth "..tostring(bitDepth))
 			assert(interlace == 0, "parsePNG: interlaced PNGs are not supported")
 		elseif typ == "PLTE" then
@@ -1392,16 +1416,22 @@ function CW.parsePNG(data)
 		elseif typ == "IEND" then break end
 	end
 
+	assert(w and h and colorType, "parsePNG: missing IHDR")
 	local ch = COLOR_CHANNELS[colorType]
 	assert(ch, "parsePNG: unsupported colorType "..tostring(colorType))
 
-	local rawData = inflate(tconcat(idatParts):sub(3, -5))
+	-- zlib stream: 2-byte header, deflate data, 4-byte Adler-32.
+	local zlibData = tconcat(idatParts)
+	assert(#zlibData > 6, "parsePNG: missing image data")
+	local rawData = inflate(zlibData:sub(3, -5))
 	local stride, px, rpos, prev = w*ch, {}, 1, {}
+	assert(#rawData >= h * (stride + 1), "parsePNG: truncated image data")
 	for i = 1, stride do prev[i] = 0 end
 
 	for y = 0, h-1 do
 		if y % 8 == 0 then CW.yieldBudget() end
 		local ftype = sbyte(rawData, rpos); rpos = rpos+1
+		assert(ftype <= 4, "parsePNG: invalid filter type")
 		local row = {}
 		for x = 1, stride do
 			local b  = sbyte(rawData, rpos); rpos = rpos+1
@@ -2182,7 +2212,8 @@ local function monitor(container, key)
 		if apply and not apply(child) then
 			task.wait(0.1)
 			apply = CW.applyWeaponTexture
-			if apply then apply(child) end
+			-- The tool may have been dropped or destroyed while waiting: do not rebuild pieces on it.
+			if apply and child.Parent == container then apply(child) end
 		end
 	end))
 	applyToContainer(container)
