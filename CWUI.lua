@@ -262,7 +262,9 @@ function Section:AddToggle(o)
 end
 
 function Section:AddSlider(o)
-	local min, max, inc = o.Min or 0, o.Max or 100, o.Increment or 1
+	local min, max, inc = tonumber(o.Min) or 0, tonumber(o.Max) or 100, tonumber(o.Increment) or 1
+	if inc <= 0 then inc = 1 end              -- a step of 0 would divide by zero
+	if max < min then min, max = max, min end -- math.clamp errors when min > max
 	local scale = 10 ^ math.max(decimalsOf(inc), decimalsOf(min))
 	local value = min
 	local row = self:_row(50)
@@ -285,9 +287,14 @@ function Section:AddSlider(o)
 	})
 
 	local obj = { Instance = row }
-	function obj:Set(v, silent)
+	local function snap(v)
 		v = math.floor((v - min) / inc + 0.5) * inc + min
-		v = math.clamp(math.floor(v * scale + 0.5) / scale, min, max) -- sem ruído (0.35 e não 0.35000000000000003)
+		return math.clamp(math.floor(v * scale + 0.5) / scale, min, max) -- sem ruído (0.35 e não 0.35000000000000003)
+	end
+	function obj:Set(v, silent)
+		v = tonumber(v)
+		if not v then return end
+		v = snap(v)
 		value = v
 		fill.Size = UDim2.fromScale(max == min and 0 or (v - min) / (max - min), 1)
 		valLbl.Text = fmt(v) .. (o.Suffix or "")
@@ -298,10 +305,12 @@ function Section:AddSlider(o)
 	local dragging = false
 	local function update(x)
 		local a = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
-		obj:Set(min + (max - min) * a)
+		local v = snap(min + (max - min) * a)
+		if v ~= value then obj:Set(v) end -- the callback runs only when the value really changed
 	end
 	hit.InputBegan:Connect(function(i)
-		if isClick(i) then dragging = true self._window:_lockScroll(true) update(i.Position.X) end
+		-- A second touch while dragging must not take another scroll lock: only one is ever released.
+		if isClick(i) and not dragging then dragging = true self._window:_lockScroll(true) update(i.Position.X) end
 	end)
 	self._window:_connect(UserInputService.InputChanged, function(i)
 		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
