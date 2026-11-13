@@ -15,6 +15,7 @@ local CAPS = {
 	customAsset = type(getcustomasset) == "function" or type(getsynasset) == "function",
 	getgenv = type(getgenv) == "function",
 	gethui = type(gethui) == "function",
+	delfile = type(delfile) == "function",
 	hook = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function",
 	signals = type(firesignal) == "function" or type(getconnections) == "function",
 	request = (type(request) == "function" and request)
@@ -207,6 +208,7 @@ do
 	if not CAPS.hook then table.insert(missing, "hookmetamethod/getnamecallmethod (hitmarker and hit sound detection is disabled)") end
 	if not CAPS.signals then table.insert(missing, "firesignal/getconnections (Auto Reload presses R instead of reloading instantly)") end
 	if not CAPS.gethui then table.insert(missing, "gethui (using CoreGui instead)") end
+	if not CAPS.delfile then table.insert(missing, "delfile (removing a cursor added by ID leaves its PNG in the Cursors folder)") end
 	if not CAPS.httpGet and not CAPS.request then table.insert(missing, "HTTP (asset sync and the UI download are disabled)") end
 	if #missing > 0 then
 		CW.Warn("Missing executor functions: " .. table.concat(missing, "; "))
@@ -893,9 +895,13 @@ end
 -- like a file choice, as "id:<number>".
 -- Without the file functions (CAPS.files) the IDs still work, but only until the player rejoins.
 local CUSTOM_ID_CATEGORIES = { -- true = one list per gun
-	Hitmarkers = false, HitSounds = false,
+	Hitmarkers = false, HitSounds = false, Cursors = false,
 	Textures = true, WeaponSounds = true, ReloadSounds = true,
 }
+-- Categories whose IDs are downloaded into a real library file (the cursor needs the PNG's pixels to
+-- make its tinted copies). Their entries also keep File = "<Category>/<name>.png", and they are listed
+-- through that file, not as an rbxassetid item.
+local DOWNLOADED_CATEGORIES = { Cursors = true }
 local CUSTOM_ID_LIMIT = 200      -- per list
 local CUSTOM_NAME_LIMIT = 40     -- characters
 
@@ -968,8 +974,17 @@ end
 
 local function copyEntries(source)
 	local entries = {}
-	for _, entry in ipairs(source) do table.insert(entries, { Name = entry.Name, Id = entry.Id }) end
+	for _, entry in ipairs(source) do table.insert(entries, { Name = entry.Name, Id = entry.Id, File = entry.File }) end
 	return entries
+end
+
+-- A downloaded file must stay inside its own category folder, outside the official one.
+local function validDownloadedFile(category, file)
+	return type(file) == "string"
+		and file:sub(1, #category + 1) == category .. "/"
+		and not file:find("..", 1, true) and not file:find("\\", 1, true)
+		and not file:find("/" .. CW.Paths.OFFICIAL_FOLDER .. "/", 1, true)
+		and file:match("^[^/]+/[^/]+%.png$") ~= nil
 end
 
 local saveWarned = false
@@ -1008,14 +1023,16 @@ function CW.CustomIds.save()
 end
 
 -- Valid, unique entries of a list read from the file.
-local function sanitizeList(source)
+local function sanitizeList(source, category)
 	local loaded, seen = {}, {}
 	if type(source) ~= "table" then return loaded end
+	local downloaded = DOWNLOADED_CATEGORIES[category]
 	for _, entry in ipairs(source) do
 		local id = type(entry) == "table" and parseAssetId(entry.Id)
-		if id and not seen[id] and #loaded < CUSTOM_ID_LIMIT then
+		local fileOk = not downloaded or validDownloadedFile(category, entry.File)
+		if id and fileOk and not seen[id] and #loaded < CUSTOM_ID_LIMIT then
 			seen[id] = true
-			table.insert(loaded, { Name = cleanName(entry.Name, id), Id = id })
+			table.insert(loaded, { Name = cleanName(entry.Name, id), Id = id, File = downloaded and entry.File or nil })
 		end
 	end
 	return loaded
@@ -1046,14 +1063,14 @@ function CW.CustomIds.load()
 			if type(source) == "table" and source[1] == nil then
 				for weapon, list in pairs(source) do
 					if validWeaponName(weapon) then
-						local loaded = sanitizeList(list)
+						local loaded = sanitizeList(list, category)
 						if #loaded > 0 then byGun[weapon] = loaded end
 					end
 				end
 			end
 			customLists[category] = byGun
 		else
-			customLists[category] = sanitizeList(source)
+			customLists[category] = sanitizeList(source, category)
 		end
 	end
 end
@@ -1061,6 +1078,23 @@ end
 function CW.CustomIds.list(category, weapon)
 	local list = listOf(category, weapon, false)
 	return list and copyEntries(list) or {}
+end
+
+-- The entry whose downloaded file is this relative path (Cursors), or nil.
+function CW.CustomIds.byFile(category, weapon, relative)
+	for _, entry in ipairs(listOf(category, weapon, false) or {}) do
+		if entry.File and entry.File == relative then return { Name = entry.Name, Id = entry.Id, File = entry.File } end
+	end
+	return nil
+end
+
+-- The entry of one ID, or nil.
+function CW.CustomIds.get(category, weapon, rawId)
+	local id = parseAssetId(rawId)
+	for _, entry in ipairs(listOf(category, weapon, false) or {}) do
+		if entry.Id == id then return { Name = entry.Name, Id = entry.Id, File = entry.File } end
+	end
+	return nil
 end
 
 function CW.CustomIds.has(category, weapon, rawId)
@@ -1071,13 +1105,35 @@ function CW.CustomIds.has(category, weapon, rawId)
 	return false
 end
 
--- Adds an ID (or renames it when it is already there). Returns the entry, or nil and the reason.
-function CW.CustomIds.add(category, weapon, rawId, name)
+-- Two assets of the same list can't share a name: not two custom IDs, and not a custom ID and a
+-- library file (official or the player's own). Compared without case. exceptId is the ID being renamed;
+-- exceptFile is a library file that belongs to it. Returns the reason when the name is taken.
+function CW.CustomIds.nameTaken(category, weapon, name, exceptId, exceptFile)
+	local lowered = tostring(name):lower()
+	for _, entry in ipairs(listOf(category, weapon, false) or {}) do
+		if entry.Id ~= exceptId and entry.Name:lower() == lowered then
+			return "the name \"" .. name .. "\" is already used by ID " .. entry.Id
+		end
+	end
+	for _, item in ipairs(CW.Library.list(category, weapon)) do
+		if item.Relative ~= exceptFile and tostring(item.Name):lower() == lowered then
+			return "the name \"" .. name .. "\" is already used by the library file " .. tostring(item.Relative)
+		end
+	end
+	return nil
+end
+
+-- Adds an ID (or renames it when it is already there). Returns the entry, or nil, the reason and the
+-- kind of problem ("name" when the name is taken). extra.File: the downloaded file (Cursors).
+function CW.CustomIds.add(category, weapon, rawId, name, extra)
 	if CUSTOM_ID_CATEGORIES[category] == nil then return nil, "this category has no custom IDs" end
 	local id = parseAssetId(rawId)
 	if not id then return nil, "not a valid asset ID" end
 	local list = listOf(category, weapon, true)
 	if not list then return nil, "no gun selected" end
+	local downloaded = DOWNLOADED_CATEGORIES[category]
+	local file = extra and extra.File
+	if downloaded and not validDownloadedFile(category, file) then return nil, "invalid downloaded file" end
 	local existing
 	for _, entry in ipairs(list) do
 		if entry.Id == id then
@@ -1085,22 +1141,12 @@ function CW.CustomIds.add(category, weapon, rawId, name)
 			break
 		end
 	end
+	if existing and downloaded then return nil, "this ID was already added", "duplicate" end
 	local newName = (type(name) == "string" and name:match("%S")) and cleanName(name, id)
 		or (existing and existing.Name) or cleanName(nil, id)
 
-	-- Two assets of the same list can't share a name: not two custom IDs, and not a custom ID and a
-	-- library file (official or the player's own). Compared without case.
-	local lowered = newName:lower()
-	for _, entry in ipairs(list) do
-		if entry ~= existing and entry.Name:lower() == lowered then
-			return nil, "the name \"" .. newName .. "\" is already used by ID " .. entry.Id, "name"
-		end
-	end
-	for _, item in ipairs(CW.Library.list(category, weapon)) do
-		if tostring(item.Name):lower() == lowered then
-			return nil, "the name \"" .. newName .. "\" is already used by the library file " .. tostring(item.Relative), "name"
-		end
-	end
+	local taken = CW.CustomIds.nameTaken(category, weapon, newName, existing and existing.Id, file)
+	if taken then return nil, taken, "name" end
 
 	if existing then
 		existing.Name = newName
@@ -1108,10 +1154,10 @@ function CW.CustomIds.add(category, weapon, rawId, name)
 		return { Name = existing.Name, Id = id }, nil
 	end
 	if #list >= CUSTOM_ID_LIMIT then return nil, "limit of " .. CUSTOM_ID_LIMIT .. " IDs reached" end
-	local entry = { Name = newName, Id = id }
+	local entry = { Name = newName, Id = id, File = downloaded and file or nil }
 	table.insert(list, entry)
 	CW.CustomIds.save()
-	return { Name = entry.Name, Id = id }, nil
+	return { Name = entry.Name, Id = id, File = entry.File }, nil
 end
 
 function CW.CustomIds.remove(category, weapon, rawId)
@@ -1143,10 +1189,11 @@ function CW.Library.relative(path)
 	return libraryRelative(path)
 end
 
--- Library files plus the custom IDs of the category (and gun). Cursors have no custom IDs yet.
+-- Library files plus the custom IDs of the category (and gun). Downloaded IDs (cursors) are files already.
 -- An ID item has Path = "rbxassetid://<id>", Relative = "id:<id>" and CustomId = "<id>".
 function CW.Library.items(category, weapon)
 	local items = CW.Library.list(category, weapon)
+	if DOWNLOADED_CATEGORIES[category] then return items end -- already listed as library files
 	for _, entry in ipairs(listOf(category, weapon, false) or {}) do
 		table.insert(items, {
 			Name = entry.Name,
@@ -1671,11 +1718,28 @@ local function inflate(data)
 	return tconcat(parts)
 end
 
+-- Bit depths the PNG standard allows for each color type.
+local VALID_DEPTHS = {
+	[0] = { [1] = true, [2] = true, [4] = true, [8] = true, [16] = true }, -- grayscale
+	[2] = { [8] = true, [16] = true },                                     -- RGB
+	[3] = { [1] = true, [2] = true, [4] = true, [8] = true },              -- palette
+	[4] = { [8] = true, [16] = true },                                     -- grayscale + alpha
+	[6] = { [8] = true, [16] = true },                                     -- RGBA
+}
+-- Adam7 passes: x start, y start, x step, y step.
+local ADAM7 = {
+	{ 0, 0, 8, 8 }, { 4, 0, 8, 8 }, { 0, 4, 4, 8 }, { 2, 0, 4, 4 },
+	{ 0, 2, 2, 4 }, { 1, 0, 2, 2 }, { 0, 1, 1, 2 },
+}
+
+-- Decodes any standard PNG (every color type and bit depth, interlaced or not) into 8-bit RGBA:
+-- returns px (flat array, 1-based, r,g,b,a per pixel), width, height.
 function CW.parsePNG(data)
 	assert(data:sub(1,8) == "\137\80\78\71\13\10\26\10", "not a PNG")
 	local pos, w, h, bitDepth, colorType = 9
 	local interlace = 0
 	local idatParts, palette, transAlpha = {}, {}, {}
+	local transKey -- tRNS for color types 0 and 2: the one gray / RGB value that is transparent (raw samples)
 
 	while pos <= #data do
 		assert(pos + 7 <= #data, "parsePNG: truncated chunk header")
@@ -1695,63 +1759,129 @@ function CW.parsePNG(data)
 			interlace = sbyte(chunk,13)
 			-- A header is cheap to forge: refuse sizes that would allocate gigabytes of pixel tables.
 			assert(w > 0 and h > 0 and w * h <= MAX_PNG_PIXELS, "parsePNG: unsupported image size " .. w .. "x" .. h)
-			assert(bitDepth == 8, "parsePNG: unsupported bit depth "..tostring(bitDepth))
-			assert(interlace == 0, "parsePNG: interlaced PNGs are not supported")
+			assert(VALID_DEPTHS[colorType], "parsePNG: unsupported colorType " .. tostring(colorType))
+			assert(VALID_DEPTHS[colorType][bitDepth],
+				"parsePNG: invalid bit depth " .. tostring(bitDepth) .. " for colorType " .. tostring(colorType))
+			assert(interlace == 0 or interlace == 1, "parsePNG: unknown interlace method " .. tostring(interlace))
 		elseif typ == "PLTE" then
 			for i = 0, floor(#chunk/3)-1 do
 				palette[i] = {sbyte(chunk,i*3+1), sbyte(chunk,i*3+2), sbyte(chunk,i*3+3)}
 			end
 		elseif typ == "tRNS" then
-			if colorType == 3 then for i=1,#chunk do transAlpha[i-1]=sbyte(chunk,i) end end
+			if colorType == 3 then
+				for i = 1, #chunk do transAlpha[i-1] = sbyte(chunk,i) end
+			elseif colorType == 0 and #chunk >= 2 then
+				transKey = { sbyte(chunk,1)*256 + sbyte(chunk,2) }
+			elseif colorType == 2 and #chunk >= 6 then
+				transKey = { sbyte(chunk,1)*256 + sbyte(chunk,2), sbyte(chunk,3)*256 + sbyte(chunk,4),
+					sbyte(chunk,5)*256 + sbyte(chunk,6) }
+			end
 		elseif typ == "IDAT" then idatParts[#idatParts+1] = chunk
 		elseif typ == "IEND" then break end
 	end
 
 	assert(w and h and colorType, "parsePNG: missing IHDR")
 	local ch = COLOR_CHANNELS[colorType]
-	assert(ch, "parsePNG: unsupported colorType "..tostring(colorType))
+	local bitsPerPixel = ch * bitDepth
+	local bpp = math.max(1, bitsPerPixel // 8) -- bytes per pixel, as the filters see it
+	local maxSample = 2 ^ bitDepth - 1
 
 	-- zlib stream: 2-byte header, deflate data, 4-byte Adler-32.
 	local zlibData = tconcat(idatParts)
 	assert(#zlibData > 6, "parsePNG: missing image data")
 	local rawData = inflate(zlibData:sub(3, -5))
-	local stride, px, rpos, prev = w*ch, {}, 1, {}
-	assert(#rawData >= h * (stride + 1), "parsePNG: truncated image data")
-	for i = 1, stride do prev[i] = 0 end
 
-	for y = 0, h-1 do
-		if y % 8 == 0 then CW.yieldBudget() end
-		local ftype = sbyte(rawData, rpos); rpos = rpos+1
-		assert(ftype <= 4, "parsePNG: invalid filter type")
-		local row = {}
-		for x = 1, stride do
-			local b  = sbyte(rawData, rpos); rpos = rpos+1
-			local a  = row[x-ch] or 0
-			local up = prev[x]   or 0
-			local ul = prev[x-ch] or 0
-			if     ftype==0 then row[x]=b
-			elseif ftype==1 then row[x]=(b+a)%256
-			elseif ftype==2 then row[x]=(b+up)%256
-			elseif ftype==3 then row[x]=(b+floor((a+up)/2))%256
-			elseif ftype==4 then
-				local p=a+up-ul
-				local pa,pb,pc=mabs(p-a),mabs(p-up),mabs(p-ul)
-				row[x]=(b+(pa<=pb and pa<=pc and a or pb<=pc and up or ul))%256
+	-- Raw sample k (0-based, within one row) of an unfiltered row, at the image's own bit depth.
+	local sampleAt
+	if bitDepth == 8 then
+		sampleAt = function(row, k) return row[k + 1] end
+	elseif bitDepth == 16 then
+		sampleAt = function(row, k) return row[2*k + 1] * 256 + row[2*k + 2] end
+	else
+		local perByte = 8 // bitDepth
+		sampleAt = function(row, k)
+			local byte = row[k // perByte + 1]
+			local shift = 8 - bitDepth * (k % perByte + 1)
+			return band(rshift(byte, shift), maxSample)
+		end
+	end
+	-- A raw gray/color sample -> 0..255 (palette indexes are not scaled).
+	local function to8(v)
+		if bitDepth == 8 then return v end
+		if bitDepth == 16 then return (v * 255 + 32767) // 65535 end
+		return (v * 255 + maxSample // 2) // maxSample
+	end
+
+	local px, rpos = {}, 1
+	local rowsDone = 0
+
+	-- Unfilters one (sub)image of pw x ph pixels and writes its pixels at (xs + i*xStep, ys + j*yStep).
+	local function decodePass(pw, ph, xs, ys, xStep, yStep)
+		local rowBytes = (pw * bitsPerPixel + 7) // 8
+		assert(rpos + ph * (rowBytes + 1) - 1 <= #rawData, "parsePNG: truncated image data")
+		local prev = {}
+		for i = 1, rowBytes do prev[i] = 0 end
+		for j = 0, ph - 1 do
+			rowsDone = rowsDone + 1
+			if rowsDone % 8 == 0 then CW.yieldBudget() end
+			local ftype = sbyte(rawData, rpos); rpos = rpos + 1
+			assert(ftype <= 4, "parsePNG: invalid filter type")
+			local row = {}
+			for x = 1, rowBytes do
+				local b  = sbyte(rawData, rpos); rpos = rpos + 1
+				local a  = row[x - bpp] or 0
+				local up = prev[x]
+				local ul = prev[x - bpp] or 0
+				if     ftype == 0 then row[x] = b
+				elseif ftype == 1 then row[x] = (b + a) % 256
+				elseif ftype == 2 then row[x] = (b + up) % 256
+				elseif ftype == 3 then row[x] = (b + floor((a + up) / 2)) % 256
+				else
+					local p = a + up - ul
+					local pa, pb, pc = mabs(p - a), mabs(p - up), mabs(p - ul)
+					row[x] = (b + (pa <= pb and pa <= pc and a or pb <= pc and up or ul)) % 256
+				end
+			end
+			prev = row
+
+			local y = ys + j * yStep
+			for i = 0, pw - 1 do
+				local dst = (y * w + xs + i * xStep) * 4 + 1
+				local k = i * ch
+				if colorType == 6 then
+					px[dst] = to8(sampleAt(row, k)); px[dst+1] = to8(sampleAt(row, k+1))
+					px[dst+2] = to8(sampleAt(row, k+2)); px[dst+3] = to8(sampleAt(row, k+3))
+				elseif colorType == 2 then
+					local r, g, b = sampleAt(row, k), sampleAt(row, k+1), sampleAt(row, k+2)
+					px[dst] = to8(r); px[dst+1] = to8(g); px[dst+2] = to8(b)
+					px[dst+3] = (transKey and r == transKey[1] and g == transKey[2] and b == transKey[3]) and 0 or 255
+				elseif colorType == 0 then
+					local v = sampleAt(row, k)
+					local gray = to8(v)
+					px[dst] = gray; px[dst+1] = gray; px[dst+2] = gray
+					px[dst+3] = (transKey and v == transKey[1]) and 0 or 255
+				elseif colorType == 4 then
+					local gray = to8(sampleAt(row, k))
+					px[dst] = gray; px[dst+1] = gray; px[dst+2] = gray; px[dst+3] = to8(sampleAt(row, k+1))
+				else -- colorType 3: palette index
+					local index = sampleAt(row, k)
+					local pal = palette[index] or {255,255,255}
+					px[dst] = pal[1]; px[dst+1] = pal[2]; px[dst+2] = pal[3]
+					px[dst+3] = transAlpha[index] ~= nil and transAlpha[index] or 255
+				end
 			end
 		end
-		prev = row
-		for x = 0, w-1 do
-			local dst, s = (y*w+x)*4+1, x*ch+1
-			if     colorType==6 then px[dst]=row[s];px[dst+1]=row[s+1];px[dst+2]=row[s+2];px[dst+3]=row[s+3]
-			elseif colorType==2 then px[dst]=row[s];px[dst+1]=row[s+1];px[dst+2]=row[s+2];px[dst+3]=255
-			elseif colorType==0 then px[dst]=row[s];px[dst+1]=row[s];  px[dst+2]=row[s];  px[dst+3]=255
-			elseif colorType==4 then px[dst]=row[s];px[dst+1]=row[s];  px[dst+2]=row[s];  px[dst+3]=row[s+1]
-			elseif colorType==3 then
-				local pal=palette[row[s]] or {255,255,255}
-				px[dst]=pal[1];px[dst+1]=pal[2];px[dst+2]=pal[3]
-				px[dst+3]=transAlpha[row[s]] ~= nil and transAlpha[row[s]] or 255
-			end
+	end
+
+	if interlace == 1 then
+		for _, pass in ipairs(ADAM7) do
+			local xs, ys, xStep, yStep = pass[1], pass[2], pass[3], pass[4]
+			local pw = (w - xs + xStep - 1) // xStep
+			local ph = (h - ys + yStep - 1) // yStep
+			if pw > 0 and ph > 0 then decodePass(pw, ph, xs, ys, xStep, yStep) end
 		end
+	else
+		decodePass(w, h, 0, 0, 1, 1)
 	end
 	return px, w, h
 end
@@ -1831,6 +1961,35 @@ function CW.applyTint(px, w, h, tR, tG, tB)
 		else out[i]=0; out[i+1]=0; out[i+2]=0; out[i+3]=0 end
 	end
 	return out
+end
+
+-- Crops the fully transparent margins around an image (a Roblox thumbnail is padded to a square).
+-- Pixels with alpha <= threshold count as transparent. Returns px, w, h, or nil when nothing is visible.
+function CW.trimTransparent(px, w, h, threshold)
+	threshold = threshold or 8
+	local minX, minY, maxX, maxY = w, h, -1, -1
+	for y = 0, h - 1 do
+		if y % 8 == 0 then CW.yieldBudget() end
+		local row = y * w
+		for x = 0, w - 1 do
+			if (px[(row + x) * 4 + 4] or 0) > threshold then
+				if x < minX then minX = x end
+				if x > maxX then maxX = x end
+				if y < minY then minY = y end
+				if y > maxY then maxY = y end
+			end
+		end
+	end
+	if maxX < 0 then return nil end
+	local tw, th = maxX - minX + 1, maxY - minY + 1
+	if tw == w and th == h then return px, w, h end
+	local out = {}
+	for y = 0, th - 1 do
+		local src = ((minY + y) * w + minX) * 4
+		local dst = y * tw * 4
+		for k = 1, tw * 4 do out[dst + k] = px[src + k] end
+	end
+	return out, tw, th
 end
 end)
 
@@ -4273,6 +4432,190 @@ local function addCustomIdRow(section, opts)
 end
 
 ------------------------------------------------------------------------------
+-- Cursor by ID. The cursor needs the image's pixels (the red and green copies are tinted from them),
+-- so the image is downloaded into the Cursors folder as a real PNG and used like any other cursor file.
+-- assetdelivery needs a login, so the image comes from Roblox's public thumbnail API instead; it
+-- accepts an Image ID or a Decal ID. The thumbnail is padded to a square: the transparent margins are
+-- cropped and the longest side is capped at 256 px (the largest cursor size).
+------------------------------------------------------------------------------
+local CURSOR_MAX_SIDE = 256
+local CURSOR_THUMBNAIL_URL = "https://thumbnails.roblox.com/v1/assets?assetIds=%s"
+	.. "&returnPolicy=PlaceHolder&size=420x420&format=Png&isCircular=false"
+
+-- A name that is safe as a file name: letters, digits, space, _ - . ( ); at most 40 characters.
+local function cursorFileName(rawName, id)
+	local name = type(rawName) == "string" and rawName:match("^%s*(.-)%s*$") or ""
+	if name == "" then name = "ID " .. id end
+	name = name:gsub("[^%w _%-%.%(%)]", "_"):gsub("^[%s%.]+", "")
+	name = name:sub(1, 40):match("^(.-)[%s%.]*$")
+	if name == "" then name = "ID " .. id end
+	return name
+end
+
+-- Yields. Returns the thumbnail PNG bytes, or nil and the reason.
+local function fetchCursorThumbnail(id)
+	local url = string.format(CURSOR_THUMBNAIL_URL, id)
+	for _ = 1, 6 do
+		local ok, body = pcall(CW.httpGet, url)
+		if not ok then return nil, "thumbnail request failed: " .. tostring(body) end
+		local okJson, data = pcall(HttpService.JSONDecode, HttpService, body)
+		local item = okJson and type(data) == "table" and type(data.data) == "table" and data.data[1]
+		if type(item) ~= "table" then return nil, "unexpected answer from the thumbnail API" end
+		if item.state == "Completed" and type(item.imageUrl) == "string" then
+			local okImage, png = pcall(CW.httpGet, item.imageUrl)
+			if not okImage then return nil, "image download failed: " .. tostring(png) end
+			return png
+		elseif item.state == "Pending" then
+			task.wait(1) -- Roblox is still rendering it
+		else
+			return nil, "Roblox has no image for this ID (" .. tostring(item.state) .. ")"
+		end
+	end
+	return nil, "the image is still being generated; try again in a few seconds"
+end
+
+-- Yields. Thumbnail PNG -> the cursor file's bytes (cropped, at most 256 px), or nil and the reason.
+local function buildCursorPng(png)
+	if type(png) ~= "string" or png:sub(1, 8) ~= "\137PNG\r\n\26\n" then return nil, "the download is not a PNG" end
+	local ok, px, w, h = pcall(CW.parsePNG, png)
+	if not ok then return nil, "could not read the PNG: " .. tostring(px) end
+	px, w, h = CW.trimTransparent(px, w, h)
+	if not px then return nil, "the image is fully transparent" end
+	local longest = math.max(w, h)
+	if longest > CURSOR_MAX_SIDE then
+		local scale = CURSOR_MAX_SIDE / longest
+		px, w, h = CW.resizePixels(px, w, h,
+			math.max(1, math.floor(w * scale + 0.5)), math.max(1, math.floor(h * scale + 0.5)))
+	end
+	return CW.encodePNG(px, w, h)
+end
+
+local function addCursorIdRow(section)
+	local busy = false
+
+	local function afterChange()
+		CW.Library.invalidate()
+		if refreshUIFromLibrary then guarded("Library refresh", refreshUIFromLibrary) end
+		scheduleSave()
+	end
+
+	local fields = {
+		{ Key = "id", Title = "Image or Decal ID", Placeholder = "Image/Decal ID or link", Weight = 0.55 },
+		{ Key = "name", Title = "Name (optional)", Placeholder = "Name", Weight = 0.45 },
+	}
+	local buttons = {
+		{ Text = "Add ID", Title = "Add ID", Callback = function(values, row)
+			if busy then
+				row:Flash(1, "Wait")
+				return
+			end
+			if not CAPS.files then
+				row:Flash(1, "No files", 2)
+				CW.Warn("Cursor by ID needs the executor's file functions")
+				return
+			end
+			if not (CAPS.httpGet or CAPS.request) then
+				row:Flash(1, "No HTTP", 2)
+				CW.Warn("Cursor by ID needs HttpGet or request in the executor")
+				return
+			end
+			local id = CW.CustomIds.parse(values.id)
+			if not id then
+				row:Flash(1, "Invalid")
+				return
+			end
+			if CW.CustomIds.get("Cursors", nil, id) then
+				row:Flash(1, "Exists", 2)
+				CW.Warn("Cursor ID " .. id .. " was already added")
+				return
+			end
+			local name = cursorFileName(values.name, id)
+			local relative = "Cursors/" .. name .. ".png"
+			local path = CW.Paths.LIBRARY_ROOT .. "/" .. relative
+			local okExists, exists = pcall(isfile, path)
+			local taken = CW.CustomIds.nameTaken("Cursors", nil, name)
+				or ((okExists and exists) and ("a file named " .. relative .. " already exists") or nil)
+			if taken then
+				row:Flash(1, "Name used", 2)
+				CW.Warn("Cursor ID not added: " .. taken)
+				return
+			end
+
+			busy = true
+			row:Flash(1, "Loading", 60)
+			task.spawn(function()
+				local ok, err = pcall(function()
+					local png, why = fetchCursorThumbnail(id)
+					if not png then error(why, 0) end
+					local data, buildError = buildCursorPng(png)
+					if not data then error(buildError, 0) end
+					writefile(path, data)
+					local entry, reason = CW.CustomIds.add("Cursors", nil, id, name, { File = relative })
+					if not entry then
+						if CAPS.delfile then pcall(delfile, path) end
+						error(reason, 0)
+					end
+				end)
+				busy = false
+				if ok then
+					row:Clear()
+					row:Flash(1, "Added")
+					CW.Log("Cursor ID " .. id .. " saved as " .. relative)
+					afterChange()
+				else
+					row:Flash(1, "Failed", 3)
+					CW.Warn("Cursor ID " .. id .. " not added: " .. tostring(err))
+				end
+			end)
+		end },
+		{ Text = "Remove", Title = "Remove ID", Callback = function(values, row)
+			if busy then
+				row:Flash(2, "Wait")
+				return
+			end
+			local entry
+			local typed = CW.CustomIds.parse(values.id)
+			if typed then
+				entry = CW.CustomIds.get("Cursors", nil, typed)
+			else
+				-- Empty box: the cursor in use right now, when it was added by ID.
+				local selected = CW.Library.relative(CW.Paths.CURSOR_FILE)
+				entry = selected and CW.CustomIds.byFile("Cursors", nil, selected)
+				if not entry and selected then
+					if selected:find("/" .. CW.Paths.OFFICIAL_FOLDER .. "/", 1, true) then
+						row:Flash(2, "Official", 2)
+						CW.Warn("Assets from the official library can't be removed (" .. selected .. ")")
+					else
+						row:Flash(2, "File", 2)
+						CW.Warn(selected .. " was not added by ID: delete it from the " .. CW.Paths.LIBRARY_ROOT .. " folder to remove it")
+					end
+					return
+				end
+			end
+			if not entry then
+				row:Flash(2, typed and "Not found" or "Pick ID")
+				return
+			end
+
+			CW.CustomIds.remove("Cursors", nil, entry.Id)
+			local path = CW.Paths.LIBRARY_ROOT .. "/" .. entry.File
+			if CAPS.delfile then
+				local deleted, err = pcall(delfile, path)
+				if not deleted then CW.Warn("Could not delete " .. path .. ": " .. tostring(err)) end
+			else
+				CW.Warn("delfile is missing: " .. path .. " stays in the Cursors folder")
+			end
+			CW.Library.clearSelectionOf("Cursors", nil, entry.File)
+			row:Clear()
+			row:Flash(2, "Removed")
+			afterChange()
+			pcall(CW.reloadCoreAssets)
+		end },
+	}
+	return inputRow(section, fields, buttons)
+end
+
+------------------------------------------------------------------------------
 -- Cursors tab: Hit Sound, Cursors, Hitmarkers
 ------------------------------------------------------------------------------
 guarded("Cursors", function()
@@ -4343,6 +4686,8 @@ guarded("Cursors", function()
 			MaxHeight = 260,
 			Callback = applyCursorFile,
 		})
+
+		guarded("Cursor Custom IDs", function() addCursorIdRow(CursorSection) end)
 
 		CursorSection:Slider({
 			Title = "Cursor Size",
