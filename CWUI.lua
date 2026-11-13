@@ -339,6 +339,79 @@ function Section:AddTextbox(o)
 	return { Instance = row, Get = function() return box.Text end, Set = function(_, t) box.Text = t end }
 end
 
+-- Linha com vários campos de texto lado a lado e botões compactos à direita (mesmo visual do Textbox).
+--   Section:AddInputRow({
+--       Fields  = { { Key = "id", Placeholder = "Asset ID", Weight = 0.45 }, { Key = "name", Placeholder = "Name" } },
+--       Buttons = { { Text = "Add ID", Callback = function(values, row) end } },  -- values = { id = "...", name = "..." }
+--   })
+--   Retorno: :Get(key)  :Set(key, texto)  :Clear()  :Flash(índiceDoBotão, texto, segundos)
+function Section:AddInputRow(o)
+	o = o or {}
+	local fields, buttons = o.Fields or {}, o.Buttons or {}
+	local GAP, BUTTON_W = 6, 62
+	local row = self:_row(36)
+	local holder = new("Frame", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(8, 0), Size = UDim2.new(1, -16, 1, 0), Parent = row,
+	}, { new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, GAP),
+		VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
+	}) })
+
+	-- Largura fixa (botões + espaços) repartida entre os campos conforme o peso de cada um.
+	local fixed = #buttons * BUTTON_W + math.max(#fields + #buttons - 1, 0) * GAP
+	local totalWeight, defaultWeight = 0, 1 / math.max(#fields, 1)
+	for _, f in ipairs(fields) do totalWeight += (tonumber(f.Weight) or defaultWeight) end
+	if totalWeight <= 0 then totalWeight = 1 end
+
+	local obj = { Instance = row }
+	local boxes = {}
+	for i, f in ipairs(fields) do
+		local weight = (tonumber(f.Weight) or defaultWeight) / totalWeight
+		boxes[f.Key or i] = new("TextBox", {
+			LayoutOrder = i, Size = UDim2.new(weight, -math.ceil(fixed * weight), 0, 24),
+			BackgroundColor3 = Theme.Track, BorderSizePixel = 0, ClearTextOnFocus = false, Text = f.Default or "",
+			PlaceholderText = f.Placeholder or "...", PlaceholderColor3 = Theme.SubText, TextColor3 = Theme.Text,
+			TextSize = 14, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd, Parent = holder,
+		}, { corner(5), new("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }) })
+	end
+
+	local function values()
+		local v = {}
+		for key, box in pairs(boxes) do v[key] = box.Text end
+		return v
+	end
+
+	local buttonObjs, flashIds = {}, {}
+	for i, b in ipairs(buttons) do
+		local btn = new("TextButton", {
+			LayoutOrder = #fields + i, Size = UDim2.fromOffset(BUTTON_W, 24), BackgroundColor3 = Theme.Track,
+			BorderSizePixel = 0, AutoButtonColor = false, Text = b.Text or "OK", TextColor3 = Theme.Text,
+			TextSize = 12, Font = Enum.Font.GothamMedium, TextTruncate = Enum.TextTruncate.AtEnd, Parent = holder,
+		}, { corner(5) })
+		btn.MouseEnter:Connect(function() tween(btn, { BackgroundColor3 = Theme.Header }) end)
+		btn.MouseLeave:Connect(function() tween(btn, { BackgroundColor3 = Theme.Track }) end)
+		btn.MouseButton1Click:Connect(function() safeCall(b.Callback, values(), obj) end)
+		buttonObjs[i] = { button = btn, text = btn.Text }
+	end
+
+	function obj:Get(key) local box = boxes[key] return box and box.Text or nil end
+	function obj:Set(key, text) local box = boxes[key] if box then box.Text = text or "" end end
+	function obj:Clear() for _, box in pairs(boxes) do box.Text = "" end end
+	-- Troca o texto de um botão por alguns segundos (retorno rápido: "Added", "Invalid"...).
+	function obj:Flash(index, text, seconds)
+		local entry = buttonObjs[index or 1]
+		if not entry then return end
+		local id = (flashIds[index or 1] or 0) + 1
+		flashIds[index or 1] = id
+		entry.button.Text = tostring(text)
+		task.delay(seconds or 1.5, function()
+			if flashIds[index or 1] == id and entry.button.Parent then entry.button.Text = entry.text end
+		end)
+	end
+	return obj
+end
+
 function Section:AddDropdown(o)
 	local options = o.Options or {}
 	local selected = o.Default
