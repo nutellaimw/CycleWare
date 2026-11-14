@@ -452,9 +452,9 @@ function Section:AddSlotBoard(o)
 		LayoutOrder = self:_next(), Parent = self._body,
 	}, { new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
 
-	--// slots
+	--// slots (the Extra area, when there is one, sits above them like the old backpack's inventory)
 	local slotArea = new("Frame", {
-		LayoutOrder = 1, BackgroundColor3 = Theme.Item, BorderSizePixel = 0,
+		LayoutOrder = 2, BackgroundColor3 = Theme.Item, BorderSizePixel = 0,
 		Size = UDim2.new(1, 0, 0, 60), Parent = container,
 	}, { corner(6), new("UIPadding", {
 		PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
@@ -490,17 +490,29 @@ function Section:AddSlotBoard(o)
 	end
 
 
-	local extraCell, extraLabel, extraStroke
+	-- Extra area: a lower strip above the slots holding its items as smaller squares; empty, it shows its
+	-- placeholder text.
+	local extraCell, extraLabel, extraStroke, extraHolder, extraGrid
+	local extraTiles = {}
+	local EXTRA_EMPTY_H, EXTRA_PAD = 30, 6
 	if extra then
 		extraCell = new("TextButton", {
-			LayoutOrder = 2, BackgroundColor3 = Theme.Track, BorderSizePixel = 0, AutoButtonColor = false, Text = "",
-			Size = UDim2.new(1, 0, 0, 34), Parent = container,
+			LayoutOrder = 1, BackgroundColor3 = Theme.Track, BorderSizePixel = 0, AutoButtonColor = false, Text = "",
+			Size = UDim2.new(1, 0, 0, EXTRA_EMPTY_H), Parent = container,
 		}, { corner(6) })
 		extraStroke = new("UIStroke", { Color = Theme.Divider, Thickness = 1, Transparency = 0.5, Parent = extraCell })
 		extraLabel = new("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -20, 1, 0),
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -20, 0, EXTRA_EMPTY_H),
 			Text = "", TextColor3 = Theme.SubText, TextSize = 12, Font = Enum.Font.GothamMedium,
 			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = extraCell,
+		})
+		extraHolder = new("Frame", {
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(EXTRA_PAD + 2, EXTRA_PAD),
+			Size = UDim2.new(1, -2 * (EXTRA_PAD + 2), 1, -2 * EXTRA_PAD), Parent = extraCell,
+		})
+		extraGrid = new("UIGridLayout", {
+			CellPadding = UDim2.fromOffset(GAP, GAP), CellSize = UDim2.fromOffset(33, 33),
+			SortOrder = Enum.SortOrder.LayoutOrder, Parent = extraHolder,
 		})
 	end
 
@@ -547,6 +559,7 @@ function Section:AddSlotBoard(o)
 	end
 
 	-- Slots: 10 por linha quando cabem com pelo menos 40 px; senão 5 por linha. Os itens usam o mesmo tamanho.
+	local relayoutExtra -- sizeExtra, once it exists
 	local function relayout()
 		local width = slotArea.AbsoluteSize.X - 16
 		if width > 0 then
@@ -554,6 +567,11 @@ function Section:AddSlotBoard(o)
 			local cell = math.min(math.floor((width - (columns - 1) * GAP) / columns), 64)
 			slotGrid.CellSize = UDim2.fromOffset(cell, cell)
 			itemGrid.CellSize = UDim2.fromOffset(cell, cell)
+			if extraGrid then
+				local small = math.max(math.floor(cell * 0.75), 24)
+				extraGrid.CellSize = UDim2.fromOffset(small, small)
+				if relayoutExtra then relayoutExtra() end
+			end
 			local rows = math.ceil(#labels / columns)
 			slotArea.Size = UDim2.new(1, 0, 0, rows * cell + (rows - 1) * GAP + 16)
 		end
@@ -569,6 +587,44 @@ function Section:AddSlotBoard(o)
 		return nil
 	end
 
+	local startDrag -- defined with the dragging code below
+	-- Height of the strip: as many rows of small squares as its items need (a thin strip when empty).
+	local function sizeExtra()
+		local count = #(value[extra.Key] or {})
+		if count == 0 then
+			extraCell.Size = UDim2.new(1, 0, 0, EXTRA_EMPTY_H)
+			return
+		end
+		local small = extraGrid.CellSize.X.Offset
+		local width = extraHolder.AbsoluteSize.X
+		local columns = width > 0 and math.max(1, math.floor((width + GAP) / (small + GAP))) or 10
+		local rows = math.ceil(count / columns)
+		extraCell.Size = UDim2.new(1, 0, 0, rows * small + (rows - 1) * GAP + 2 * EXTRA_PAD)
+	end
+	relayoutExtra = extra and sizeExtra or nil
+	local function renderExtra()
+		for _, tile in ipairs(extraTiles) do tile:Destroy() end
+		table.clear(extraTiles)
+		local keys = value[extra.Key] or {}
+		extraLabel.Visible = #keys == 0
+		extraLabel.Text = extra.Placeholder or (extra.Text or "Extra")
+		for index, key in ipairs(keys) do
+			local tile = new("TextButton", {
+				LayoutOrder = index, BackgroundColor3 = Theme.Item, BorderSizePixel = 0, AutoButtonColor = false,
+				Text = "", Parent = extraHolder,
+			}, { corner(5), new("TextLabel", {
+				BackgroundTransparency = 1, Position = UDim2.fromOffset(2, 2), Size = UDim2.new(1, -4, 1, -4),
+				Text = itemText[key] or key, TextColor3 = Theme.Text, TextScaled = true, TextWrapped = true,
+				TextYAlignment = Enum.TextYAlignment.Center, Font = Enum.Font.GothamMedium,
+			}, { new("UITextSizeConstraint", { MaxTextSize = 10, MinTextSize = 5 }) }) })
+			tile.InputBegan:Connect(function(input)
+				if isClick(input) and startDrag then startDrag(key, extra.Key, input) end
+			end)
+			table.insert(extraTiles, tile)
+		end
+		sizeExtra()
+	end
+
 	local function render()
 		for index, s in ipairs(slotCells) do
 			local keys = value[index]
@@ -582,18 +638,7 @@ function Section:AddSlotBoard(o)
 			end
 		end
 		if extraCell then
-			local keys = value[extra.Key]
-			if keys and #keys > 0 then
-				local names = {}
-				for _, k in ipairs(keys) do table.insert(names, itemText[k] or k) end
-				extraLabel.Text = (extra.Text or "Extra") .. ": " .. table.concat(names, ", ")
-				extraLabel.TextColor3 = Theme.Text
-				extraCell.BackgroundColor3 = Theme.ItemSelected
-			else
-				extraLabel.Text = extra.Placeholder or (extra.Text or "Extra")
-				extraLabel.TextColor3 = Theme.SubText
-				extraCell.BackgroundColor3 = Theme.Track
-			end
+			renderExtra()
 		end
 		for key, c in pairs(itemCells) do
 			local slot = slotOf(key)
@@ -656,7 +701,7 @@ function Section:AddSlotBoard(o)
 		end
 	end
 
-	local function startDrag(key, fromSlot, input)
+	function startDrag(key, fromSlot, input)
 		if dragging or not key then return end
 		local cell = slotGrid.CellSize -- the ghost is a square of the same size as the slots and the items
 		local ghost = new("Frame", {
@@ -713,14 +758,13 @@ function Section:AddSlotBoard(o)
 
 	if extraCell then
 		extraCell.InputBegan:Connect(function(input)
-			local keys = value[extra.Key]
-			if isClick(input) and keys and #keys > 0 then
-				startDrag(keys[#keys], extra.Key, input)
-			elseif input.UserInputType == Enum.UserInputType.MouseButton2 and keys then
+			if input.UserInputType == Enum.UserInputType.MouseButton2 and value[extra.Key] then
 				value[extra.Key] = nil
 				changed()
 			end
 		end)
+		-- The squares wrap when the strip changes width.
+		extraHolder:GetPropertyChangedSignal("AbsoluteSize"):Connect(sizeExtra)
 	end
 
 	self._window:_connect(UserInputService.InputChanged, function(input)
