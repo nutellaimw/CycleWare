@@ -5735,32 +5735,37 @@ guarded("Utilities", function()
 	-- <<< AUTO RELOAD END
 
 	-- >>> AUTO SLOT BEGIN
-	-- Auto Slot: every tool can be given a slot of the game's inventory bar (1-9 and 0).
+	-- Auto Slot: every tool can be given a slot of the inventory bar (1-9 and 0), or be hidden from the
+	-- inventory. There are two layouts: one for the police (Guards) and one for everybody else (Criminals,
+	-- Inmates, Neutral); the one of the player's current team is used, and switches when the team changes.
 	--
-	-- How the game's inventory works (ReplicatedStorage.Scripts.BackpackClient, read from the decompiled place):
+	-- The game's inventory (ReplicatedStorage.Scripts.BackpackClient, read from the decompiled place):
 	--   * the bar is ONE list (t1) of { Tool, Button, Slot } with no gaps and at most 10 entries: the slot of a
 	--     tool is its position in that list. updateToolbar() re-reads the list and moves the buttons.
-	--   * onToolAdded (connected to Backpack.ChildAdded) appends a new tool; equipTool(entry) equips it.
-	--   * the keys 1-8 equip slots 1-8 (9 and 0 are in its key map, but the handler ignores them).
-	--   * PlayerSettings "UseOldBackpack" switches to Roblox's own backpack (the BackpackScript CoreScript).
-	-- The list and updateToolbar are reached through the upvalues of onToolAdded (getconnections +
-	-- debug.getupvalue). Each one is recognised by what it captures, not by its position:
-	--   t1           the only table onToolAdded captures (besides the player)
-	--   updateToolbar captures t1 and no function, no Color3 and no player
-	--   equipTool     captures t1, the player and the two button Color3s
-	-- Arranging SWAPS: a tool goes to its slot only when that position exists (there are that many tools),
-	-- and the tool that was there takes its old place. With several tools in one slot, the first one the
-	-- player has wins; a slot already settled is never moved by a later one.
+	--   * onToolAdded (connected to Backpack.ChildAdded) appends a new tool; a tool whose parent leaves the
+	--     Backpack/character is removed (AncestryChanged).
+	--   The list and updateToolbar are reached through the upvalues of onToolAdded (getconnections +
+	--   debug.getupvalue), each one recognised by what it captures:
+	--     t1            the only table onToolAdded captures (besides the player)
+	--     updateToolbar captures t1 and no function, no Color3 and no player
+	--     equipTool     captures t1, the player and the two button Color3s
+	--   Arranging SWAPS: a tool goes to its slot only when that position exists (there are that many tools),
+	--   and the tool that was there takes its old place. With several tools in one slot the first one the
+	--   player has wins; a slot already settled is never moved by a later one.
 	--
 	-- Roblox's own backpack ("Use Old Backpack") is a CoreScript: its connections come from a foreign Luau
 	-- state, and reading their upvalues crashed the game on some executors, so its internals are never
-	-- touched. Its public behaviour is used instead: a tool that leaves the Backpack frees its slot, and a
-	-- tool that arrives takes the lowest empty slot. So the tools are taken out of the Backpack locally
-	-- (nothing replicates: the server still has them there), one frame is waited so that backpack frees
-	-- the slots (signals are deferred: in the same frame it would see the tool back and keep the slot), and
-	-- they are put back in the wanted order. Only the game's BackpackClient listens to the Backpack (its bar
-	-- is hidden in that mode); the tool controllers (guns, shield, C4, snacks) listen to the character only.
-	-- This runs only while no tool is in hand, and only when the order has to change.
+	-- touched. Its public behaviour is used instead: a tool that leaves the Backpack and the character frees
+	-- its slot, and a tool that arrives takes the lowest empty slot. This script follows every arrival and
+	-- departure the same way (its handlers are deferred like Roblox's, in the same order), so it knows where
+	-- each tool is. To reorder, the tools are taken out of the Backpack locally (nothing replicates: the
+	-- server still has them there), one frame is waited so that backpack frees the slots, and they are put
+	-- back in the wanted order. That happens only while no tool is in hand. Only the game's BackpackClient
+	-- listens to the Backpack; the tool controllers (guns, shield, C4, snacks) listen to the character only.
+	--
+	-- Hiding: a hidden tool is taken out of the Backpack locally (parent nil), so neither bar shows it and
+	-- it can't be equipped. The server still has it. It comes back when it is un-hidden, when Auto Slot is
+	-- turned off, or when the server moves it. Kept in CW.State so a re-run can put the tools back.
 	local PlayerSettings = ReplicatedStorage:FindFirstChild("PlayerSettings")
 	local SLOT_COUNT = 10
 	local autoSlotCaps = CW.Caps.upvalues == true
@@ -5866,34 +5871,72 @@ guarded("Utilities", function()
 		return nil
 	end
 
-	-- Layout: slot -> { tool names, first has priority }. Saved as AUTO_SLOT_LAYOUT = { S1 = "AK-47|M4A1", ... }.
-	local function readLayout()
+	--// Layouts per team ----------------------------------------------------------------------------------
+	-- "Police" = Guards; "Prisoner" = Criminals, Inmates and Neutral. The tools a team can't have are left
+	-- out of its board: Handcuffs and Taser are guard equipment, and the Riot Shield comes from the guards'
+	-- "Riot Police" gamepass.
+	local VARIANTS = {
+		{ key = "PRISONER", label = "Criminal / Inmate", excluded = { Handcuffs = true, Taser = true, ["Riot Shield"] = true } },
+		{ key = "POLICE", label = "Police", excluded = {} },
+	}
+	local VARIANT_BY_KEY = {}
+	for _, variant in ipairs(VARIANTS) do VARIANT_BY_KEY[variant.key] = variant end
+
+	local function currentVariantKey()
+		local team = LocalPlayer.Team
+		return (team and team.Name == "Guards") and "POLICE" or "PRISONER"
+	end
+
+	-- Saved as AUTO_SLOT_LAYOUT_<KEY> = { S1 = "AK-47|M4A1", ..., H = "Key card|Soda" } (H = hidden).
+	local HIDDEN_KEY = "hidden"
+	local function readLayout(variantKey)
 		local layout = {}
-		local saved = CW.Settings.AUTO_SLOT_LAYOUT
-		if type(saved) == "table" then
-			for slot = 1, SLOT_COUNT do
-				local text = saved["S" .. slot]
-				if type(text) == "string" and text ~= "" then
-					local names = {}
-					for name in text:gmatch("[^|]+") do table.insert(names, name) end
-					if #names > 0 then layout[slot] = names end
+		local saved = CW.Settings["AUTO_SLOT_LAYOUT_" .. variantKey]
+		local excluded = VARIANT_BY_KEY[variantKey].excluded
+		local function parse(text)
+			local names = {}
+			if type(text) == "string" then
+				for name in text:gmatch("[^|]+") do
+					if not excluded[name] then table.insert(names, name) end
 				end
 			end
+			return #names > 0 and names or nil
+		end
+		if type(saved) == "table" then
+			for slot = 1, SLOT_COUNT do layout[slot] = parse(saved["S" .. slot]) end
+			layout[HIDDEN_KEY] = parse(saved.H)
 		end
 		return layout
 	end
-	local layout = readLayout()
-
-	local function saveLayout(newLayout)
-		layout = newLayout
+	local function saveLayout(variantKey, layout)
 		local saved = {}
-		for slot, names in pairs(newLayout) do
-			if type(slot) == "number" and slot >= 1 and slot <= SLOT_COUNT and #names > 0 then
-				saved["S" .. slot] = table.concat(names, "|")
+		for slot, names in pairs(layout) do
+			if #names > 0 then
+				if slot == HIDDEN_KEY then
+					saved.H = table.concat(names, "|")
+				elseif type(slot) == "number" and slot >= 1 and slot <= SLOT_COUNT then
+					saved["S" .. slot] = table.concat(names, "|")
+				end
 			end
 		end
-		CW.Settings.AUTO_SLOT_LAYOUT = saved
+		CW.Settings["AUTO_SLOT_LAYOUT_" .. variantKey] = saved
 	end
+
+	-- The single layout of an older build becomes the starting layout of both teams (once).
+	if type(CW.Settings.AUTO_SLOT_LAYOUT) == "table" then
+		for _, variant in ipairs(VARIANTS) do
+			local name = "AUTO_SLOT_LAYOUT_" .. variant.key
+			if type(CW.Settings[name]) ~= "table" then CW.Settings[name] = table.clone(CW.Settings.AUTO_SLOT_LAYOUT) end
+		end
+		CW.Settings.AUTO_SLOT_LAYOUT = nil
+	end
+	-- An older build had keys 9 and 0 equip slots 9 and 0: a re-run removes that connection.
+	CW.untrack("autoSlotKeys")
+	CW.Settings.AUTO_SLOT_KEYS = nil
+
+	local layouts = {}
+	for _, variant in ipairs(VARIANTS) do layouts[variant.key] = readLayout(variant.key) end
+	local layout = layouts[currentVariantKey()] -- the layout arrangeList uses
 
 	-- Swaps the tools into their slots. Returns true when the bar changed.
 	local function arrangeList(list)
@@ -5905,7 +5948,8 @@ guarded("Utilities", function()
 				local position
 				for _, name in ipairs(names) do
 					for i, entry in ipairs(list) do
-						if not settled[i] and isEntry(entry) and entry.Tool.Name == name then
+						-- (a tool that was just hidden is still in the game's list until its own event runs)
+						if not settled[i] and isEntry(entry) and entry.Tool.Name == name and entry.Tool.Parent ~= nil then
 							position = i
 							break
 						end
@@ -5925,79 +5969,147 @@ guarded("Utilities", function()
 	end
 	CW.AutoSlotArrangeList = arrangeList -- used by the tests
 
+	--// Hiding -----------------------------------------------------------------------------------------
+	CW.State.autoSlotHidden = CW.State.autoSlotHidden or {} -- tool -> the Backpack it was taken from
+	local hiddenTools = CW.State.autoSlotHidden
 
-	local warnedMissing = false
-	--// Roblox's own backpack (Use Old Backpack) ----------------------------------------------------------
-	local oldOrder = {}       -- the tools in the order this script last put them in Roblox's backpack
-	local rebuildingOld = false
-
-	-- Order of the tools in Roblox's backpack, as far as this script knows: what it placed last time (still
-	-- there), then the others in the Backpack's order (the order Roblox's backpack fills them on spawn).
-	local function currentOldOrder(backpack)
-		local order, seen = {}, {}
-		for _, tool in ipairs(oldOrder) do
-			if tool.Parent == backpack then
-				table.insert(order, tool)
-				seen[tool] = true
-			end
+	local function isHiddenName(name)
+		for _, hiddenName in ipairs(layout[HIDDEN_KEY] or {}) do
+			if hiddenName == name then return true end
 		end
-		local known = #order > 0
-		for _, child in ipairs(backpack:GetChildren()) do
-			if child:IsA("Tool") and not seen[child] then table.insert(order, child) end
-		end
-		return order, known
+		return false
 	end
 
-	-- Takes the tools out and puts them back in the wanted order. Yields for one frame.
+	-- Puts back every hidden tool that should be visible now (or all of them with all = true).
+	local function restoreHidden(all)
+		for tool, backpack in pairs(hiddenTools) do
+			if all or not isHiddenName(tool.Name) or not CW.Settings.AUTO_SLOT_ENABLED then
+				hiddenTools[tool] = nil
+				-- Only when it is still where this script left it (the server may have moved it since).
+				if tool.Parent == nil and backpack.Parent == LocalPlayer then
+					pcall(function() tool.Parent = backpack end)
+				end
+			end
+		end
+	end
+
+	-- Takes the hidden tools out of the Backpack (never one in hand).
+	local function hideTools(backpack)
+		if not CW.Settings.AUTO_SLOT_ENABLED then return end
+		for _, child in ipairs(backpack:GetChildren()) do
+			if child:IsA("Tool") and isHiddenName(child.Name) then
+				hiddenTools[child] = backpack
+				pcall(function() child.Parent = nil end)
+			end
+		end
+	end
+
+	--// Roblox's own backpack (Use Old Backpack) ----------------------------------------------------------
+	-- Where each tool is in Roblox's backpack, as it decided it: [1..10] = tool or false.
+	local oldSlots = {}
+	local oldKnown = false   -- false until this script has laid the bar out itself (after a spawn or a start)
+	local rebuildingOld = false
+
+	local function oldIndex(tool)
+		for i = 1, SLOT_COUNT do
+			if oldSlots[i] == tool then return i end
+		end
+		return nil
+	end
+	local function oldArrived(tool)
+		if rebuildingOld or oldIndex(tool) then return end
+		for i = 1, SLOT_COUNT do
+			if not oldSlots[i] then
+				oldSlots[i] = tool
+				return
+			end
+		end
+	end
+	local function oldLeft(tool, backpack)
+		if rebuildingOld then return end
+		local parent = tool.Parent
+		if parent ~= backpack and parent ~= LocalPlayer.Character then
+			local i = oldIndex(tool)
+			if i then oldSlots[i] = false end
+		end
+	end
+
+	-- Takes the tools out and puts them back in the wanted order. Yields for two frames.
 	local function rebuildOldBackpack(backpack, wanted)
 		rebuildingOld = true
 		for _, tool in ipairs(wanted) do
 			pcall(function() tool.Parent = nil end)
 		end
 		task.wait() -- Roblox's backpack frees the slots now
-		local placed = {}
+		table.clear(oldSlots)
+		local index = 0
 		for _, tool in ipairs(wanted) do
 			-- A tool the server moved meanwhile (dropped, removed) is left where the server put it.
 			if tool.Parent == nil and backpack.Parent == LocalPlayer then
 				local ok = pcall(function() tool.Parent = backpack end)
-				if ok then table.insert(placed, tool) end
+				if ok then
+					index += 1
+					if index <= SLOT_COUNT then oldSlots[index] = tool end
+				end
 			end
 		end
-		oldOrder = placed
-		task.wait() -- our own ChildAdded events of this rebuild are not taken as new tools
+		task.wait() -- the ChildAdded events of this rebuild are not taken as new tools
+		oldKnown = true
 		rebuildingOld = false
 	end
 
-	local function arrangeOldBackpack()
+	local function arrangeOldBackpack(backpack)
 		if rebuildingOld then return end
-		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-		if not backpack then return end
 		-- Only with nothing in hand: the tool in hand keeps its slot and can't be moved without unequipping it.
 		local character = LocalPlayer.Character
 		if character and character:FindFirstChildOfClass("Tool") then return end
 
-		local order, known = currentOldOrder(backpack)
-		if #order < 2 then
-			oldOrder = order
-			return
+		-- The tools in bar order, and whether the bar has a gap before the last one.
+		local order, gap, seen = {}, false, {}
+		if oldKnown then
+			local emptyBefore = false
+			for i = 1, SLOT_COUNT do
+				local tool = oldSlots[i]
+				if tool and tool.Parent == backpack then
+					table.insert(order, tool)
+					seen[tool] = true
+					if emptyBefore then gap = true end
+				else
+					oldSlots[i] = false
+					emptyBefore = true
+				end
+			end
 		end
+		for _, child in ipairs(backpack:GetChildren()) do
+			if child:IsA("Tool") and not seen[child] then
+				table.insert(order, child)
+				if oldKnown then gap = true end -- a tool this script did not see arrive: lay the bar out again
+			end
+		end
+		if #order == 0 then return end
+
 		local entries = {}
 		for i, tool in ipairs(order) do entries[i] = { Tool = tool, Button = tool } end
 		local changed = arrangeList(entries)
-		if not changed and known then
-			oldOrder = order
-			return
-		end
-		-- The first time (nothing placed yet) the real order is unknown, so the whole bar is rebuilt once.
+		if oldKnown and not changed and not gap then return end
+		-- The first time (after a spawn or a start) the real order is unknown, so the bar is laid out once.
 		local wanted = {}
 		for i, entry in ipairs(entries) do wanted[i] = entry.Tool end
 		rebuildOldBackpack(backpack, wanted)
 	end
 
+	--// Arranging ------------------------------------------------------------------------------------------
+	local warnedMissing = false
 	local function arrange()
+		layout = layouts[currentVariantKey()]
+		restoreHidden(false)
 		if not CW.Settings.AUTO_SLOT_ENABLED then return end
+		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		if not backpack then return end
+		if not rebuildingOld then hideTools(backpack) end
+
 		if usingOldBackpack() then
-			arrangeOldBackpack() -- needs no executor function
+			arrangeOldBackpack(backpack) -- needs no executor function
 			return
 		end
 		if not autoSlotCaps then return end
@@ -6034,26 +6146,41 @@ guarded("Utilities", function()
 	end
 
 	local function watchBackpack(backpack)
+		oldKnown = false -- a new Backpack (a spawn): Roblox's backpack fills its bar again
+		table.clear(oldSlots)
 		CW.track("autoSlotBackpackAdded", backpack.ChildAdded:Connect(function(child)
-			if child:IsA("Tool") then queueArrange() end
+			if not child:IsA("Tool") then return end
+			oldArrived(child)
+			queueArrange()
 		end))
 		CW.track("autoSlotBackpackRemoved", backpack.ChildRemoved:Connect(function(child)
-			if child:IsA("Tool") then queueArrange() end
+			if not child:IsA("Tool") then return end
+			oldLeft(child, backpack)
+			queueArrange()
 		end))
 		queueArrange()
 	end
 	local function watchCharacter(character)
-		-- Equipping moves the tool from the Backpack into the character.
+		-- Equipping moves the tool into the character; a tool removed from the hand (a primary replaced by
+		-- another one, a dropped gun) leaves from the character.
 		CW.track("autoSlotEquip", character.ChildAdded:Connect(function(child)
-			if child:IsA("Tool") then queueArrange() end
+			if not child:IsA("Tool") then return end
+			oldArrived(child)
+			queueArrange()
+		end))
+		CW.track("autoSlotUnequip", character.ChildRemoved:Connect(function(child)
+			if not child:IsA("Tool") then return end
+			oldLeft(child, LocalPlayer:FindFirstChildOfClass("Backpack"))
+			queueArrange()
 		end))
 	end
 
 	local function stopAutoSlot()
-		for _, key in ipairs({ "autoSlotBackpackAdded", "autoSlotBackpackRemoved", "autoSlotEquip",
-			"autoSlotBackpackWait", "autoSlotCharacter", "autoSlotOldBackpack" }) do
+		for _, key in ipairs({ "autoSlotBackpackAdded", "autoSlotBackpackRemoved", "autoSlotEquip", "autoSlotUnequip",
+			"autoSlotBackpackWait", "autoSlotCharacter", "autoSlotOldBackpack", "autoSlotTeam" }) do
 			CW.untrack(key)
 		end
+		restoreHidden(true)
 	end
 
 	local function setAutoSlot(enabled)
@@ -6070,19 +6197,18 @@ guarded("Utilities", function()
 		end))
 		if LocalPlayer.Character then watchCharacter(LocalPlayer.Character) end
 		CW.track("autoSlotCharacter", LocalPlayer.CharacterAdded:Connect(watchCharacter))
+		CW.track("autoSlotTeam", LocalPlayer:GetPropertyChangedSignal("Team"):Connect(queueArrange))
 		if PlayerSettings then
-			CW.track("autoSlotOldBackpack", PlayerSettings:GetAttributeChangedSignal("UseOldBackpack"):Connect(queueArrange))
+			CW.track("autoSlotOldBackpack", PlayerSettings:GetAttributeChangedSignal("UseOldBackpack"):Connect(function()
+				oldKnown = false -- switching backpacks: lay the new one out from scratch
+				queueArrange()
+			end))
 		end
 	end
 
-	-- An older build had keys 9 and 0 equip slots 9 and 0: a re-run removes that connection.
-	CW.untrack("autoSlotKeys")
-	CW.Settings.AUTO_SLOT_KEYS = nil
-
-	-- Tools left out of the board: the EBR is in the Guns folder but has no ToolProperties (not in use).
+	-- Every tool of the game, grouped: guns, melee, the other tools, snacks. The EBR is in the Guns folder but
+	-- has no ToolProperties (not in use), so it is left out.
 	local HIDDEN_TOOLS = { EBR = true }
-
-	-- Every tool of the game, grouped: guns, melee, the other tools, snacks.
 	local function gameToolNames()
 		local names, seen = {}, table.clone(HIDDEN_TOOLS)
 		local tools = ReplicatedStorage:FindFirstChild("Tools")
@@ -6127,48 +6253,59 @@ guarded("Utilities", function()
 			drawer:AddLabel("Your executor has no getconnections or debug.getupvalue: Auto Slot works only with the game's \"Use Old Backpack\" setting.")
 		end
 
-		local names = gameToolNames()
-		local board = drawer:SlotBoard({
-			Slots = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" },
-			Items = (function()
-				local items = {}
-				for _, name in ipairs(names) do table.insert(items, { Key = name, Text = name }) end
-				return items
-			end)(),
-			Value = layout,
-			Hint = "Drag a tool onto a slot. Several tools can share a slot (the first one you have wins). "
-				.. "Drag a slot out to clear it, or right-click it.",
-			Callback = function(newLayout)
-				saveLayout(newLayout)
-				queueArrange()
+		local allNames = gameToolNames()
+		local boards = {}
+		local labelToKey = {}
+		local labels = {}
+		for _, variant in ipairs(VARIANTS) do
+			labelToKey[variant.label] = variant.key
+			table.insert(labels, variant.label)
+		end
+
+		local function showBoard(variantKey)
+			for key, board in pairs(boards) do
+				if board.Instance then board.Instance.Visible = key == variantKey end
+			end
+		end
+
+		-- Which team's layout the board edits (it opens on the current team's).
+		local startKey = currentVariantKey()
+		drawer:Dropdown({
+			Title = "Layout For",
+			Options = labels,
+			Default = VARIANT_BY_KEY[startKey].label,
+			Callback = function(label)
+				local key = labelToKey[label]
+				if key then showBoard(key) end
 			end,
 		})
-		if not board then
-			-- Older cached CWUI without AddSlotBoard: one dropdown per slot (one tool each).
-			local NONE = "None"
-			local options = { NONE }
-			for _, name in ipairs(names) do table.insert(options, name) end
-			for slot = 1, SLOT_COUNT do
-				local current = layout[slot] and layout[slot][1] or NONE
-				drawer:Dropdown({
-					Title = "Slot " .. (slot == 10 and 0 or slot),
-					Options = options,
-					Default = current,
-					Callback = function(name)
-						local newLayout = table.clone(layout)
-						for other, list in pairs(newLayout) do
-							if table.find(list, name) then
-								local copy = table.clone(list)
-								table.remove(copy, table.find(copy, name))
-								newLayout[other] = #copy > 0 and copy or nil
-							end
-						end
-						newLayout[slot] = name ~= NONE and { name } or nil
-						saveLayout(newLayout)
-						queueArrange()
-					end,
-				})
+
+		for _, variant in ipairs(VARIANTS) do
+			local variantKey = variant.key
+			local items = {}
+			for _, name in ipairs(allNames) do
+				if not variant.excluded[name] then table.insert(items, { Key = name, Text = name }) end
 			end
+			local board = drawer:SlotBoard({
+				Slots = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" },
+				Items = items,
+				Value = layouts[variantKey],
+				Extra = { Key = HIDDEN_KEY, Text = "Hidden", Badge = "H",
+					Placeholder = "Drop a tool here to hide it from the inventory" },
+				Hint = "Drag a tool onto a slot (several can share one: the first you have wins), or onto Hidden. "
+					.. "Drag it out to clear it, or right-click.",
+				Callback = function(newLayout)
+					layouts[variantKey] = newLayout
+					saveLayout(variantKey, newLayout)
+					queueArrange()
+				end,
+			})
+			if board then boards[variantKey] = board end
+		end
+		if next(boards) then
+			showBoard(startKey)
+		else
+			drawer:AddLabel("Update CWUI.lua (the slot board is new) to edit the Auto Slot layouts.")
 		end
 	end)
 
