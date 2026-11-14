@@ -418,8 +418,10 @@ end
 --       Items = { { Key = "AK-47", Text = "AK-47" }, ... },   -- itens arrastáveis
 --       Value = { [1] = { "AK-47", "M4A1" }, [3] = { "Hammer" } }, -- slot -> chaves (a primeira tem prioridade)
 --       Hint  = "texto opcional abaixo dos slots",
+--       Extra = { Key = "hidden", Text = "Hidden", Placeholder = "Drop here to ..." }, -- área extra opcional
 --       Callback = function(value) end,                       -- cópia do valor a cada mudança
 --   })
+--   Com Extra, value[Extra.Key] = { chaves } é mais um destino (uma área larga abaixo dos slots).
 --   Arrastar um item para um slot coloca ele no fim da lista daquele slot (e tira de qualquer outro).
 --   Arrastar um slot: leva o último item dele; soltar fora dos slots tira o item. Botão direito limpa o slot.
 --   Retorno: :Get()  :Set(value, silent)
@@ -432,10 +434,12 @@ function Section:AddSlotBoard(o)
 	local itemText = {}
 	for _, item in ipairs(items) do itemText[item.Key] = item.Text or item.Key end
 
+	local extra = o.Extra
 	local function copyValue(source)
 		local result = {}
 		for slot, keys in pairs(source or {}) do
-			if type(slot) == "number" and type(keys) == "table" and #keys > 0 then
+			local valid = type(slot) == "number" or (extra and slot == extra.Key)
+			if valid and type(keys) == "table" and #keys > 0 then
 				result[slot] = table.clone(keys)
 			end
 		end
@@ -486,9 +490,23 @@ function Section:AddSlotBoard(o)
 	end
 
 
+	local extraCell, extraLabel, extraStroke
+	if extra then
+		extraCell = new("TextButton", {
+			LayoutOrder = 2, BackgroundColor3 = Theme.Track, BorderSizePixel = 0, AutoButtonColor = false, Text = "",
+			Size = UDim2.new(1, 0, 0, 34), Parent = container,
+		}, { corner(6) })
+		extraStroke = new("UIStroke", { Color = Theme.Divider, Thickness = 1, Transparency = 0.5, Parent = extraCell })
+		extraLabel = new("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -20, 1, 0),
+			Text = "", TextColor3 = Theme.SubText, TextSize = 12, Font = Enum.Font.GothamMedium,
+			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = extraCell,
+		})
+	end
+
 	if o.Hint then
 		new("TextLabel", {
-			LayoutOrder = 2, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = 3, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 			Text = o.Hint, TextColor3 = Theme.SubText, TextSize = 12, Font = Enum.Font.Gotham, TextWrapped = true,
 			TextXAlignment = Enum.TextXAlignment.Left, Parent = container,
 		}, { new("UIPadding", { PaddingLeft = UDim.new(0, 4) }) })
@@ -496,7 +514,7 @@ function Section:AddSlotBoard(o)
 
 	--// itens
 	local itemArea = new("Frame", {
-		LayoutOrder = 3, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 4, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 		Parent = container,
 	})
 	-- Same padding and cell size as the slot row, so the item squares line up with the slots.
@@ -563,9 +581,29 @@ function Section:AddSlotBoard(o)
 				s.cell.BackgroundColor3 = Theme.Track
 			end
 		end
+		if extraCell then
+			local keys = value[extra.Key]
+			if keys and #keys > 0 then
+				local names = {}
+				for _, k in ipairs(keys) do table.insert(names, itemText[k] or k) end
+				extraLabel.Text = (extra.Text or "Extra") .. ": " .. table.concat(names, ", ")
+				extraLabel.TextColor3 = Theme.Text
+				extraCell.BackgroundColor3 = Theme.ItemSelected
+			else
+				extraLabel.Text = extra.Placeholder or (extra.Text or "Extra")
+				extraLabel.TextColor3 = Theme.SubText
+				extraCell.BackgroundColor3 = Theme.Track
+			end
+		end
 		for key, c in pairs(itemCells) do
 			local slot = slotOf(key)
-			c.badge.Text = slot and tostring(labels[slot] or slot) or ""
+			local badgeText = ""
+			if extra and slot == extra.Key then
+				badgeText = extra.Badge or "H"
+			elseif slot then
+				badgeText = tostring(labels[slot] or slot)
+			end
+			c.badge.Text = badgeText
 			c.name.TextColor3 = slot and Theme.Text or Theme.SubText
 			c.stroke.Transparency = slot and 0.2 or 1
 		end
@@ -598,6 +636,7 @@ function Section:AddSlotBoard(o)
 		for index, s in ipairs(slotCells) do
 			if insideGui(s.cell, point) then return index end
 		end
+		if extraCell and insideGui(extraCell, point) then return extra.Key end
 		return nil
 	end
 	-- The ghost lives in the window's ScreenGui: its offset is relative to the gui's own top-left corner.
@@ -609,6 +648,11 @@ function Section:AddSlotBoard(o)
 		for i, s in ipairs(slotCells) do
 			s.stroke.Color = (i == index) and Theme.Accent or Theme.Divider
 			s.stroke.Transparency = (i == index) and 0 or 0.5
+		end
+		if extraStroke then
+			local on = extra and index == extra.Key
+			extraStroke.Color = on and Theme.Accent or Theme.Divider
+			extraStroke.Transparency = on and 0 or 0.5
 		end
 	end
 
@@ -662,6 +706,18 @@ function Section:AddSlotBoard(o)
 				startDrag(keys[#keys], index, input)
 			elseif input.UserInputType == Enum.UserInputType.MouseButton2 and keys then
 				value[index] = nil
+				changed()
+			end
+		end)
+	end
+
+	if extraCell then
+		extraCell.InputBegan:Connect(function(input)
+			local keys = value[extra.Key]
+			if isClick(input) and keys and #keys > 0 then
+				startDrag(keys[#keys], extra.Key, input)
+			elseif input.UserInputType == Enum.UserInputType.MouseButton2 and keys then
+				value[extra.Key] = nil
 				changed()
 			end
 		end)
