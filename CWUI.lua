@@ -16,7 +16,7 @@
         Elementos: Label, Button, Toggle, Slider, Textbox, Dropdown, Colorpicker, Gallery
 ]]
 
-local CW = { Version = "2.2.0" }
+local CW = { Version = "2.3.0" }
 
 --// Services ---------------------------------------------------------------
 local cloneref = cloneref or function(x) return x end
@@ -409,6 +409,271 @@ function Section:AddInputRow(o)
 			if flashIds[index or 1] == id and entry.button.Parent then entry.button.Text = entry.text end
 		end)
 	end
+	return obj
+end
+
+-- Quadro de slots: uma fileira de slots (como a barra do inventário) e, embaixo, os itens para arrastar.
+--   Section:AddSlotBoard({
+--       Slots = { "1", "2", ..., "0" },                       -- rótulo de cada slot
+--       Items = { { Key = "AK-47", Text = "AK-47" }, ... },   -- itens arrastáveis
+--       Value = { [1] = { "AK-47", "M4A1" }, [3] = { "Hammer" } }, -- slot -> chaves (a primeira tem prioridade)
+--       Hint  = "texto opcional abaixo dos slots",
+--       Callback = function(value) end,                       -- cópia do valor a cada mudança
+--   })
+--   Arrastar um item para um slot coloca ele no fim da lista daquele slot (e tira de qualquer outro).
+--   Arrastar um slot: leva o último item dele; soltar fora dos slots tira o item. Botão direito limpa o slot.
+--   Retorno: :Get()  :Set(value, silent)
+function Section:AddSlotBoard(o)
+	o = o or {}
+	local labels = o.Slots or { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" }
+	local items = o.Items or {}
+	local GAP = 6
+	local value = {}
+	local itemText = {}
+	for _, item in ipairs(items) do itemText[item.Key] = item.Text or item.Key end
+
+	local function copyValue(source)
+		local result = {}
+		for slot, keys in pairs(source or {}) do
+			if type(slot) == "number" and type(keys) == "table" and #keys > 0 then
+				result[slot] = table.clone(keys)
+			end
+		end
+		return result
+	end
+	value = copyValue(o.Value)
+
+	local container = new("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = self:_next(), Parent = self._body,
+	}, { new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+	--// slots
+	local slotArea = new("Frame", {
+		LayoutOrder = 1, BackgroundColor3 = Theme.Item, BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 60), Parent = container,
+	}, { corner(6), new("UIPadding", {
+		PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+	}) })
+	local slotGrid = new("UIGridLayout", {
+		CellPadding = UDim2.fromOffset(GAP, GAP), CellSize = UDim2.fromOffset(44, 44),
+		SortOrder = Enum.SortOrder.LayoutOrder, HorizontalAlignment = Enum.HorizontalAlignment.Center, Parent = slotArea,
+	})
+
+	local slotCells = {}
+	for index, label in ipairs(labels) do
+		local cell = new("TextButton", {
+			LayoutOrder = index, BackgroundColor3 = Theme.Track, BorderSizePixel = 0, AutoButtonColor = false,
+			Text = "", Parent = slotArea,
+		}, { corner(6) })
+		local stroke = new("UIStroke", { Color = Theme.Divider, Thickness = 1, Transparency = 0.5, Parent = cell })
+		new("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 2), Size = UDim2.fromOffset(14, 12),
+			Text = label, TextColor3 = Theme.SubText, TextSize = 11, Font = Enum.Font.GothamBold,
+			TextXAlignment = Enum.TextXAlignment.Left, Parent = cell,
+		})
+		local name = new("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 13), Size = UDim2.new(1, -6, 1, -15),
+			Text = "", TextColor3 = Theme.Text, TextScaled = true, TextWrapped = true, Font = Enum.Font.GothamMedium,
+			Parent = cell,
+		}, { new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6 }) })
+		local extra = new("TextLabel", {
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -4, 0, 2),
+			Size = UDim2.fromOffset(20, 12), Text = "", TextColor3 = Theme.Accent, TextSize = 10,
+			Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Right, Parent = cell,
+		})
+		slotCells[index] = { cell = cell, stroke = stroke, name = name, extra = extra }
+	end
+
+
+	if o.Hint then
+		new("TextLabel", {
+			LayoutOrder = 2, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			Text = o.Hint, TextColor3 = Theme.SubText, TextSize = 12, Font = Enum.Font.Gotham, TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left, Parent = container,
+		}, { new("UIPadding", { PaddingLeft = UDim.new(0, 4) }) })
+	end
+
+	--// itens
+	local itemArea = new("Frame", {
+		LayoutOrder = 3, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		Parent = container,
+	})
+	local itemGrid = new("UIGridLayout", {
+		CellPadding = UDim2.fromOffset(GAP, GAP), CellSize = UDim2.fromOffset(90, 30),
+		SortOrder = Enum.SortOrder.LayoutOrder, Parent = itemArea,
+	})
+	local itemCells = {}
+	for index, item in ipairs(items) do
+		local tile = new("TextButton", {
+			LayoutOrder = index, BackgroundColor3 = Theme.Item, BorderSizePixel = 0, AutoButtonColor = false,
+			Text = itemText[item.Key], TextColor3 = Theme.SubText, TextSize = 12, Font = Enum.Font.GothamMedium,
+			TextTruncate = Enum.TextTruncate.AtEnd, Parent = itemArea,
+		}, { corner(6), new("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }) })
+		local stroke = new("UIStroke", {
+			Color = Theme.Accent, Thickness = 1, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = tile,
+		})
+		itemCells[item.Key] = { tile = tile, stroke = stroke }
+	end
+
+	-- Slots: 10 por linha quando cabem com pelo menos 40 px; senão 5 por linha. Itens: 4 a 6 por linha.
+	local function relayout()
+		local width = slotArea.AbsoluteSize.X - 16
+		if width > 0 then
+			local columns = (width - 9 * GAP) / 10 >= 40 and 10 or 5
+			local cell = math.min(math.floor((width - (columns - 1) * GAP) / columns), 64)
+			slotGrid.CellSize = UDim2.fromOffset(cell, cell)
+			local rows = math.ceil(#labels / columns)
+			slotArea.Size = UDim2.new(1, 0, 0, rows * cell + (rows - 1) * GAP + 16)
+		end
+		local itemWidth = itemArea.AbsoluteSize.X
+		if itemWidth > 0 then
+			local columns = math.clamp(math.floor((itemWidth + GAP) / (84 + GAP)), 2, 6)
+			itemGrid.CellSize = UDim2.fromOffset(math.floor((itemWidth - (columns - 1) * GAP) / columns), 30)
+		end
+	end
+	slotArea:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayout)
+	itemArea:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayout)
+
+	local function slotOf(key)
+		for slot, keys in pairs(value) do
+			for _, k in ipairs(keys) do
+				if k == key then return slot end
+			end
+		end
+		return nil
+	end
+
+	local function render()
+		for index, s in ipairs(slotCells) do
+			local keys = value[index]
+			if keys and #keys > 0 then
+				s.name.Text = itemText[keys[1]] or keys[1]
+				s.extra.Text = #keys > 1 and ("+" .. (#keys - 1)) or ""
+				s.cell.BackgroundColor3 = Theme.ItemSelected
+			else
+				s.name.Text, s.extra.Text = "", ""
+				s.cell.BackgroundColor3 = Theme.Track
+			end
+		end
+		for key, c in pairs(itemCells) do
+			local slot = slotOf(key)
+			c.tile.Text = slot and (itemText[key] .. "  ·  " .. (labels[slot] or slot)) or itemText[key]
+			c.tile.TextColor3 = slot and Theme.Text or Theme.SubText
+			c.stroke.Transparency = slot and 0.2 or 1
+		end
+	end
+
+	local obj = { Instance = container }
+	local function changed()
+		render()
+		safeCall(o.Callback, copyValue(value))
+	end
+
+	local function removeKey(key)
+		for slot, keys in pairs(value) do
+			for i = #keys, 1, -1 do
+				if keys[i] == key then table.remove(keys, i) end
+			end
+			if #keys == 0 then value[slot] = nil end
+		end
+	end
+
+	--// arrastar
+	local gui = self._window._gui
+	local dragging -- { key, ghost, fromSlot }
+	local function pointOf(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			local inset = game:GetService("GuiService"):GetGuiInset()
+			return Vector2.new(input.Position.X, input.Position.Y) + inset
+		end
+		return UserInputService:GetMouseLocation() -- a janela ignora o inset: mesmo espaço da tela inteira
+	end
+	local function slotAt(point)
+		for index, s in ipairs(slotCells) do
+			if insideGui(s.cell, point) then return index end
+		end
+		return nil
+	end
+	local function highlight(index)
+		for i, s in ipairs(slotCells) do
+			s.stroke.Color = (i == index) and Theme.Accent or Theme.Divider
+			s.stroke.Transparency = (i == index) and 0 or 0.5
+		end
+	end
+
+	local function startDrag(key, fromSlot, input)
+		if dragging or not key then return end
+		local point = pointOf(input)
+		local ghost = new("TextLabel", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(point.X, point.Y),
+			Size = UDim2.fromOffset(96, 28), BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.1,
+			Text = itemText[key] or key, TextColor3 = Theme.Text, TextSize = 12, Font = Enum.Font.GothamMedium,
+			TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 50, Parent = gui,
+		}, { corner(6) })
+		dragging = { key = key, ghost = ghost, fromSlot = fromSlot }
+		self._window:_lockScroll(true)
+	end
+
+	local function endDrag(input)
+		local d = dragging
+		if not d then return end
+		dragging = nil
+		self._window:_lockScroll(false)
+		pcall(function() d.ghost:Destroy() end)
+		highlight(nil)
+		local target = slotAt(pointOf(input))
+		if target then
+			if target == d.fromSlot then return end
+			removeKey(d.key)
+			value[target] = value[target] or {}
+			table.insert(value[target], d.key)
+			changed()
+		elseif d.fromSlot then
+			removeKey(d.key) -- arrastado de um slot e solto fora: tira do slot
+			changed()
+		end
+	end
+
+	for key, c in pairs(itemCells) do
+		c.tile.InputBegan:Connect(function(input)
+			if isClick(input) then startDrag(key, nil, input) end
+		end)
+		c.tile.MouseEnter:Connect(function() if not dragging then tween(c.tile, { BackgroundColor3 = Theme.ItemHover }) end end)
+		c.tile.MouseLeave:Connect(function() tween(c.tile, { BackgroundColor3 = Theme.Item }) end)
+	end
+	for index, s in ipairs(slotCells) do
+		s.cell.InputBegan:Connect(function(input)
+			local keys = value[index]
+			if isClick(input) and keys and #keys > 0 then
+				startDrag(keys[#keys], index, input)
+			elseif input.UserInputType == Enum.UserInputType.MouseButton2 and keys then
+				value[index] = nil
+				changed()
+			end
+		end)
+	end
+
+	self._window:_connect(UserInputService.InputChanged, function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local point = pointOf(input)
+			dragging.ghost.Position = UDim2.fromOffset(point.X, point.Y)
+			highlight(slotAt(point))
+		end
+	end)
+	self._window:_connect(UserInputService.InputEnded, function(input)
+		if dragging and isClick(input) then endDrag(input) end
+	end)
+
+	function obj:Get() return copyValue(value) end
+	function obj:Set(newValue, silent)
+		value = copyValue(newValue)
+		render()
+		if not silent then safeCall(o.Callback, copyValue(value)) end
+	end
+
+	render()
+	task.defer(relayout)
 	return obj
 end
 
