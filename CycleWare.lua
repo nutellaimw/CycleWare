@@ -6206,6 +6206,222 @@ guarded("Utilities", function()
 		end
 	end
 
+	--// Auto pickup, riot shield and auto armor ------------------------------------------------------------
+	-- How the game hands out items (ReplicatedStorage.Scripts.ClientItemHandler, read from the decompiled place):
+	--   * Workspace.Prison_ITEMS.giver / .single / .clothes: models whose direct child parts are clicked; the
+	--     click calls Remotes.InteractWithItem:InvokeServer(part) when the part is within 12 studs.
+	--   * Models tagged "Giver" / "TouchGiver" (CollectionService), with a ToolName attribute and the tags
+	--     Team_Any or Team_<team>: the click fires Remotes.GiverPressed:FireServer(model) within 12 studs.
+	--   * The riot shield goes on the arm when the player clicks while holding it:
+	--     Remotes.ShieldEquipped:FireServer(); the server then adds RiotShieldPart to the character.
+	-- Auto pickup takes, when the player walks up to it, a tool that is in a slot of the current team's layout
+	-- and that the player doesn't have yet. It never takes a second tool of a slot the player already has a
+	-- tool of, nor a second primary or secondary gun (the game would swap the one in hand, and two givers side
+	-- by side would keep swapping). The server still decides: each item is tried once per approach, so a
+	-- gamepass item the player doesn't own is not asked for over and over.
+	local CollectionService = game:GetService("CollectionService")
+	local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	local INTERACT_RANGE = 11    -- the game allows 12 studs; a little margin for movement
+	local FORGET_RANGE = 18      -- leaving this far from an item lets it be tried again
+	-- SlotType of the guns (SharedModules.ToolProperties): the game keeps one primary and one secondary.
+	local SLOT_TYPES = {
+		["AK-47"] = "Primary", FAL = "Primary", M4A1 = "Primary", MP5 = "Primary", ["Remington 870"] = "Primary",
+		M700 = "Primary", M9 = "Secondary", Revolver = "Secondary",
+	}
+	local function slotTypeOf(tool)
+		local attribute = typeof(tool) == "Instance" and tool:GetAttribute("SlotType")
+		return attribute or SLOT_TYPES[typeof(tool) == "Instance" and tool.Name or tool]
+	end
+
+	local function remote(name)
+		return Remotes and Remotes:FindFirstChild(name)
+	end
+
+	-- Tools the player has: Backpack, hand, and the ones Auto Slot is hiding.
+	local function ownedTools()
+		local owned = {}
+		local function add(container)
+			if not container then return end
+			for _, child in ipairs(container:GetChildren()) do
+				if child:IsA("Tool") then table.insert(owned, child) end
+			end
+		end
+		add(LocalPlayer:FindFirstChildOfClass("Backpack"))
+		add(LocalPlayer.Character)
+		for tool in pairs(hiddenTools) do table.insert(owned, tool) end
+		return owned
+	end
+
+	-- True when this tool should be picked up now.
+	local function wantsTool(name, owned)
+		local ownedNames = {}
+		for _, tool in ipairs(owned) do ownedNames[tool.Name] = true end
+		if ownedNames[name] then return false end
+		local inLayout = false
+		for slot = 1, SLOT_COUNT do
+			local names = layout[slot]
+			if names and table.find(names, name) then
+				inLayout = true
+				for _, other in ipairs(names) do
+					if ownedNames[other] then return false end -- that slot already has its tool
+				end
+			end
+		end
+		if not inLayout then return false end
+		local slotType = SLOT_TYPES[name]
+		if slotType then
+			for _, tool in ipairs(owned) do
+				if slotTypeOf(tool) == slotType then return false end -- would swap the gun the player has
+			end
+		end
+		return true
+	end
+
+	-- Teams a "Giver"/"TouchGiver" model is for.
+	local function giverAllowsTeam(model)
+		if CollectionService:HasTag(model, "Team_Any") then return true end
+		local team = LocalPlayer.Team
+		return team ~= nil and CollectionService:HasTag(model, "Team_" .. team.Name)
+	end
+
+	-- The model's direct child part nearest to a point (the game checks the clicked part), and its distance.
+	local function nearestPart(model, position)
+		local best, bestDistance
+		for _, child in ipairs(model:GetChildren()) do
+			if child:IsA("BasePart") then
+				local distance = (child.Position - position).Magnitude
+				if not bestDistance or distance < bestDistance then best, bestDistance = child, distance end
+			end
+		end
+		return best, bestDistance
+	end
+
+	local tried = setmetatable({}, { __mode = "k" }) -- model -> true while the player stays near it
+	local busy = false
+
+	local function tryItem(model, action)
+		tried[model] = true
+		busy = true
+		task.spawn(function()
+			local ok, err = pcall(action)
+			if not ok then CW.Log("Pickup of " .. model.Name .. " failed: " .. tostring(err)) end
+			task.wait(0.3)
+			busy = false
+		end)
+	end
+
+	-- Armor: Prison_ITEMS.clothes. The ones inside the Armory region are the guards'; the others are at the
+	-- criminals' base. Inmates have none.
+	local ARMOR_TEAMS = { Guards = "POLICE", Criminals = "CRIMINAL" }
+	local armoryRegion = ReplicatedStorage:FindFirstChild("Regions") and ReplicatedStorage.Regions:FindFirstChild("Armory")
+	local function armorSide(model)
+		local ok, pivot = pcall(function() return model:GetPivot().Position end)
+		if not ok or not armoryRegion or not armoryRegion:IsA("BasePart") then return "CRIMINAL" end
+		local rel = armoryRegion.CFrame:PointToObjectSpace(pivot)
+		local half = armoryRegion.Size / 2
+		local inside = math.abs(rel.X) <= half.X and math.abs(rel.Y) <= half.Y + 6 and math.abs(rel.Z) <= half.Z
+		return inside and "POLICE" or "CRIMINAL"
+	end
+	-- Worn armor shows up in the character as a part named like "vest".
+	local function wearingArmor(character)
+		for _, d in ipairs(character:GetDescendants()) do
+			if d:IsA("BasePart") and d.Name:lower():find("vest") then return true end
+		end
+		return false
+	end
+	CW.AutoArmorChoices = { POLICE = { "Any", "Light Vest", "Riot Police" }, CRIMINAL = { "Any", "Light Vest", "Mafia" } }
+
+	local function pickupStep()
+		if busy or rebuildingOld then return end
+		local character = LocalPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if not (humanoid and root) or humanoid.Health <= 0 then return end
+		local position = root.Position
+		local pickupOn = CW.Settings.AUTO_SLOT_ENABLED == true
+		local armorOn = CW.Settings.AUTO_ARMOR_ENABLED == true
+		if not pickupOn and not armorOn then return end
+		layout = layouts[currentVariantKey()]
+
+		local owned = pickupOn and ownedTools() or {}
+		local items = workspace:FindFirstChild("Prison_ITEMS")
+
+		local function consider(model, action)
+			local part, distance = nearestPart(model, position)
+			if not part then return false end
+			if distance > FORGET_RANGE then
+				tried[model] = nil
+				return false
+			end
+			if tried[model] or distance > INTERACT_RANGE then return false end
+			tryItem(model, function() action(part) end)
+			return true
+		end
+
+		if pickupOn then
+			local interact = remote("InteractWithItem")
+			if items and interact then
+				for _, folderName in ipairs({ "giver", "single" }) do
+					local folder = items:FindFirstChild(folderName)
+					for _, model in ipairs(folder and folder:GetChildren() or {}) do
+						if wantsTool(model.Name, owned) then
+							if consider(model, function(part) interact:InvokeServer(part) end) then return end
+						end
+					end
+				end
+			end
+			local giverPressed = remote("GiverPressed")
+			if giverPressed then
+				for _, tag in ipairs({ "Giver", "TouchGiver" }) do
+					for _, model in ipairs(CollectionService:GetTagged(tag)) do
+						local name = model:GetAttribute("ToolName")
+						if type(name) == "string" and model:IsDescendantOf(workspace) and giverAllowsTeam(model)
+							and wantsTool(name, owned) then
+							if consider(model, function() giverPressed:FireServer(model) end) then return end
+						end
+					end
+				end
+			end
+		end
+
+		if armorOn and items then
+			local side = LocalPlayer.Team and ARMOR_TEAMS[LocalPlayer.Team.Name]
+			local interact = remote("InteractWithItem")
+			local clothes = items:FindFirstChild("clothes")
+			if side and interact and clothes and not wearingArmor(character) then
+				local wanted = CW.Settings["AUTO_ARMOR_" .. side] or "Any"
+				for _, model in ipairs(clothes:GetChildren()) do
+					if armorSide(model) == side and (wanted == "Any" or model.Name == wanted) then
+						if consider(model, function(part) interact:InvokeServer(part) end) then return end
+					end
+				end
+			end
+		end
+	end
+
+	local stepAccumulator = 0
+	CW.track("autoPickupStep", RunService.Heartbeat:Connect(function(dt)
+		stepAccumulator += dt
+		if stepAccumulator < 0.2 then return end
+		stepAccumulator = 0
+		local ok, err = pcall(pickupStep)
+		if not ok then CW.Log("Auto pickup step failed: " .. tostring(err)) end
+	end))
+
+	-- Riot shield: on the arm as soon as it is equipped (what a click while holding it does).
+	local function watchShield(character)
+		CW.track("autoShield", character.ChildAdded:Connect(function(child)
+			if not CW.Settings.AUTO_SLOT_ENABLED or not child:IsA("Tool") or child.Name ~= "Riot Shield" then return end
+			task.wait(0.15)
+			local shieldEquipped = remote("ShieldEquipped")
+			if shieldEquipped and child.Parent == character and not character:FindFirstChild("RiotShieldPart") then
+				pcall(function() shieldEquipped:FireServer() end)
+			end
+		end))
+	end
+	if LocalPlayer.Character then watchShield(LocalPlayer.Character) end
+	CW.track("autoShieldCharacter", LocalPlayer.CharacterAdded:Connect(watchShield))
+
 	-- Every tool of the game, grouped: guns, melee, the other tools, snacks. The EBR is in the Guns folder but
 	-- has no ToolProperties (not in use), so it is left out.
 	local HIDDEN_TOOLS = { EBR = true }
@@ -6293,7 +6509,7 @@ guarded("Utilities", function()
 				Extra = { Key = HIDDEN_KEY, Text = "Hidden", Badge = "H",
 					Placeholder = "Drop a tool here to hide it from the inventory" },
 				Hint = "Drag a tool onto a slot (several can share one: the first you have wins), or onto Hidden. "
-					.. "Drag it out to clear it, or right-click.",
+					.. "Drag it out to clear it, or right-click. Tools in a slot are picked up when you walk up to them.",
 				Callback = function(newLayout)
 					layouts[variantKey] = newLayout
 					saveLayout(variantKey, newLayout)
@@ -6306,6 +6522,28 @@ guarded("Utilities", function()
 			showBoard(startKey)
 		else
 			drawer:AddLabel("Update CWUI.lua (the slot board is new) to edit the Auto Slot layouts.")
+		end
+	end)
+
+	guarded("Auto Armor", function()
+		local drawer = UtilityTab:AddSubSection("Auto Armor", false)
+		drawer:Toggle({
+			Title = "Enable Auto Armor",
+			Default = CW.Settings.AUTO_ARMOR_ENABLED == true,
+			Callback = function(enabled) CW.Settings.AUTO_ARMOR_ENABLED = enabled == true end,
+		})
+		drawer:AddLabel("Walk up to an armor your team can wear and it is put on. Criminals and Guards only; "
+			.. "gamepass armors work only if you own the gamepass.")
+		for _, entry in ipairs({ { "POLICE", "Guards Armor" }, { "CRIMINAL", "Criminals Armor" } }) do
+			local side, title = entry[1], entry[2]
+			local options = CW.AutoArmorChoices[side]
+			local current = CW.Settings["AUTO_ARMOR_" .. side]
+			drawer:Dropdown({
+				Title = title,
+				Options = options,
+				Default = table.find(options, current) and current or "Any",
+				Callback = function(value) CW.Settings["AUTO_ARMOR_" .. side] = value end,
+			})
 		end
 	end)
 
