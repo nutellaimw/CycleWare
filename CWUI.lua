@@ -473,7 +473,7 @@ function Section:AddSlotBoard(o)
 			TextXAlignment = Enum.TextXAlignment.Left, Parent = cell,
 		})
 		local name = new("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 13), Size = UDim2.new(1, -6, 1, -15),
+			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 12), Size = UDim2.new(1, -6, 1, -24), TextYAlignment = Enum.TextYAlignment.Center,
 			Text = "", TextColor3 = Theme.Text, TextScaled = true, TextWrapped = true, Font = Enum.Font.GothamMedium,
 			Parent = cell,
 		}, { new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6 }) })
@@ -515,7 +515,7 @@ function Section:AddSlotBoard(o)
 			Color = Theme.Accent, Thickness = 1, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = tile,
 		})
 		local name = new("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 13), Size = UDim2.new(1, -6, 1, -15),
+			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 12), Size = UDim2.new(1, -6, 1, -24), TextYAlignment = Enum.TextYAlignment.Center,
 			Text = itemText[item.Key], TextColor3 = Theme.SubText, TextScaled = true, TextWrapped = true,
 			Font = Enum.Font.GothamMedium, Parent = tile,
 		}, { new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6 }) })
@@ -614,12 +614,15 @@ function Section:AddSlotBoard(o)
 
 	local function startDrag(key, fromSlot, input)
 		if dragging or not key then return end
-		local ghost = new("TextLabel", {
-			AnchorPoint = Vector2.new(0.5, 0.5),
-			Size = UDim2.fromOffset(96, 28), BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.1,
-			Text = itemText[key] or key, TextColor3 = Theme.Text, TextSize = 12, Font = Enum.Font.GothamMedium,
-			TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 50, Parent = gui,
-		}, { corner(6) })
+		local cell = slotGrid.CellSize -- the ghost is a square of the same size as the slots and the items
+		local ghost = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Size = cell, BackgroundColor3 = Theme.Accent,
+			BackgroundTransparency = 0.1, BorderSizePixel = 0, ZIndex = 50, Parent = gui,
+		}, { corner(6), new("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 12), Size = UDim2.new(1, -6, 1, -24),
+			Text = itemText[key] or key, TextColor3 = Theme.Text, TextScaled = true, TextWrapped = true,
+			TextYAlignment = Enum.TextYAlignment.Center, Font = Enum.Font.GothamMedium, ZIndex = 51,
+		}, { new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6 }) }) })
 		placeGhost(ghost, pointOf(input))
 		dragging = { key = key, ghost = ghost, fromSlot = fromSlot }
 		self._window:_lockScroll(true)
