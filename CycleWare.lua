@@ -6219,14 +6219,32 @@ guarded("Utilities", function()
 	CW.Settings.AUTO_ARMOR_ENABLED, CW.Settings.AUTO_ARMOR_POLICE, CW.Settings.AUTO_ARMOR_CRIMINAL = nil, nil, nil
 
 	-- Riot shield: on the arm as soon as it is equipped (what a click while holding it does).
+	-- ShieldController (decompiled) connects a click listener when the shield enters the character; each click
+	-- fires ShieldEquipped and the server adds RiotShieldPart. Here the same request is sent in the very event
+	-- the shield arrives in the hand (no wait: the equip and this request reach the server in that order), and
+	-- only ONCE per equip: after that the shield is the player's again until it is put away and equipped again.
+	-- If the server's shield never shows up (the equip reached it late) and the player didn't click meanwhile,
+	-- the request is repeated one time.
 	local function watchShield(character)
 		CW.track("autoShield", character.ChildAdded:Connect(function(child)
 			if not CW.Settings.AUTO_SLOT_ENABLED or not child:IsA("Tool") or child.Name ~= "Riot Shield" then return end
-			task.wait(0.15)
 			local shieldEquipped = remote("ShieldEquipped")
-			if shieldEquipped and child.Parent == character and not character:FindFirstChild("RiotShieldPart") then
-				pcall(function() shieldEquipped:FireServer() end)
-			end
+			if not shieldEquipped or character:FindFirstChild("RiotShieldPart") then return end
+			pcall(function() shieldEquipped:FireServer() end)
+
+			local clicked = false
+			local clickConnection = UserInputService.InputBegan:Connect(function(input, processed)
+				if not processed and (input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch or input.KeyCode == Enum.KeyCode.ButtonR2) then
+					clicked = true
+				end
+			end)
+			task.delay(1, function()
+				clickConnection:Disconnect()
+				if not clicked and child.Parent == character and not character:FindFirstChild("RiotShieldPart") then
+					pcall(function() shieldEquipped:FireServer() end)
+				end
+			end)
 		end))
 	end
 	if LocalPlayer.Character then watchShield(LocalPlayer.Character) end
