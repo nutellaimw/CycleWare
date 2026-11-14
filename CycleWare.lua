@@ -1,4 +1,4 @@
--- CycleWare (phase-5). Standalone entry point; module bodies below are kept in isolated scopes.
+-- CycleWare. Standalone entry point; module bodies below are kept in isolated scopes.
 
 --=============================================================================
 -- Preflight
@@ -6,7 +6,7 @@
 --   stand-in, so a single missing function disables one feature instead of aborting the
 --   whole script. What was found is stored in CW.Caps and reported once at startup.
 --=============================================================================
-local SCRIPT_VERSION = "phase-10"
+local SCRIPT_VERSION = "phase-11"
 
 local CAPS = {
 	files = type(isfile) == "function" and type(isfolder) == "function"
@@ -18,6 +18,8 @@ local CAPS = {
 	delfile = type(delfile) == "function",
 	hook = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function",
 	signals = type(firesignal) == "function" or type(getconnections) == "function",
+	upvalues = type(getconnections) == "function" and type(debug) == "table"
+		and (type(debug.getupvalues) == "function" or type(debug.getupvalue) == "function"),
 	request = (type(request) == "function" and request)
 		or (type(http_request) == "function" and http_request)
 		or (syn and type(syn.request) == "function" and syn.request)
@@ -208,6 +210,7 @@ do
 	if not CAPS.hook then table.insert(missing, "hookmetamethod/getnamecallmethod (hitmarker and hit sound detection is disabled)") end
 	if not CAPS.signals then table.insert(missing, "firesignal/getconnections (Auto Reload presses R instead of reloading instantly)") end
 	if not CAPS.gethui then table.insert(missing, "gethui (using CoreGui instead)") end
+	if not CAPS.upvalues then table.insert(missing, "getconnections + debug.getupvalue (Auto Slot works only with Use Old Backpack)") end
 	if not CAPS.delfile then table.insert(missing, "delfile (removing a cursor added by ID leaves its PNG in the Cursors folder)") end
 	if not CAPS.httpGet and not CAPS.request then table.insert(missing, "HTTP (asset sync and the UI download are disabled)") end
 	if #missing > 0 then
@@ -3650,6 +3653,14 @@ local function wrapSection(section)
 		if type(section.AddTextbox) ~= "function" then return nil end
 		return section:AddTextbox(mapControlOptions(control))
 	end
+	-- Slot board (CWUI 2.3+); nil when the loaded CWUI has no AddSlotBoard.
+	function adapter:SlotBoard(control)
+		if type(section.AddSlotBoard) ~= "function" then return nil end
+		local o = {}
+		for key, value in pairs(control) do o[key] = value end
+		o.Callback = withSave(control.Callback)
+		return section:AddSlotBoard(o)
+	end
 	-- Text boxes side by side with buttons (CWUI 2.3+); nil when the loaded CWUI has no AddInputRow.
 	function adapter:InputRow(control)
 		if type(section.AddInputRow) ~= "function" then return nil end
@@ -5722,6 +5733,447 @@ guarded("Utilities", function()
 
 	setAutoReload(CW.Settings.AUTO_RELOAD_ENABLED == true)
 	-- <<< AUTO RELOAD END
+
+	-- >>> AUTO SLOT BEGIN
+	-- Auto Slot: every tool can be given a slot of the game's inventory bar (1-9 and 0).
+	--
+	-- How the game's inventory works (ReplicatedStorage.Scripts.BackpackClient, read from the decompiled place):
+	--   * the bar is ONE list (t1) of { Tool, Button, Slot } with no gaps and at most 10 entries: the slot of a
+	--     tool is its position in that list. updateToolbar() re-reads the list and moves the buttons.
+	--   * onToolAdded (connected to Backpack.ChildAdded) appends a new tool; equipTool(entry) equips it.
+	--   * the keys 1-8 equip slots 1-8 (9 and 0 are in its key map, but the handler ignores them).
+	--   * PlayerSettings "UseOldBackpack" switches to Roblox's own backpack (the BackpackScript CoreScript).
+	-- The list and updateToolbar are reached through the upvalues of onToolAdded (getconnections +
+	-- debug.getupvalue). Each one is recognised by what it captures, not by its position:
+	--   t1           the only table onToolAdded captures (besides the player)
+	--   updateToolbar captures t1 and no function, no Color3 and no player
+	--   equipTool     captures t1, the player and the two button Color3s
+	-- Arranging SWAPS: a tool goes to its slot only when that position exists (there are that many tools),
+	-- and the tool that was there takes its old place. With several tools in one slot, the first one the
+	-- player has wins; a slot already settled is never moved by a later one.
+	--
+	-- Roblox's own backpack ("Use Old Backpack") is a CoreScript: its connections come from a foreign Luau
+	-- state, and reading their upvalues crashed the game on some executors, so its internals are never
+	-- touched. Its public behaviour is used instead: a tool that leaves the Backpack frees its slot, and a
+	-- tool that arrives takes the lowest empty slot. So the tools are taken out of the Backpack locally
+	-- (nothing replicates: the server still has them there), one frame is waited so that backpack frees
+	-- the slots (signals are deferred: in the same frame it would see the tool back and keep the slot), and
+	-- they are put back in the wanted order. Only the game's BackpackClient listens to the Backpack (its bar
+	-- is hidden in that mode); the tool controllers (guns, shield, C4, snacks) listen to the character only.
+	-- This runs only while no tool is in hand, and only when the order has to change.
+	local PlayerSettings = ReplicatedStorage:FindFirstChild("PlayerSettings")
+	local SLOT_COUNT = 10
+	local autoSlotCaps = CW.Caps.upvalues == true
+
+	-- True only for a Lua closure. C functions have no Luau upvalues, and asking for them can crash
+	-- some executors.
+	local function isLuaClosure(fn)
+		if type(fn) ~= "function" then return false end
+		if type(islclosure) == "function" then
+			local ok, result = pcall(islclosure, fn)
+			return ok and result == true
+		end
+		if type(iscclosure) == "function" then
+			local ok, result = pcall(iscclosure, fn)
+			return ok and result == false
+		end
+		local ok, source = pcall(function() return debug.info(fn, "s") end)
+		return ok and source ~= "[C]"
+	end
+
+	local function upvaluesOf(fn)
+		if not isLuaClosure(fn) then return {} end
+		if type(debug.getupvalues) == "function" then
+			local ok, values = pcall(debug.getupvalues, fn)
+			if ok and type(values) == "table" then return values end
+		end
+		-- One by one only when the executor tells how many there are: reading past the last one is not
+		-- safe everywhere.
+		local values = {}
+		if type(debug.getupvalue) == "function" and type(debug.getinfo) == "function" then
+			local okInfo, info = pcall(debug.getinfo, fn)
+			local count = okInfo and type(info) == "table" and tonumber(info.nups) or 0
+			for i = 1, math.min(count, 64) do
+				local ok, v = pcall(debug.getupvalue, fn, i)
+				if not ok then break end
+				values[i] = v
+			end
+		end
+		return values
+	end
+
+	local function usingOldBackpack()
+		return PlayerSettings ~= nil and PlayerSettings:GetAttribute("UseOldBackpack") == true
+	end
+
+	-- A list entry made by the game's onToolAdded.
+	local function isEntry(entry)
+		return type(entry) == "table" and typeof(entry.Tool) == "Instance" and typeof(entry.Button) == "Instance"
+	end
+
+	local internals -- { list, update, equip }
+	local function findInternals()
+		if internals then
+			local list = internals.list
+			if #list == 0 or isEntry(list[1]) then return internals end
+			internals = nil
+		end
+		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		if not backpack then return nil end
+		local okConnections, connections = pcall(getconnections, backpack.ChildAdded)
+		if not okConnections or type(connections) ~= "table" then return nil end
+		for _, connection in ipairs(connections) do
+			-- Connections made by a foreign Luau state (CoreScripts) are skipped without touching them.
+			local okForeign, foreign = pcall(function() return connection.ForeignState end)
+			local okFn, fn = false, nil
+			if okForeign and foreign ~= true then
+				okFn, fn = pcall(function() return connection.Function end)
+			end
+			if okFn and isLuaClosure(fn) then
+				local list, hasPlayer, functions = nil, false, {}
+				for _, v in pairs(upvaluesOf(fn)) do
+					if v == LocalPlayer then
+						hasPlayer = true
+					elseif type(v) == "table" then
+						list = list == nil and v or false -- more than one table: not the game's onToolAdded
+					elseif type(v) == "function" then
+						table.insert(functions, v)
+					end
+				end
+				if hasPlayer and type(list) == "table" and (#list == 0 or isEntry(list[1])) then
+					local update, equip
+					for _, f in ipairs(functions) do
+						local hasList, hasColor, hasFunction, hasPlayerToo = false, false, false, false
+						for _, v in pairs(upvaluesOf(f)) do
+							if v == list then hasList = true
+							elseif typeof(v) == "Color3" then hasColor = true
+							elseif type(v) == "function" then hasFunction = true
+							elseif v == LocalPlayer then hasPlayerToo = true end
+						end
+						if hasList and hasColor and hasPlayerToo then
+							equip = f
+						elseif hasList and not hasColor and not hasFunction and not hasPlayerToo then
+							update = update or f
+						end
+					end
+					if update and equip then
+						internals = { list = list, update = update, equip = equip }
+						return internals
+					end
+				end
+			end
+		end
+		return nil
+	end
+
+	-- Layout: slot -> { tool names, first has priority }. Saved as AUTO_SLOT_LAYOUT = { S1 = "AK-47|M4A1", ... }.
+	local function readLayout()
+		local layout = {}
+		local saved = CW.Settings.AUTO_SLOT_LAYOUT
+		if type(saved) == "table" then
+			for slot = 1, SLOT_COUNT do
+				local text = saved["S" .. slot]
+				if type(text) == "string" and text ~= "" then
+					local names = {}
+					for name in text:gmatch("[^|]+") do table.insert(names, name) end
+					if #names > 0 then layout[slot] = names end
+				end
+			end
+		end
+		return layout
+	end
+	local layout = readLayout()
+
+	local function saveLayout(newLayout)
+		layout = newLayout
+		local saved = {}
+		for slot, names in pairs(newLayout) do
+			if type(slot) == "number" and slot >= 1 and slot <= SLOT_COUNT and #names > 0 then
+				saved["S" .. slot] = table.concat(names, "|")
+			end
+		end
+		CW.Settings.AUTO_SLOT_LAYOUT = saved
+	end
+
+	-- Swaps the tools into their slots. Returns true when the bar changed.
+	local function arrangeList(list)
+		local count = #list
+		local settled, changed = {}, false
+		for slot = 1, math.min(SLOT_COUNT, count) do
+			local names = layout[slot]
+			if names then
+				local position
+				for _, name in ipairs(names) do
+					for i, entry in ipairs(list) do
+						if not settled[i] and isEntry(entry) and entry.Tool.Name == name then
+							position = i
+							break
+						end
+					end
+					if position then break end
+				end
+				if position then
+					if position ~= slot then
+						list[position], list[slot] = list[slot], list[position]
+						changed = true
+					end
+					settled[slot] = true
+				end
+			end
+		end
+		return changed
+	end
+	CW.AutoSlotArrangeList = arrangeList -- used by the tests
+
+
+	local warnedMissing = false
+	--// Roblox's own backpack (Use Old Backpack) ----------------------------------------------------------
+	local oldOrder = {}       -- the tools in the order this script last put them in Roblox's backpack
+	local rebuildingOld = false
+
+	-- Order of the tools in Roblox's backpack, as far as this script knows: what it placed last time (still
+	-- there), then the others in the Backpack's order (the order Roblox's backpack fills them on spawn).
+	local function currentOldOrder(backpack)
+		local order, seen = {}, {}
+		for _, tool in ipairs(oldOrder) do
+			if tool.Parent == backpack then
+				table.insert(order, tool)
+				seen[tool] = true
+			end
+		end
+		local known = #order > 0
+		for _, child in ipairs(backpack:GetChildren()) do
+			if child:IsA("Tool") and not seen[child] then table.insert(order, child) end
+		end
+		return order, known
+	end
+
+	-- Takes the tools out and puts them back in the wanted order. Yields for one frame.
+	local function rebuildOldBackpack(backpack, wanted)
+		rebuildingOld = true
+		for _, tool in ipairs(wanted) do
+			pcall(function() tool.Parent = nil end)
+		end
+		task.wait() -- Roblox's backpack frees the slots now
+		local placed = {}
+		for _, tool in ipairs(wanted) do
+			-- A tool the server moved meanwhile (dropped, removed) is left where the server put it.
+			if tool.Parent == nil and backpack.Parent == LocalPlayer then
+				local ok = pcall(function() tool.Parent = backpack end)
+				if ok then table.insert(placed, tool) end
+			end
+		end
+		oldOrder = placed
+		task.wait() -- our own ChildAdded events of this rebuild are not taken as new tools
+		rebuildingOld = false
+	end
+
+	local function arrangeOldBackpack()
+		if rebuildingOld then return end
+		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		if not backpack then return end
+		-- Only with nothing in hand: the tool in hand keeps its slot and can't be moved without unequipping it.
+		local character = LocalPlayer.Character
+		if character and character:FindFirstChildOfClass("Tool") then return end
+
+		local order, known = currentOldOrder(backpack)
+		if #order < 2 then
+			oldOrder = order
+			return
+		end
+		local entries = {}
+		for i, tool in ipairs(order) do entries[i] = { Tool = tool, Button = tool } end
+		local changed = arrangeList(entries)
+		if not changed and known then
+			oldOrder = order
+			return
+		end
+		-- The first time (nothing placed yet) the real order is unknown, so the whole bar is rebuilt once.
+		local wanted = {}
+		for i, entry in ipairs(entries) do wanted[i] = entry.Tool end
+		rebuildOldBackpack(backpack, wanted)
+	end
+
+	local function arrange()
+		if not CW.Settings.AUTO_SLOT_ENABLED then return end
+		if usingOldBackpack() then
+			arrangeOldBackpack() -- needs no executor function
+			return
+		end
+		if not autoSlotCaps then return end
+		local found = findInternals()
+		if not found then
+			if not warnedMissing then
+				warnedMissing = true
+				CW.Warn("Auto Slot could not find the game's inventory bar (BackpackClient); it will try again on the next tool")
+			end
+			return
+		end
+		warnedMissing = false
+		local list = found.list
+		-- Not while the player is dragging a button in the game's own move mode.
+		for _, entry in ipairs(list) do
+			local detector = isEntry(entry) and entry.Button:FindFirstChildOfClass("UIDragDetector")
+			if detector and detector:GetAttribute("Dragging") then return end
+		end
+		if arrangeList(list) then
+			local ok, err = pcall(found.update)
+			if not ok then CW.Warn("Auto Slot could not refresh the inventory bar: " .. tostring(err)) end
+		end
+	end
+
+	-- Runs after the game's own handlers of the same event (they add the tool to the list first).
+	local arrangeQueued = false
+	local function queueArrange()
+		if arrangeQueued then return end
+		arrangeQueued = true
+		task.defer(function()
+			arrangeQueued = false
+			arrange()
+		end)
+	end
+
+	local function watchBackpack(backpack)
+		CW.track("autoSlotBackpackAdded", backpack.ChildAdded:Connect(function(child)
+			if child:IsA("Tool") then queueArrange() end
+		end))
+		CW.track("autoSlotBackpackRemoved", backpack.ChildRemoved:Connect(function(child)
+			if child:IsA("Tool") then queueArrange() end
+		end))
+		queueArrange()
+	end
+	local function watchCharacter(character)
+		-- Equipping moves the tool from the Backpack into the character.
+		CW.track("autoSlotEquip", character.ChildAdded:Connect(function(child)
+			if child:IsA("Tool") then queueArrange() end
+		end))
+	end
+
+	local function stopAutoSlot()
+		for _, key in ipairs({ "autoSlotBackpackAdded", "autoSlotBackpackRemoved", "autoSlotEquip",
+			"autoSlotBackpackWait", "autoSlotCharacter", "autoSlotOldBackpack" }) do
+			CW.untrack(key)
+		end
+	end
+
+	local function setAutoSlot(enabled)
+		stopAutoSlot()
+		if not enabled then return end
+		if not autoSlotCaps then
+			CW.Warn("Auto Slot needs getconnections and debug.getupvalue(s) for the game's inventory bar; "
+				.. "it works only with \"Use Old Backpack\" on this executor")
+		end
+		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		if backpack then watchBackpack(backpack) end
+		CW.track("autoSlotBackpackWait", LocalPlayer.ChildAdded:Connect(function(child)
+			if child:IsA("Backpack") then watchBackpack(child) end
+		end))
+		if LocalPlayer.Character then watchCharacter(LocalPlayer.Character) end
+		CW.track("autoSlotCharacter", LocalPlayer.CharacterAdded:Connect(watchCharacter))
+		if PlayerSettings then
+			CW.track("autoSlotOldBackpack", PlayerSettings:GetAttributeChangedSignal("UseOldBackpack"):Connect(queueArrange))
+		end
+	end
+
+	-- An older build had keys 9 and 0 equip slots 9 and 0: a re-run removes that connection.
+	CW.untrack("autoSlotKeys")
+	CW.Settings.AUTO_SLOT_KEYS = nil
+
+	-- Tools left out of the board: the EBR is in the Guns folder but has no ToolProperties (not in use).
+	local HIDDEN_TOOLS = { EBR = true }
+
+	-- Every tool of the game, grouped: guns, melee, the other tools, snacks.
+	local function gameToolNames()
+		local names, seen = {}, table.clone(HIDDEN_TOOLS)
+		local tools = ReplicatedStorage:FindFirstChild("Tools")
+		local function addFrom(folder)
+			if not folder then return end
+			local group = {}
+			for _, child in ipairs(folder:GetChildren()) do
+				if child:IsA("Tool") and not seen[child.Name] then
+					seen[child.Name] = true
+					table.insert(group, child.Name)
+				end
+			end
+			table.sort(group)
+			for _, name in ipairs(group) do table.insert(names, name) end
+		end
+		if tools then
+			addFrom(tools:FindFirstChild("Guns"))
+			addFrom(tools:FindFirstChild("Melees"))
+			addFrom(tools)
+			addFrom(tools:FindFirstChild("Snacks"))
+		end
+		if #names == 0 then
+			names = { "AK-47", "FAL", "M4A1", "M700", "M9", "MP5", "Remington 870", "Revolver", "Taser",
+				"Crude Knife", "Hammer", "Breakfast", "C4 Explosive", "Dinner", "Handcuffs", "Key card", "Lunch",
+				"Riot Shield", "Chips", "Chocolate", "Soda" }
+		end
+		return names
+	end
+
+	guarded("Auto Slot", function()
+		local drawer = UtilityTab:AddSubSection("Auto Slot", false)
+
+		drawer:Toggle({
+			Title = "Enable Auto Slot",
+			Default = CW.Settings.AUTO_SLOT_ENABLED == true,
+			Callback = function(enabled)
+				CW.Settings.AUTO_SLOT_ENABLED = enabled == true
+				setAutoSlot(CW.Settings.AUTO_SLOT_ENABLED)
+			end,
+		})
+		if not autoSlotCaps then
+			drawer:AddLabel("Your executor has no getconnections or debug.getupvalue: Auto Slot works only with the game's \"Use Old Backpack\" setting.")
+		end
+
+		local names = gameToolNames()
+		local board = drawer:SlotBoard({
+			Slots = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" },
+			Items = (function()
+				local items = {}
+				for _, name in ipairs(names) do table.insert(items, { Key = name, Text = name }) end
+				return items
+			end)(),
+			Value = layout,
+			Hint = "Drag a tool onto a slot. Several tools can share a slot (the first one you have wins). "
+				.. "Drag a slot out to clear it, or right-click it.",
+			Callback = function(newLayout)
+				saveLayout(newLayout)
+				queueArrange()
+			end,
+		})
+		if not board then
+			-- Older cached CWUI without AddSlotBoard: one dropdown per slot (one tool each).
+			local NONE = "None"
+			local options = { NONE }
+			for _, name in ipairs(names) do table.insert(options, name) end
+			for slot = 1, SLOT_COUNT do
+				local current = layout[slot] and layout[slot][1] or NONE
+				drawer:Dropdown({
+					Title = "Slot " .. (slot == 10 and 0 or slot),
+					Options = options,
+					Default = current,
+					Callback = function(name)
+						local newLayout = table.clone(layout)
+						for other, list in pairs(newLayout) do
+							if table.find(list, name) then
+								local copy = table.clone(list)
+								table.remove(copy, table.find(copy, name))
+								newLayout[other] = #copy > 0 and copy or nil
+							end
+						end
+						newLayout[slot] = name ~= NONE and { name } or nil
+						saveLayout(newLayout)
+						queueArrange()
+					end,
+				})
+			end
+		end
+	end)
+
+	setAutoSlot(CW.Settings.AUTO_SLOT_ENABLED == true)
+	-- <<< AUTO SLOT END
 end)
 
 ------------------------------------------------------------------------------
