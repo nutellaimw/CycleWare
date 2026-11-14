@@ -454,7 +454,7 @@ function Section:AddSlotBoard(o)
 
 	--// slots (the Extra area, when there is one, sits above them like the old backpack's inventory)
 	local slotArea = new("Frame", {
-		LayoutOrder = 2, BackgroundColor3 = Theme.Item, BorderSizePixel = 0,
+		LayoutOrder = 3, BackgroundColor3 = Theme.Item, BorderSizePixel = 0,
 		Size = UDim2.new(1, 0, 0, 60), Parent = container,
 	}, { corner(6), new("UIPadding", {
 		PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
@@ -494,17 +494,19 @@ function Section:AddSlotBoard(o)
 	-- placeholder text.
 	local extraCell, extraLabel, extraStroke, extraHolder, extraGrid
 	local extraTiles = {}
-	local EXTRA_EMPTY_H, EXTRA_PAD = 30, 6
+	local EXTRA_EMPTY_H, EXTRA_PAD = 36, 6
 	if extra then
+		-- Its own grey rounded rectangle, a little above the slot bar (like the old backpack's inventory panel).
 		extraCell = new("TextButton", {
-			LayoutOrder = 1, BackgroundColor3 = Theme.Track, BorderSizePixel = 0, AutoButtonColor = false, Text = "",
+			LayoutOrder = 1, BackgroundColor3 = Theme.Item, BorderSizePixel = 0, AutoButtonColor = false, Text = "",
 			Size = UDim2.new(1, 0, 0, EXTRA_EMPTY_H), Parent = container,
 		}, { corner(6) })
+		new("Frame", { LayoutOrder = 2, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 4), Parent = container })
 		extraStroke = new("UIStroke", { Color = Theme.Divider, Thickness = 1, Transparency = 0.5, Parent = extraCell })
 		extraLabel = new("TextLabel", {
 			BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -20, 0, EXTRA_EMPTY_H),
 			Text = "", TextColor3 = Theme.SubText, TextSize = 12, Font = Enum.Font.GothamMedium,
-			TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = extraCell,
+			TextXAlignment = Enum.TextXAlignment.Center, TextTruncate = Enum.TextTruncate.AtEnd, Parent = extraCell,
 		})
 		extraHolder = new("Frame", {
 			BackgroundTransparency = 1, Position = UDim2.fromOffset(EXTRA_PAD + 2, EXTRA_PAD),
@@ -518,7 +520,7 @@ function Section:AddSlotBoard(o)
 
 	if o.Hint then
 		new("TextLabel", {
-			LayoutOrder = 3, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = 4, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 			Text = o.Hint, TextColor3 = Theme.SubText, TextSize = 12, Font = Enum.Font.Gotham, TextWrapped = true,
 			TextXAlignment = Enum.TextXAlignment.Left, Parent = container,
 		}, { new("UIPadding", { PaddingLeft = UDim.new(0, 4) }) })
@@ -526,7 +528,7 @@ function Section:AddSlotBoard(o)
 
 	--// itens
 	local itemArea = new("Frame", {
-		LayoutOrder = 4, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 5, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 		Parent = container,
 	})
 	-- Same padding and cell size as the slot row, so the item squares line up with the slots.
@@ -610,7 +612,7 @@ function Section:AddSlotBoard(o)
 		extraLabel.Text = extra.Placeholder or (extra.Text or "Extra")
 		for index, key in ipairs(keys) do
 			local tile = new("TextButton", {
-				LayoutOrder = index, BackgroundColor3 = Theme.Item, BorderSizePixel = 0, AutoButtonColor = false,
+				LayoutOrder = index, BackgroundColor3 = Theme.ItemSelected, BorderSizePixel = 0, AutoButtonColor = false,
 				Text = "", Parent = extraHolder,
 			}, { corner(5), new("TextLabel", {
 				BackgroundTransparency = 1, Position = UDim2.fromOffset(2, 2), Size = UDim2.new(1, -4, 1, -4),
