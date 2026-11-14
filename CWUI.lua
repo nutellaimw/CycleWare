@@ -499,41 +499,48 @@ function Section:AddSlotBoard(o)
 		LayoutOrder = 3, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 		Parent = container,
 	})
+	-- Same padding and cell size as the slot row, so the item squares line up with the slots.
+	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = itemArea })
 	local itemGrid = new("UIGridLayout", {
-		CellPadding = UDim2.fromOffset(GAP, GAP), CellSize = UDim2.fromOffset(90, 30),
+		CellPadding = UDim2.fromOffset(GAP, GAP), CellSize = UDim2.fromOffset(44, 44),
 		SortOrder = Enum.SortOrder.LayoutOrder, Parent = itemArea,
 	})
 	local itemCells = {}
 	for index, item in ipairs(items) do
 		local tile = new("TextButton", {
 			LayoutOrder = index, BackgroundColor3 = Theme.Item, BorderSizePixel = 0, AutoButtonColor = false,
-			Text = itemText[item.Key], TextColor3 = Theme.SubText, TextSize = 12, Font = Enum.Font.GothamMedium,
-			TextTruncate = Enum.TextTruncate.AtEnd, Parent = itemArea,
-		}, { corner(6), new("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }) })
+			Text = "", Parent = itemArea,
+		}, { corner(6) })
 		local stroke = new("UIStroke", {
 			Color = Theme.Accent, Thickness = 1, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = tile,
 		})
-		itemCells[item.Key] = { tile = tile, stroke = stroke }
+		local name = new("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 13), Size = UDim2.new(1, -6, 1, -15),
+			Text = itemText[item.Key], TextColor3 = Theme.SubText, TextScaled = true, TextWrapped = true,
+			Font = Enum.Font.GothamMedium, Parent = tile,
+		}, { new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6 }) })
+		-- The slot the item is in (top-left, like the slot numbers).
+		local badge = new("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 2), Size = UDim2.fromOffset(14, 12),
+			Text = "", TextColor3 = Theme.Accent, TextSize = 11, Font = Enum.Font.GothamBold,
+			TextXAlignment = Enum.TextXAlignment.Left, Parent = tile,
+		})
+		itemCells[item.Key] = { tile = tile, stroke = stroke, name = name, badge = badge }
 	end
 
-	-- Slots: 10 por linha quando cabem com pelo menos 40 px; senão 5 por linha. Itens: 4 a 6 por linha.
+	-- Slots: 10 por linha quando cabem com pelo menos 40 px; senão 5 por linha. Os itens usam o mesmo tamanho.
 	local function relayout()
 		local width = slotArea.AbsoluteSize.X - 16
 		if width > 0 then
 			local columns = (width - 9 * GAP) / 10 >= 40 and 10 or 5
 			local cell = math.min(math.floor((width - (columns - 1) * GAP) / columns), 64)
 			slotGrid.CellSize = UDim2.fromOffset(cell, cell)
+			itemGrid.CellSize = UDim2.fromOffset(cell, cell)
 			local rows = math.ceil(#labels / columns)
 			slotArea.Size = UDim2.new(1, 0, 0, rows * cell + (rows - 1) * GAP + 16)
 		end
-		local itemWidth = itemArea.AbsoluteSize.X
-		if itemWidth > 0 then
-			local columns = math.clamp(math.floor((itemWidth + GAP) / (84 + GAP)), 2, 6)
-			itemGrid.CellSize = UDim2.fromOffset(math.floor((itemWidth - (columns - 1) * GAP) / columns), 30)
-		end
 	end
 	slotArea:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayout)
-	itemArea:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayout)
 
 	local function slotOf(key)
 		for slot, keys in pairs(value) do
@@ -558,8 +565,8 @@ function Section:AddSlotBoard(o)
 		end
 		for key, c in pairs(itemCells) do
 			local slot = slotOf(key)
-			c.tile.Text = slot and (itemText[key] .. "  ·  " .. (labels[slot] or slot)) or itemText[key]
-			c.tile.TextColor3 = slot and Theme.Text or Theme.SubText
+			c.badge.Text = slot and tostring(labels[slot] or slot) or ""
+			c.name.TextColor3 = slot and Theme.Text or Theme.SubText
 			c.stroke.Transparency = slot and 0.2 or 1
 		end
 	end
@@ -582,18 +589,21 @@ function Section:AddSlotBoard(o)
 	--// arrastar
 	local gui = self._window._gui
 	local dragging -- { key, ghost, fromSlot }
+	-- input.Position is in the same space as AbsolutePosition (see insideGui); GetMouseLocation is not
+	-- (it counts the top bar inset), which put the drop point below the cursor and missed the slots.
 	local function pointOf(input)
-		if input.UserInputType == Enum.UserInputType.Touch then
-			local inset = game:GetService("GuiService"):GetGuiInset()
-			return Vector2.new(input.Position.X, input.Position.Y) + inset
-		end
-		return UserInputService:GetMouseLocation() -- a janela ignora o inset: mesmo espaço da tela inteira
+		return Vector2.new(input.Position.X, input.Position.Y)
 	end
 	local function slotAt(point)
 		for index, s in ipairs(slotCells) do
 			if insideGui(s.cell, point) then return index end
 		end
 		return nil
+	end
+	-- The ghost lives in the window's ScreenGui: its offset is relative to the gui's own top-left corner.
+	local function placeGhost(ghost, point)
+		local origin = gui.AbsolutePosition
+		ghost.Position = UDim2.fromOffset(point.X - origin.X, point.Y - origin.Y)
 	end
 	local function highlight(index)
 		for i, s in ipairs(slotCells) do
@@ -604,13 +614,13 @@ function Section:AddSlotBoard(o)
 
 	local function startDrag(key, fromSlot, input)
 		if dragging or not key then return end
-		local point = pointOf(input)
 		local ghost = new("TextLabel", {
-			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(point.X, point.Y),
+			AnchorPoint = Vector2.new(0.5, 0.5),
 			Size = UDim2.fromOffset(96, 28), BackgroundColor3 = Theme.Accent, BackgroundTransparency = 0.1,
 			Text = itemText[key] or key, TextColor3 = Theme.Text, TextSize = 12, Font = Enum.Font.GothamMedium,
 			TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 50, Parent = gui,
 		}, { corner(6) })
+		placeGhost(ghost, pointOf(input))
 		dragging = { key = key, ghost = ghost, fromSlot = fromSlot }
 		self._window:_lockScroll(true)
 	end
@@ -622,7 +632,7 @@ function Section:AddSlotBoard(o)
 		self._window:_lockScroll(false)
 		pcall(function() d.ghost:Destroy() end)
 		highlight(nil)
-		local target = slotAt(pointOf(input))
+		local target = slotAt(pointOf(input)) or (d.lastPoint and slotAt(d.lastPoint))
 		if target then
 			if target == d.fromSlot then return end
 			removeKey(d.key)
@@ -657,7 +667,8 @@ function Section:AddSlotBoard(o)
 	self._window:_connect(UserInputService.InputChanged, function(input)
 		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 			local point = pointOf(input)
-			dragging.ghost.Position = UDim2.fromOffset(point.X, point.Y)
+			dragging.lastPoint = point
+			placeGhost(dragging.ghost, point)
 			highlight(slotAt(point))
 		end
 	end)
