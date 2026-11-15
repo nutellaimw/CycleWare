@@ -939,7 +939,7 @@ CW.CustomIds.parse = parseAssetId
 
 local function cleanName(name, id)
 	name = type(name) == "string" and name:gsub("[%c]", ""):match("^%s*(.-)%s*$") or ""
-	if name == "" then name = "ID " .. id end
+	if name == "" then name = id end -- no name given: it is named after its ID
 	if utf8.len(name) and utf8.len(name) > CUSTOM_NAME_LIMIT then
 		name = name:sub(1, utf8.offset(name, CUSTOM_NAME_LIMIT + 1) - 1)
 	end
@@ -1210,6 +1210,18 @@ end
 
 -- Clears the saved choice of one category (and gun) when it points at a relative path
 -- (used when a custom ID is removed). The weapon sounds keep their choices in the sound changers.
+function CW.Library.replaceSelectionOf(category, weapon, oldRelative, newRelative)
+	local selections = CW.Settings.ASSET_SELECTIONS
+	if category == "Textures" then
+		if type(selections.Textures) == "table" and selections.Textures[weapon] == oldRelative then
+			selections.Textures[weapon] = newRelative
+		end
+		return
+	end
+	local key = SELECTION_KEYS[category]
+	if key and selections[key] == oldRelative then selections[key] = newRelative end
+end
+
 function CW.Library.clearSelectionOf(category, weapon, relative)
 	local selections = CW.Settings.ASSET_SELECTIONS
 	if category == "Textures" then
@@ -3697,9 +3709,15 @@ local HitmarkerGallery, CursorGallery, HitSoundDropdown
 local textureGalleries = {}
 local refreshUIFromLibrary -- defined after the tabs; the custom ID controls call it
 
--- Label of a custom ID in the sound dropdowns. The "[ID]" prefix keeps it apart from a file of the same name.
-local function customIdLabel(item)
-	return "[ID] " .. item.Name .. " (" .. item.CustomId .. ")"
+-- Label of a custom ID in the sound dropdowns: just the name the player gave it (or its ID when it was
+-- added without a name). Names are unique within a list; the ID is only added when the name would collide
+-- with a label already in that dropdown.
+local function customIdLabel(item, taken)
+	local label = item.Name
+	if (taken and taken[label]) or label == "Default" or label == "—" then
+		label = label .. " (" .. item.CustomId .. ")"
+	end
+	return label
 end
 
 ------------------------------------------------------------------------------
@@ -3711,9 +3729,10 @@ local availableHitSounds = {}
 local function refreshHitSoundCatalog()
 	table.clear(hitSoundEntries)
 	table.clear(availableHitSounds)
-	local options = {}
+	local options, taken = {}, {}
 	for _, item in ipairs(CW.Library.items("HitSounds")) do
-		local label = item.CustomId and customIdLabel(item) or item.Relative:gsub("^HitSounds/", "")
+		local label = item.CustomId and customIdLabel(item, taken) or item.Relative:gsub("^HitSounds/", "")
+		taken[label] = true
 		item.Label = label
 		table.insert(hitSoundEntries, item)
 		availableHitSounds[item.Relative] = true
@@ -3864,7 +3883,7 @@ local function createSoundChanger(spec)
 			for _, item in ipairs(CW.Library.items(spec.Category, weapon)) do
 				local tail = tailOf(weapon, item.Relative)
 				if item.CustomId then
-					local label = customIdLabel(item)
+					local label = customIdLabel(item, entry.byLabel)
 					entry.byLabel[label] = item.Relative
 					entry.available[item.Relative] = true
 					table.insert(entry.options, label)
@@ -4234,8 +4253,12 @@ local function createSoundChanger(spec)
 
 	-- Removes one gun's choice when it is that relative path (a custom ID that was deleted).
 	function changer.clearChoice(weapon, relative)
-		if weapon ~= nil and overrides[weapon] == relative then
-			overrides[weapon] = nil
+		changer.replaceChoice(weapon, relative, nil)
+	end
+	-- Moves one gun's choice from one relative path to another (a custom ID that was edited), or clears it.
+	function changer.replaceChoice(weapon, oldRelative, newRelative)
+		if weapon ~= nil and overrides[weapon] == oldRelative then
+			overrides[weapon] = newRelative
 			changer.schedule()
 		end
 	end
@@ -4349,6 +4372,16 @@ local function inputRow(section, fields, buttons)
 			if box then box:Set("") end
 		end
 	end
+	function shim:Set(key, text)
+		local box = boxes[key]
+		if box then box:Set(text or "") end
+	end
+	function shim:SetButtonText(index, text)
+		local entry = buttonObjs[index]
+		if not entry then return end
+		entry.text = tostring(text)
+		if entry.control and entry.control.SetText then pcall(entry.control.SetText, entry.control, entry.text) end
+	end
 	function shim:Flash(index, text, seconds)
 		local entry = buttonObjs[index]
 		if not (entry and entry.control and entry.control.SetText) then return end
@@ -4358,88 +4391,166 @@ local function inputRow(section, fields, buttons)
 	return shim
 end
 
+-- Edit / Remove live in the header of the asset's own selector (dropdown or gallery), at its right side, and
+-- show only while the selected asset is a custom ID. One light loop keeps them in step with the selection.
+local customIdActionUpdaters = {}
+CW.track("customIdActions", game:GetService("RunService").Heartbeat:Connect((function()
+	local elapsed = 0
+	return function(dt)
+		elapsed += dt
+		if elapsed < 0.25 then return end
+		elapsed = 0
+		for _, update in ipairs(customIdActionUpdaters) do pcall(update) end
+	end
+end)()))
+
+-- Puts Edit / Remove on the controls (or, with an older cached CWUI, as plain buttons under the row).
+-- Returns a function(visible) that shows or hides them.
+local function attachActions(section, controls, onEdit, onRemove)
+	local attached = {}
+	for _, control in ipairs(controls or {}) do
+		if type(control) == "table" and type(control.SetActions) == "function" then
+			control:SetActions({ { Text = "Edit", Callback = onEdit }, { Text = "Remove", Callback = onRemove } })
+			table.insert(attached, control)
+		end
+	end
+	if #attached == 0 then
+		section:Button({ Title = "Edit Selected ID", Callback = onEdit })
+		section:Button({ Title = "Remove Selected ID", Callback = onRemove })
+		return function() end
+	end
+	return function(visible)
+		for _, control in ipairs(attached) do pcall(control.ShowActions, control, visible) end
+	end
+end
+
 -- opts = {
 --   category  = "HitSounds" | "Hitmarkers" | "Textures" | "WeaponSounds" | "ReloadSounds"
---   kind      = "Audio" | "Image"                (placeholder text)
---   weapon    = function() return gun name end   (per-gun categories)
+--   kind      = "Audio" | "Image" | "Texture"      (placeholder text)
+--   weapon    = function() return gun name end     (per-gun categories)
 --   selected  = function() return saved choice ("id:123" or a file) end
+--   controls  = { the dropdown / gallery that selects this asset }
 -- }
 local function addCustomIdRow(section, opts)
+	local category = opts.category
 	local function currentWeapon() return opts.weapon and opts.weapon() or nil end
+	local function selectedId()
+		local selected = opts.selected and opts.selected()
+		return type(selected) == "string" and selected:match("^id:(%d+)$") or nil
+	end
 
 	local function afterChange()
 		if refreshUIFromLibrary then guarded("Library refresh", refreshUIFromLibrary) end
 		scheduleSave()
 	end
 
-	local fields = {
-		{ Key = "id", Title = opts.kind .. " ID", Placeholder = opts.kind .. " ID or link", Weight = 0.55 },
-		{ Key = "name", Title = "Name (optional)", Placeholder = "Name", Weight = 0.45 },
-	}
-	local buttons = {
-		{ Text = "Add ID", Title = "Add ID", Callback = function(values, row)
-			local weapon = currentWeapon()
-			local entry, reason, problem = CW.CustomIds.add(opts.category, weapon, values.id, values.name)
+	-- Every saved choice of the old ID (this gun only, for the per-gun categories) moves to the new one,
+	-- or is cleared when there is no new one.
+	local function moveChoices(weapon, oldRelative, newRelative)
+		if newRelative then
+			CW.Library.replaceSelectionOf(category, weapon, oldRelative, newRelative)
+		else
+			CW.Library.clearSelectionOf(category, weapon, oldRelative)
+		end
+		for _, changer in ipairs(soundChangers) do
+			if changer.spec.Category == category then changer.replaceChoice(weapon, oldRelative, newRelative) end
+		end
+	end
+
+	local function checkLoads(entry, weapon, row)
+		local where = weapon and (" (" .. weapon .. ")") or ""
+		checkCustomAsset("rbxassetid://" .. entry.Id, function(loaded, why)
+			if loaded then
+				CW.Log("Custom ID " .. entry.Id .. where .. " loads fine")
+			else
+				row:Flash(1, "No load", 3)
+				CW.Warn("Custom ID " .. entry.Id .. where .. " was saved, but Roblox could not load it (" .. tostring(why)
+					.. "). It may be private, deleted, or the wrong kind of asset.")
+			end
+		end)
+	end
+
+	local row
+	local editingId -- the custom ID being edited; nil while adding
+	local function setEditing(id)
+		editingId = id
+		row:SetButtonText(1, id and "Save" or "Add ID")
+	end
+
+	local function save(values)
+		local weapon = currentWeapon()
+		local newId = CW.CustomIds.parse(values.id)
+		if not newId then
+			row:Flash(1, "Invalid")
+			return
+		end
+		if not editingId or newId == editingId then
+			-- A new ID, or a new name for the same one.
+			local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, values.name)
 			if not entry then
 				row:Flash(1, problem == "name" and "Name used" or "Invalid", 2)
-				CW.Warn("Custom ID not added: " .. tostring(reason))
+				CW.Warn("Custom ID not saved: " .. tostring(reason))
 				return
 			end
+			local wasEditing = editingId ~= nil
 			row:Clear()
-			row:Flash(1, "Added")
+			setEditing(nil)
+			row:Flash(1, wasEditing and "Saved" or "Added")
 			afterChange()
-			local where = weapon and (" (" .. weapon .. ")") or ""
-			checkCustomAsset("rbxassetid://" .. entry.Id, function(loaded, why)
-				if loaded then
-					CW.Log("Custom ID " .. entry.Id .. where .. " loads fine")
-				else
-					row:Flash(1, "No load", 3)
-					CW.Warn("Custom ID " .. entry.Id .. where .. " was added, but Roblox could not load it (" .. tostring(why)
-						.. "). It may be private, deleted, or the wrong kind of asset.")
-				end
-			end)
-		end },
-		{ Text = "Remove", Title = "Remove ID", Callback = function(values, row)
-			local weapon = currentWeapon()
-			local id = CW.CustomIds.parse(values.id)
-			if not id then
-				-- Empty box: the custom ID that is selected right now. Only custom IDs can be removed here:
-				-- the official library (downloaded from GitHub) can't be removed at all, and the player's
-				-- own files are removed by deleting them from the library folder.
-				local selected = opts.selected and opts.selected()
-				if type(selected) == "string" and not selected:match("^id:%d+$") then
-					if selected:find("/" .. CW.Paths.OFFICIAL_FOLDER .. "/", 1, true) then
-						row:Flash(2, "Official", 2)
-						CW.Warn("Assets from the official library can't be removed (" .. selected .. ")")
-					else
-						row:Flash(2, "File", 2)
-						CW.Warn(selected .. " is a library file, not a custom ID: delete it from the "
-							.. CW.Paths.LIBRARY_ROOT .. " folder to remove it")
-					end
-					return
-				end
-				id = type(selected) == "string" and selected:match("^id:(%d+)$")
-			end
-			if not id then
-				row:Flash(2, "Pick ID")
-				return
-			end
-			if not CW.CustomIds.remove(opts.category, weapon, id) then
-				row:Flash(2, "Not found")
-				return
-			end
-			local relative = CW.CustomIds.selectionOf(id)
-			CW.Library.clearSelectionOf(opts.category, weapon, relative)
-			for _, changer in ipairs(soundChangers) do
-				if changer.spec.Category == opts.category then changer.clearChoice(weapon, relative) end
-			end
+			if not wasEditing then checkLoads(entry, weapon, row) end
+			return
+		end
+		-- Another ID in place of the edited one: the old one goes, the new one takes its choices.
+		local old = CW.CustomIds.get(category, weapon, editingId)
+		CW.CustomIds.remove(category, weapon, editingId)
+		local name = (type(values.name) == "string" and values.name:match("%S")) and values.name or (old and old.Name)
+		local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, name)
+		if not entry then
+			if old then CW.CustomIds.add(category, weapon, old.Id, old.Name) end -- put the old one back
+			row:Flash(1, problem == "name" and "Name used" or "Invalid", 2)
+			CW.Warn("Custom ID not saved: " .. tostring(reason))
+			return
+		end
+		moveChoices(weapon, CW.CustomIds.selectionOf(editingId), CW.CustomIds.selectionOf(newId))
+		row:Clear()
+		setEditing(nil)
+		row:Flash(1, "Saved")
+		pcall(CW.reloadCoreAssets)
+		afterChange()
+		checkLoads(entry, weapon, row)
+	end
+
+	row = inputRow(section, {
+		{ Key = "id", Title = opts.kind .. " ID", Placeholder = opts.kind .. " ID or link", Weight = 0.55 },
+		{ Key = "name", Title = "Name (optional)", Placeholder = "Name", Weight = 0.45 },
+	}, {
+		{ Text = "Add ID", Title = "Add ID", Callback = function(values) save(values) end },
+	})
+
+	local function edit()
+		local id = selectedId()
+		local entry = id and CW.CustomIds.get(category, currentWeapon(), id)
+		if not entry then return end
+		row:Set("id", entry.Id)
+		row:Set("name", entry.Name)
+		setEditing(entry.Id)
+	end
+	local function remove()
+		local weapon = currentWeapon()
+		local id = selectedId()
+		if not id or not CW.CustomIds.remove(category, weapon, id) then return end
+		moveChoices(weapon, CW.CustomIds.selectionOf(id), nil)
+		if editingId == id then
 			row:Clear()
-			row:Flash(2, "Removed")
-			pcall(CW.reloadCoreAssets)
-			afterChange()
-		end },
-	}
-	return inputRow(section, fields, buttons)
+			setEditing(nil)
+		end
+		row:Flash(1, "Removed")
+		pcall(CW.reloadCoreAssets)
+		afterChange()
+	end
+	local showActions = attachActions(section, opts.controls, edit, remove)
+	table.insert(customIdActionUpdaters, function() showActions(selectedId() ~= nil) end)
+	return row
 end
 
 ------------------------------------------------------------------------------
@@ -4456,10 +4567,10 @@ local CURSOR_THUMBNAIL_URL = "https://thumbnails.roblox.com/v1/assets?assetIds=%
 -- A name that is safe as a file name: letters, digits, space, _ - . ( ); at most 40 characters.
 local function cursorFileName(rawName, id)
 	local name = type(rawName) == "string" and rawName:match("^%s*(.-)%s*$") or ""
-	if name == "" then name = "ID " .. id end
+	if name == "" then name = id end
 	name = name:gsub("[^%w _%-%.%(%)]", "_"):gsub("^[%s%.]+", "")
 	name = name:sub(1, 40):match("^(.-)[%s%.]*$")
-	if name == "" then name = "ID " .. id end
+	if name == "" then name = id end
 	return name
 end
 
@@ -4501,129 +4612,173 @@ local function buildCursorPng(png)
 	return CW.encodePNG(px, w, h)
 end
 
-local function addCursorIdRow(section)
+-- Downloads one cursor image by ID and returns the finished PNG bytes, or nil and the reason. Yields.
+local function downloadCursorPng(id)
+	local png, why = fetchCursorThumbnail(id)
+	if not png then return nil, why end
+	return buildCursorPng(png)
+end
+
+local function addCursorIdRow(section, controls)
 	local busy = false
+	local row
+	local editing -- the entry being edited; nil while adding
 
 	local function afterChange()
 		CW.Library.invalidate()
 		if refreshUIFromLibrary then guarded("Library refresh", refreshUIFromLibrary) end
 		scheduleSave()
 	end
+	local function pathOf(relative) return CW.Paths.LIBRARY_ROOT .. "/" .. relative end
+	local function deleteFile(relative)
+		if not CAPS.delfile then
+			CW.Warn("delfile is missing: " .. pathOf(relative) .. " stays in the Cursors folder")
+			return
+		end
+		local ok, err = pcall(delfile, pathOf(relative))
+		if not ok then CW.Warn("Could not delete " .. pathOf(relative) .. ": " .. tostring(err)) end
+	end
+	-- The cursor in use, when it was added by ID.
+	local function selectedEntry()
+		local selected = CW.Library.relative(CW.Paths.CURSOR_FILE)
+		return selected and CW.CustomIds.byFile("Cursors", nil, selected) or nil
+	end
+	local function setEditing(entry)
+		editing = entry
+		row:SetButtonText(1, entry and "Save" or "Add ID")
+	end
+	-- After a rename or a new ID: the old file goes, the entry and every choice point at the new file.
+	local function replaceEntry(old, id, name, relative)
+		CW.CustomIds.remove("Cursors", nil, old.Id)
+		CW.CustomIds.add("Cursors", nil, id, name, { File = relative })
+		if old.File ~= relative then deleteFile(old.File) end
+		CW.Library.replaceSelectionOf("Cursors", nil, old.File, relative)
+	end
 
-	local fields = {
-		{ Key = "id", Title = "Image or Decal ID", Placeholder = "Image/Decal ID or link", Weight = 0.55 },
-		{ Key = "name", Title = "Name (optional)", Placeholder = "Name", Weight = 0.45 },
-	}
-	local buttons = {
-		{ Text = "Add ID", Title = "Add ID", Callback = function(values, row)
-			if busy then
-				row:Flash(1, "Wait")
-				return
-			end
-			if not CAPS.files then
-				row:Flash(1, "No files", 2)
-				CW.Warn("Cursor by ID needs the executor's file functions")
-				return
-			end
-			if not (CAPS.httpGet or CAPS.request) then
-				row:Flash(1, "No HTTP", 2)
-				CW.Warn("Cursor by ID needs HttpGet or request in the executor")
-				return
-			end
-			local id = CW.CustomIds.parse(values.id)
-			if not id then
-				row:Flash(1, "Invalid")
-				return
-			end
-			if CW.CustomIds.get("Cursors", nil, id) then
-				row:Flash(1, "Exists", 2)
-				CW.Warn("Cursor ID " .. id .. " was already added")
-				return
-			end
-			local name = cursorFileName(values.name, id)
-			local relative = "Cursors/" .. name .. ".png"
-			local path = CW.Paths.LIBRARY_ROOT .. "/" .. relative
-			local okExists, exists = pcall(isfile, path)
-			local taken = CW.CustomIds.nameTaken("Cursors", nil, name)
-				or ((okExists and exists) and ("a file named " .. relative .. " already exists") or nil)
-			if taken then
-				row:Flash(1, "Name used", 2)
-				CW.Warn("Cursor ID not added: " .. taken)
-				return
-			end
+	local function save(values)
+		if busy then
+			row:Flash(1, "Wait")
+			return
+		end
+		if not CAPS.files then
+			row:Flash(1, "No files", 2)
+			CW.Warn("Cursor by ID needs the executor's file functions")
+			return
+		end
+		local id = CW.CustomIds.parse(values.id)
+		if not id then
+			row:Flash(1, "Invalid")
+			return
+		end
+		local old = editing
+		if not old and CW.CustomIds.get("Cursors", nil, id) then
+			row:Flash(1, "Exists", 2)
+			CW.Warn("Cursor ID " .. id .. " was already added")
+			return
+		end
+		local name = cursorFileName(values.name ~= "" and values.name or (old and old.Id == id and old.Name or nil), id)
+		local relative = "Cursors/" .. name .. ".png"
+		local path = pathOf(relative)
+		local okExists, exists = pcall(isfile, path)
+		local ownFile = old and old.File == relative
+		local taken = CW.CustomIds.nameTaken("Cursors", nil, name, old and old.Id, old and old.File)
+			or ((okExists and exists and not ownFile) and ("a file named " .. relative .. " already exists") or nil)
+		if taken then
+			row:Flash(1, "Name used", 2)
+			CW.Warn("Cursor ID not saved: " .. taken)
+			return
+		end
 
-			busy = true
-			row:Flash(1, "Loading", 60)
-			task.spawn(function()
-				local ok, err = pcall(function()
-					local png, why = fetchCursorThumbnail(id)
-					if not png then error(why, 0) end
-					local data, buildError = buildCursorPng(png)
-					if not data then error(buildError, 0) end
-					writefile(path, data)
+		-- Same ID, only a new name: the file is copied under the new name, nothing is downloaded.
+		if old and old.Id == id then
+			if not ownFile then
+				local okRead, data = pcall(readfile, pathOf(old.File))
+				if not okRead or type(data) ~= "string" then
+					row:Flash(1, "Failed", 3)
+					CW.Warn("Could not read " .. pathOf(old.File) .. ": " .. tostring(data))
+					return
+				end
+				writefile(path, data)
+				replaceEntry(old, id, name, relative)
+			end
+			row:Clear()
+			setEditing(nil)
+			row:Flash(1, "Saved")
+			afterChange()
+			pcall(CW.reloadCoreAssets)
+			return
+		end
+
+		if not (CAPS.httpGet or CAPS.request) then
+			row:Flash(1, "No HTTP", 2)
+			CW.Warn("Cursor by ID needs HttpGet or request in the executor")
+			return
+		end
+		busy = true
+		row:Flash(1, "Loading", 60)
+		task.spawn(function()
+			local ok, err = pcall(function()
+				local data, why = downloadCursorPng(id)
+				if not data then error(why, 0) end
+				writefile(path, data)
+				if old then
+					replaceEntry(old, id, name, relative)
+				else
 					local entry, reason = CW.CustomIds.add("Cursors", nil, id, name, { File = relative })
 					if not entry then
 						if CAPS.delfile then pcall(delfile, path) end
 						error(reason, 0)
 					end
-				end)
-				busy = false
-				if ok then
-					row:Clear()
-					row:Flash(1, "Added")
-					CW.Log("Cursor ID " .. id .. " saved as " .. relative)
-					afterChange()
-				else
-					row:Flash(1, "Failed", 3)
-					CW.Warn("Cursor ID " .. id .. " not added: " .. tostring(err))
 				end
 			end)
-		end },
-		{ Text = "Remove", Title = "Remove ID", Callback = function(values, row)
-			if busy then
-				row:Flash(2, "Wait")
-				return
-			end
-			local entry
-			local typed = CW.CustomIds.parse(values.id)
-			if typed then
-				entry = CW.CustomIds.get("Cursors", nil, typed)
+			busy = false
+			if ok then
+				row:Clear()
+				setEditing(nil)
+				row:Flash(1, old and "Saved" or "Added")
+				CW.Log("Cursor ID " .. id .. " saved as " .. relative)
+				afterChange()
+				if old then pcall(CW.reloadCoreAssets) end
 			else
-				-- Empty box: the cursor in use right now, when it was added by ID.
-				local selected = CW.Library.relative(CW.Paths.CURSOR_FILE)
-				entry = selected and CW.CustomIds.byFile("Cursors", nil, selected)
-				if not entry and selected then
-					if selected:find("/" .. CW.Paths.OFFICIAL_FOLDER .. "/", 1, true) then
-						row:Flash(2, "Official", 2)
-						CW.Warn("Assets from the official library can't be removed (" .. selected .. ")")
-					else
-						row:Flash(2, "File", 2)
-						CW.Warn(selected .. " was not added by ID: delete it from the " .. CW.Paths.LIBRARY_ROOT .. " folder to remove it")
-					end
-					return
-				end
+				row:Flash(1, "Failed", 3)
+				CW.Warn("Cursor ID " .. id .. " not saved: " .. tostring(err))
 			end
-			if not entry then
-				row:Flash(2, typed and "Not found" or "Pick ID")
-				return
-			end
+		end)
+	end
 
-			CW.CustomIds.remove("Cursors", nil, entry.Id)
-			local path = CW.Paths.LIBRARY_ROOT .. "/" .. entry.File
-			if CAPS.delfile then
-				local deleted, err = pcall(delfile, path)
-				if not deleted then CW.Warn("Could not delete " .. path .. ": " .. tostring(err)) end
-			else
-				CW.Warn("delfile is missing: " .. path .. " stays in the Cursors folder")
-			end
-			CW.Library.clearSelectionOf("Cursors", nil, entry.File)
+	row = inputRow(section, {
+		{ Key = "id", Title = "Image or Decal ID", Placeholder = "Image/Decal ID or link", Weight = 0.55 },
+		{ Key = "name", Title = "Name (optional)", Placeholder = "Name", Weight = 0.45 },
+	}, {
+		{ Text = "Add ID", Title = "Add ID", Callback = function(values) save(values) end },
+	})
+
+	local function edit()
+		local entry = selectedEntry()
+		if not entry then return end
+		row:Set("id", entry.Id)
+		row:Set("name", entry.Name)
+		setEditing(entry)
+	end
+	-- Removes the cursor in use (only cursors added by ID: the others never show the button).
+	local function remove()
+		if busy then return end
+		local entry = selectedEntry()
+		if not entry then return end
+		CW.CustomIds.remove("Cursors", nil, entry.Id)
+		deleteFile(entry.File)
+		CW.Library.clearSelectionOf("Cursors", nil, entry.File)
+		if editing and editing.Id == entry.Id then
 			row:Clear()
-			row:Flash(2, "Removed")
-			afterChange()
-			pcall(CW.reloadCoreAssets)
-		end },
-	}
-	return inputRow(section, fields, buttons)
+			setEditing(nil)
+		end
+		row:Flash(1, "Removed")
+		afterChange()
+		pcall(CW.reloadCoreAssets)
+	end
+	local showActions = attachActions(section, controls, edit, remove)
+	table.insert(customIdActionUpdaters, function() showActions(selectedEntry() ~= nil) end)
+	return row
 end
 
 ------------------------------------------------------------------------------
@@ -4647,7 +4802,7 @@ guarded("Cursors", function()
 
 		guarded("Hit Sound Custom IDs", function()
 			addCustomIdRow(HitSoundSection, {
-				category = "HitSounds", kind = "Audio",
+				category = "HitSounds", kind = "Audio", controls = { HitSoundDropdown },
 				selected = function() return CW.Library.relative(CW.Paths.SOUND_FILE) end,
 			})
 		end)
@@ -4698,7 +4853,7 @@ guarded("Cursors", function()
 			Callback = applyCursorFile,
 		})
 
-		guarded("Cursor Custom IDs", function() addCursorIdRow(CursorSection) end)
+		guarded("Cursor Custom IDs", function() addCursorIdRow(CursorSection, { CursorGallery }) end)
 
 		CursorSection:Slider({
 			Title = "Cursor Size",
@@ -4731,7 +4886,7 @@ guarded("Cursors", function()
 
 		guarded("Hitmarker Custom IDs", function()
 			addCustomIdRow(HitmarkerSection, {
-				category = "Hitmarkers", kind = "Image",
+				category = "Hitmarkers", kind = "Image", controls = { HitmarkerGallery },
 				selected = function() return CW.Library.relative(CW.Paths.HITMARKER_FILE) end,
 			})
 		end)
@@ -4827,9 +4982,9 @@ guarded("Guns", function()
 			end,
 		})
 
-		local function customIdOptions(getWeapon)
+		local function customIdOptions(getWeapon, controls)
 			return {
-				category = spec.Category, kind = "Audio",
+				category = spec.Category, kind = "Audio", controls = controls,
 				weapon = getWeapon,
 				selected = function()
 					local weapon = getWeapon()
@@ -4882,7 +5037,7 @@ guarded("Guns", function()
 
 			if drawers then
 				guarded(weapon .. " " .. label .. " Custom IDs", function()
-					addCustomIdRow(target, customIdOptions(function() return weapon end))
+					addCustomIdRow(target, customIdOptions(function() return weapon end, { dropdown }))
 				end)
 			end
 		end
@@ -4915,7 +5070,7 @@ guarded("Guns", function()
 			-- Custom IDs for this gun only, right under its gallery.
 			guarded(weapon .. " Texture Custom IDs", function()
 				addCustomIdRow(weaponSection, {
-					category = "Textures", kind = "Texture",
+					category = "Textures", kind = "Texture", controls = { gallery },
 					weapon = function() return weapon end,
 					selected = function()
 						local textures = CW.Settings.ASSET_SELECTIONS.Textures
@@ -5760,7 +5915,8 @@ guarded("Utilities", function()
 	-- departure the same way (its handlers are deferred like Roblox's, in the same order), so it knows where
 	-- each tool is. To reorder, the tools are taken out of the Backpack locally (nothing replicates: the
 	-- server still has them there), one frame is waited so that backpack frees the slots, and they are put
-	-- back in the wanted order. That happens only while no tool is in hand. Only the game's BackpackClient
+	-- back slot by slot; a slot that must stay empty is held meanwhile by a local placeholder tool. Unlike
+	-- the game's own bar, Roblox's allows empty slots, so there each tool goes exactly to its slot. That happens only while no tool is in hand. Only the game's BackpackClient
 	-- listens to the Backpack; the tool controllers (guns, shield, C4, snacks) listen to the character only.
 	--
 	-- Hiding: a hidden tool is taken out of the Backpack locally (parent nil), so neither bar shows it and
@@ -5874,10 +6030,11 @@ guarded("Utilities", function()
 	--// Layouts per team ----------------------------------------------------------------------------------
 	-- "Police" = Guards; "Prisoner" = Criminals, Inmates and Neutral. The tools a team can't have are left
 	-- out of its board: Handcuffs and Taser are guard equipment, and the Riot Shield comes from the guards'
-	-- "Riot Police" gamepass. A guard who picks up a key card disposes of it (it never reaches the inventory).
+	-- "Riot Police" gamepass. A guard who picks up a key card disposes of it (it never reaches the inventory), and
+	-- the hammer and the crude knife are inmate weapons.
 	local VARIANTS = {
 		{ key = "PRISONER", label = "Criminal / Inmate", excluded = { Handcuffs = true, Taser = true, ["Riot Shield"] = true } },
-		{ key = "POLICE", label = "Police", excluded = { ["Key card"] = true } },
+		{ key = "POLICE", label = "Police", excluded = { ["Key card"] = true, Hammer = true, ["Crude Knife"] = true } },
 	}
 	local VARIANT_BY_KEY = {}
 	for _, variant in ipairs(VARIANTS) do VARIANT_BY_KEY[variant.key] = variant end
@@ -6034,26 +6191,100 @@ guarded("Utilities", function()
 		end
 	end
 
-	-- Takes the tools out and puts them back in the wanted order. Yields for two frames.
-	local function rebuildOldBackpack(backpack, wanted)
-		rebuildingOld = true
-		for _, tool in ipairs(wanted) do
-			pcall(function() tool.Parent = nil end)
-		end
-		task.wait() -- Roblox's backpack frees the slots now
-		table.clear(oldSlots)
-		local index = 0
-		for _, tool in ipairs(wanted) do
-			-- A tool the server moved meanwhile (dropped, removed) is left where the server put it.
-			if tool.Parent == nil and backpack.Parent == LocalPlayer then
-				local ok = pcall(function() tool.Parent = backpack end)
-				if ok then
-					index += 1
-					if index <= SLOT_COUNT then oldSlots[index] = tool end
+	-- Where every tool should be in Roblox's backpack: [1..10] = tool or false, plus the tools past the bar.
+	-- A tool with a slot in the layout goes exactly there (Roblox's backpack allows empty slots); every other
+	-- tool keeps the slot it is in when that one is still free, else it takes the lowest free one.
+	local function planOldSlots(current, tools)
+		local desired, used = {}, {}
+		for slot = 1, SLOT_COUNT do desired[slot] = false end
+		for slot = 1, SLOT_COUNT do
+			local names = layout[slot]
+			if names then
+				for _, name in ipairs(names) do
+					for _, tool in ipairs(tools) do
+						if not used[tool] and tool.Name == name then
+							desired[slot] = tool
+							used[tool] = true
+							break
+						end
+					end
+					if desired[slot] then break end
 				end
 			end
 		end
-		task.wait() -- the ChildAdded events of this rebuild are not taken as new tools
+		local rest = {}
+		for slot = 1, SLOT_COUNT do
+			local tool = current[slot]
+			if tool and not used[tool] and table.find(tools, tool) then
+				if not desired[slot] then
+					desired[slot] = tool
+				else
+					table.insert(rest, tool)
+				end
+				used[tool] = true
+			end
+		end
+		for _, tool in ipairs(tools) do
+			if not used[tool] then table.insert(rest, tool) end
+		end
+		local overflow = {}
+		for _, tool in ipairs(rest) do
+			local placed = false
+			for slot = 1, SLOT_COUNT do
+				if not desired[slot] then
+					desired[slot] = tool
+					placed = true
+					break
+				end
+			end
+			if not placed then table.insert(overflow, tool) end
+		end
+		return desired, overflow
+	end
+	CW.AutoSlotPlanOld = planOldSlots -- used by the tests
+
+	-- Takes the tools out and puts them back so that each lands in its planned slot. Roblox's backpack fills
+	-- the lowest empty slot, so a slot that must stay empty is held for that moment by a local placeholder
+	-- tool (never replicated), which is removed right after. Yields for three frames.
+	local function rebuildOldBackpack(backpack, desired, overflow)
+		rebuildingOld = true
+		local all = {}
+		for slot = 1, SLOT_COUNT do
+			if desired[slot] then table.insert(all, desired[slot]) end
+		end
+		for _, tool in ipairs(overflow) do table.insert(all, tool) end
+		for _, tool in ipairs(all) do
+			pcall(function() tool.Parent = nil end)
+		end
+		task.wait() -- Roblox's backpack frees the slots now
+
+		local last = 0
+		for slot = 1, SLOT_COUNT do
+			if desired[slot] then last = slot end
+		end
+		local placeholders = {}
+		table.clear(oldSlots)
+		for slot = 1, SLOT_COUNT do oldSlots[slot] = false end
+		for slot = 1, last do
+			local tool = desired[slot]
+			-- A tool the server moved meanwhile (dropped, removed) is left where the server put it.
+			if tool and tool.Parent == nil and backpack.Parent == LocalPlayer then
+				if pcall(function() tool.Parent = backpack end) then oldSlots[slot] = tool end
+			else
+				local placeholder = Instance.new("Tool")
+				placeholder.Name = " "
+				placeholder.RequiresHandle = false
+				placeholder.CanBeDropped = false
+				placeholder.Parent = backpack
+				table.insert(placeholders, placeholder)
+			end
+		end
+		for _, tool in ipairs(overflow) do
+			if tool.Parent == nil and backpack.Parent == LocalPlayer then pcall(function() tool.Parent = backpack end) end
+		end
+		task.wait() -- each tool now has its slot
+		for _, placeholder in ipairs(placeholders) do placeholder:Destroy() end
+		task.wait() -- the placeholders' slots are empty again; these events are not taken as real tools
 		oldKnown = true
 		rebuildingOld = false
 	end
@@ -6064,38 +6295,41 @@ guarded("Utilities", function()
 		local character = LocalPlayer.Character
 		if character and character:FindFirstChildOfClass("Tool") then return end
 
-		-- The tools in bar order, and whether the bar has a gap before the last one.
-		local order, gap, seen = {}, false, {}
-		if oldKnown then
-			local emptyBefore = false
-			for i = 1, SLOT_COUNT do
-				local tool = oldSlots[i]
-				if tool and tool.Parent == backpack then
-					table.insert(order, tool)
-					seen[tool] = true
-					if emptyBefore then gap = true end
-				else
-					oldSlots[i] = false
-					emptyBefore = true
+		local tools = {}
+		for _, child in ipairs(backpack:GetChildren()) do
+			if child:IsA("Tool") then table.insert(tools, child) end
+		end
+		if #tools == 0 then return end
+
+		-- Where the tools are now. Before this script has laid the bar out (after a spawn or a start), Roblox
+		-- filled it in the Backpack's order.
+		local current = {}
+		local known = oldKnown
+		if known then
+			for slot = 1, SLOT_COUNT do
+				local tool = oldSlots[slot]
+				current[slot] = (tool and tool.Parent == backpack) and tool or false
+			end
+			for _, tool in ipairs(tools) do
+				if not table.find(current, tool) then known = false end -- arrived unseen: lay the bar out again
+			end
+		end
+		if not known then
+			for slot = 1, SLOT_COUNT do current[slot] = tools[slot] or false end
+		end
+
+		local desired, overflow = planOldSlots(current, tools)
+		if known then
+			local same = true
+			for slot = 1, SLOT_COUNT do
+				if (desired[slot] or false) ~= (current[slot] or false) then
+					same = false
+					break
 				end
 			end
+			if same then return end
 		end
-		for _, child in ipairs(backpack:GetChildren()) do
-			if child:IsA("Tool") and not seen[child] then
-				table.insert(order, child)
-				if oldKnown then gap = true end -- a tool this script did not see arrive: lay the bar out again
-			end
-		end
-		if #order == 0 then return end
-
-		local entries = {}
-		for i, tool in ipairs(order) do entries[i] = { Tool = tool, Button = tool } end
-		local changed = arrangeList(entries)
-		if oldKnown and not changed and not gap then return end
-		-- The first time (after a spawn or a start) the real order is unknown, so the bar is laid out once.
-		local wanted = {}
-		for i, entry in ipairs(entries) do wanted[i] = entry.Tool end
-		rebuildOldBackpack(backpack, wanted)
+		rebuildOldBackpack(backpack, desired, overflow)
 	end
 
 	--// Arranging ------------------------------------------------------------------------------------------
