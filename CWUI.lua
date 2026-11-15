@@ -398,6 +398,13 @@ function Section:AddInputRow(o)
 	function obj:Get(key) local box = boxes[key] return box and box.Text or nil end
 	function obj:Set(key, text) local box = boxes[key] if box then box.Text = text or "" end end
 	function obj:Clear() for _, box in pairs(boxes) do box.Text = "" end end
+	-- Troca o texto normal de um botão ("Add ID" <-> "Save").
+	function obj:SetButtonText(index, text)
+		local entry = buttonObjs[index or 1]
+		if not entry then return end
+		entry.text = tostring(text)
+		entry.button.Text = entry.text
+	end
 	-- Troca o texto de um botão por alguns segundos (retorno rápido: "Added", "Invalid"...).
 	function obj:Flash(index, text, seconds)
 		local entry = buttonObjs[index or 1]
@@ -793,6 +800,32 @@ function Section:AddSlotBoard(o)
 	return obj
 end
 
+-- Small action buttons ("Edit", "Remove"...) for the right side of a header bar.
+-- actions = { { Text = "Edit", Callback = fn }, ... }. Returns the box (hidden) and its width.
+local ACTION_W, ACTION_GAP = 54, 4
+local function buildHeaderActions(parent, actions, zIndex)
+	local width = #actions * ACTION_W + math.max(#actions - 1, 0) * ACTION_GAP
+	local box = new("Frame", {
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0.5), Size = UDim2.fromOffset(width, 22),
+		Visible = false, ZIndex = zIndex, Parent = parent,
+	}, { new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, ACTION_GAP),
+		HorizontalAlignment = Enum.HorizontalAlignment.Right, VerticalAlignment = Enum.VerticalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}) })
+	for index, action in ipairs(actions) do
+		local button = new("TextButton", {
+			LayoutOrder = index, Size = UDim2.fromOffset(ACTION_W, 22), BackgroundColor3 = Theme.Track,
+			BorderSizePixel = 0, AutoButtonColor = false, Text = action.Text or "?", TextColor3 = Theme.Text,
+			TextSize = 12, Font = Enum.Font.GothamMedium, ZIndex = zIndex, Parent = box,
+		}, { corner(5) })
+		button.MouseEnter:Connect(function() tween(button, { BackgroundColor3 = Theme.Header }) end)
+		button.MouseLeave:Connect(function() tween(button, { BackgroundColor3 = Theme.Track }) end)
+		button.MouseButton1Click:Connect(function() safeCall(action.Callback) end)
+	end
+	return box, width
+end
+
 function Section:AddDropdown(o)
 	local options = o.Options or {}
 	local selected = o.Default
@@ -834,6 +867,18 @@ function Section:AddDropdown(o)
 		if not silent then safeCall(o.Callback, v) end
 	end
 	function obj:Get() return selected end
+	-- Action buttons in the header, left of the value text; shown with :ShowActions(true).
+	local actionBox, actionWidth
+	function obj:SetActions(actions)
+		if actionBox then actionBox:Destroy() end
+		actionBox, actionWidth = buildHeaderActions(head, actions)
+		actionBox.Position = UDim2.new(1, -8, 0.5, 0)
+	end
+	function obj:ShowActions(visible)
+		if not actionBox then return end
+		actionBox.Visible = visible == true
+		valLbl.Position = UDim2.new(1, visible and -(actionWidth + 16) or -12, 0.5, 0)
+	end
 	function obj:Refresh(newOptions)
 		options = newOptions or {}
 		for _, b in ipairs(list:GetChildren()) do if b:IsA("TextButton") then b:Destroy() end end
@@ -1214,6 +1259,17 @@ function Section:AddGallery(o)
 		Text = "0", TextColor3 = Theme.SubText, TextSize = 13, Font = Enum.Font.GothamMedium,
 		TextXAlignment = Enum.TextXAlignment.Right, Parent = bar,
 	})
+	local actionBox, actionWidth
+	local function placeActions(visible)
+		local rightEdge = hasFolder and -74 or -12
+		if actionBox then
+			actionBox.Visible = visible
+			actionBox.Position = UDim2.new(1, rightEdge, 0.5, 0)
+		end
+		local shift = (visible and actionBox) and (actionWidth + 8) or 0
+		countLbl.Position = UDim2.new(1, rightEdge - shift, 0.5, 0)
+		search.Size = UDim2.new(1, (hasFolder and -148 or -76) - shift, 1, 0)
+	end
 	local refreshBtn
 	if hasFolder then
 		refreshBtn = new("TextButton", {
@@ -1466,6 +1522,13 @@ function Section:AddGallery(o)
 	end
 	function obj:Clear() obj:Set(nil) end
 	function obj:Refresh() build() end
+	-- Action buttons in the top bar (left of the counter); shown with :ShowActions(true).
+	function obj:SetActions(actions)
+		if actionBox then actionBox:Destroy() end
+		actionBox, actionWidth = buildHeaderActions(bar, actions)
+		placeActions(false)
+	end
+	function obj:ShowActions(visible) placeActions(visible == true) end
 	function obj:SetItems(list) o.Items = list build() end
 
 	if refreshBtn then refreshBtn.MouseButton1Click:Connect(build) end
