@@ -218,7 +218,7 @@ do
 	end
 end
 
-CW.Log(isFirstRun and "First run — initializing." or "Re-run detected — reloading modules and replacing the previous run's connections.")
+CW.Log(isFirstRun and "First run: initializing." or "Re-run detected: reloading modules and replacing the previous run's connections.")
 if not isFirstRun and CW.PreviousVersion == nil then
 	CW.Warn("State from an older script version was found. Connections made by that version stay active until you rejoin, so rejoin once for a fully clean update.")
 end
@@ -2096,7 +2096,7 @@ end
 
 local function reloadCursorFromSource(sigHash, data)
 	if not data then
-		CW.Warn("No valid cursor image found at " .. tostring(CW.Paths.CURSOR_FILE) .. " — place a PNG in the cursor library and refresh.")
+		CW.Warn("No valid cursor image found at " .. tostring(CW.Paths.CURSOR_FILE) .. ". Place a PNG in the cursor library and refresh.")
 		return false
 	end
 	local ok2, px, w, h = pcall(CW.parsePNG, data)
@@ -2165,7 +2165,7 @@ local function generateCursorsOnce()
 	local filesExist = isfile(files.white) and isfile(files.red) and isfile(files.green)
 
 	if filesExist and storedHash == sigHash then
-		CW.Log("cursor.png unchanged — tinted variants match, using cache")
+		CW.Log("cursor.png unchanged: tinted variants match, using cache")
 		loadCachedCursorAssets(files)
 		activateCursors()
 		CW.Log("OS cursor active (cached).")
@@ -2173,9 +2173,9 @@ local function generateCursorsOnce()
 	end
 
 	if storedHash and storedHash ~= sigHash then
-		CW.Log("cursor.png changed since last run — reloading original and regenerating tints")
+		CW.Log("cursor.png changed since last run: reloading original and regenerating tints")
 	elseif not filesExist then
-		CW.Log("Tinted cache incomplete — regenerating from current cursor.png")
+		CW.Log("Tinted cache incomplete: regenerating from current cursor.png")
 	end
 
 	if reloadCursorFromSource(sigHash, data) then
@@ -3229,11 +3229,11 @@ end
 task.spawn(function()
 	local shared = ReplicatedStorage:WaitForChild("SharedModules", 30)
 	if not (shared and shared:WaitForChild("GunTracers", 30)) then
-		CW.Warn("GunTracers module not found — custom tracers disabled.")
+		CW.Warn("GunTracers module not found: custom tracers disabled.")
 		return
 	end
 	if not installTracers() then
-		CW.Warn("Could not load the GunTracers module — custom tracers disabled.")
+		CW.Warn("Could not load the GunTracers module: custom tracers disabled.")
 	end
 end)
 end)
@@ -3690,6 +3690,8 @@ local function createCompatTab(options)
 	options = options or {}
 	local tabName = options.Title or options.Name or "Settings"
 	local tab = Window:AddTab({ Name = tabName, Icon = options.Icon or uiIcons[tabName] })
+	-- CWUI 3+: the tab takes the controls itself, so it does not open on one closed section named like the tab.
+	if type(tab.AddToggle) == "function" then return wrapSection(tab) end
 	return wrapSection(tab:AddSection({ Name = tabName, Open = false }))
 end
 
@@ -3714,7 +3716,7 @@ local refreshUIFromLibrary -- defined after the tabs; the custom ID controls cal
 -- with a label already in that dropdown.
 local function customIdLabel(item, taken)
 	local label = item.Name
-	if (taken and taken[label]) or label == "Default" or label == "—" then
+	if (taken and taken[label]) or label == "Default" or label == "None" then
 		label = label .. " (" .. item.CustomId .. ")"
 	end
 	return label
@@ -6965,7 +6967,7 @@ function refreshUIFromLibrary()
 
 	if HitSoundDropdown then
 		HitSoundDropdown:Refresh(hitSoundOptions)
-		HitSoundDropdown:Set(hitSoundLabel(CW.Paths.SOUND_FILE) or "—", true)
+		HitSoundDropdown:Set(hitSoundLabel(CW.Paths.SOUND_FILE) or "None", true)
 	end
 	for _, changer in ipairs(soundChangers) do
 		for _, entry in ipairs(changer.dropdowns) do
