@@ -3624,15 +3624,17 @@ local uiIcons = type(_cfg.UI_ICONS) == "table" and _cfg.UI_ICONS or {}
 
 -- The saved look (CW.Settings.UI_THEME) as CWUI.SetTheme arguments: hex strings become colors.
 -- Applied before the window is built, so it opens with the player's colors already.
-local THEME_COLOR_KEYS = { "Accent", "Text", "Background", "Sidebar", "Panel" }
+local THEME_COLOR_KEYS = { "Accent", "Selector", "Text", "Background", "Sidebar", "Panel" }
 local function savedThemeChanges()
 	local look, changes = CW.Settings.UI_THEME, {}
 	for _, key in ipairs(THEME_COLOR_KEYS) do
 		local ok, color = pcall(Color3.fromHex, type(look[key]) == "string" and look[key] or "")
 		if ok and typeof(color) == "Color3" then changes[key] = color end
 	end
-	changes.BackgroundTransparency = tonumber(look.BackgroundTransparency)
-	changes.PanelTransparency = tonumber(look.PanelTransparency)
+	for _, key in ipairs({ "BackgroundTransparency", "PanelTransparency", "SelectorTransparency" }) do
+		changes[key] = tonumber(look[key])
+	end
+	if type(look.Corners) == "boolean" then changes.Corners = look.Corners end
 	return changes
 end
 local canTheme = type(CWUI.SetTheme) == "function"
@@ -3650,6 +3652,11 @@ CW.UIWindow = Window
 Window.ToggleVisibility = Window.Toggle
 
 local canBackdrop = type(Window.SetBackgroundImage) == "function"
+local canParallax = type(Window.SetParallax) == "function"
+local PARALLAX_DEFAULT = 0.03
+if canParallax then
+	Window:SetParallax(CW.Settings.UI_THEME.Parallax == true, tonumber(CW.Settings.UI_THEME.ParallaxStrength) or PARALLAX_DEFAULT)
+end
 if canBackdrop then
 	Window:SetBackgroundImageTransparency(tonumber(CW.Settings.UI_THEME.ImageTransparency) or 0.5)
 	if CW.Settings.UI_THEME.Image and not Window:SetBackgroundImage(CW.Settings.UI_THEME.Image) then
@@ -4967,7 +4974,7 @@ guarded("Cursors", function()
 			Callback = applyCursorSize,
 		})
 
-		CursorSection:Toggle({
+		local teamToggle = CursorSection:Toggle({
 			Title = "Team Check",
 			Default = CW.Settings.CURSOR_TEAM_CHECK,
 			Callback = function(on)
@@ -4975,9 +4982,10 @@ guarded("Cursors", function()
 				CW.State.lastTarget = nil -- the cursor loop re-checks what is under the mouse right away
 			end,
 		})
+		local teamPickers = {}
 		for _, entry in ipairs({ { "Enemy Color", "CURSOR_ENEMY_COLOR" }, { "Teammate Color", "CURSOR_TEAM_COLOR" } }) do
 			local key = entry[2]
-			CursorSection:Colorpicker({ -- nil on an old CWUI without the picker: the colors keep their defaults
+			teamPickers[key] = CursorSection:Colorpicker({ -- nil on an old CWUI: the colors keep their defaults
 				Title = entry[1],
 				Default = CW.Settings[key],
 				Callback = function(color)
@@ -4986,6 +4994,20 @@ guarded("Cursors", function()
 				end,
 			})
 		end
+		CursorSection:Button({
+			Title = "Reset Team Check",
+			Callback = function()
+				CW.Settings.CURSOR_TEAM_CHECK = CW.Defaults.CURSOR_TEAM_CHECK
+				teamToggle:Set(CW.Defaults.CURSOR_TEAM_CHECK, true)
+				for key, picker in pairs(teamPickers) do
+					CW.Settings[key] = CW.Defaults[key]
+					picker:Set(CW.Defaults[key], true)
+				end
+				CW.State.lastTarget = nil
+				scheduleCursorReload(0.1)
+				scheduleSave()
+			end,
+		})
 	end)
 
 	-- Hitmarkers: the library, then all the switches together, then all the sliders together.
@@ -7057,41 +7079,62 @@ guarded("Settings", function()
 	-- Opened by the Settings button next to Discord (on an old CWUI it is a normal tab in the sidebar).
 	local SettingsTab = createCompatTab({ Title = "Settings", Footer = "Settings" })
 
-	-- Interface: the UI's colors, transparency and background image. Changes show at once and are saved.
+	-- Interface: colors, transparency, corners and the background image. Changes show at once and are saved.
+	-- Three drawers so the page reads at a glance; one reset puts all of it back.
 	guarded("Interface", function()
 		if not canTheme then return end
-		local Interface = SettingsTab:AddSubSection("Interface", true)
 		local look = CW.Settings.UI_THEME
 		local current = CWUI.GetTheme()
-		local pickers, sliders = {}, {}
+		local resets = {} -- how each control goes back to the default look
 
+		local Colors = SettingsTab:AddSubSection("Colors", true)
+		local pickers = {}
 		for _, entry in ipairs({
-			{ "Highlight Color", "Accent" }, { "Text Color", "Text" }, { "Background Color", "Background" },
-			{ "Sidebar Color", "Sidebar" }, { "Panel Color", "Panel" },
+			{ "Highlight Color", "Accent" }, { "Tab Selector Color", "Selector" }, { "Text Color", "Text" },
+			{ "Background Color", "Background" }, { "Sidebar Color", "Sidebar" }, { "Panel Color", "Panel" },
 		}) do
 			local key = entry[2]
-			pickers[key] = Interface:Colorpicker({
+			pickers[key] = Colors:Colorpicker({
 				Title = entry[1],
-				Default = current[key],
+				Default = current[key] or current.Accent, -- the selector follows the highlight until it is picked
 				Callback = function(color)
 					look[key] = color:ToHex()
 					CWUI.SetTheme({ [key] = color })
+					if key == "Accent" and not look.Selector and pickers.Selector then pickers.Selector:Set(color, true) end
 				end,
 			})
 		end
-		for _, entry in ipairs({ { "Background Transparency", "BackgroundTransparency" }, { "Panel Transparency", "PanelTransparency" } }) do
+		table.insert(resets, function(d)
+			for key, picker in pairs(pickers) do picker:Set(d[key] or d.Accent, true) end
+		end)
+
+		local Surfaces = SettingsTab:AddSubSection("Transparency & Corners", false)
+		for _, entry in ipairs({
+			{ "Background Transparency", "BackgroundTransparency" }, { "Panel Transparency", "PanelTransparency" },
+			{ "Tab Selector Transparency", "SelectorTransparency" },
+		}) do
 			local key = entry[2]
-			sliders[key] = Interface:Slider({
+			local slider = Surfaces:Slider({
 				Title = entry[1], Min = 0, Max = 1, Decimal = 2, Default = current[key],
 				Callback = function(v)
 					look[key] = v
 					CWUI.SetTheme({ [key] = v })
 				end,
 			})
+			table.insert(resets, function(d) slider:Set(d[key], true) end)
 		end
+		local cornersToggle = Surfaces:Toggle({
+			Title = "Rounded Corners",
+			Default = current.Corners,
+			Callback = function(on)
+				look.Corners = on
+				CWUI.SetTheme({ Corners = on })
+			end,
+		})
+		table.insert(resets, function(d) cornersToggle:Set(d.Corners, true) end)
 
-		local imageRow
 		if canBackdrop then
+			local Backdrop = SettingsTab:AddSubSection("Background Image", false)
 			-- A Roblox image ID (or link) is checked before use; anything else is a file in the workspace.
 			local function applyImage(source, row)
 				local id = CW.CustomIds.parse(source)
@@ -7117,8 +7160,8 @@ guarded("Settings", function()
 					row:Flash(1, "Not found")
 				end
 			end
-			imageRow = Interface:InputRow({
-				Fields = { { Key = "image", Placeholder = "Background image: ID or workspace file", Default = look.Image } },
+			local imageRow = Backdrop:InputRow({
+				Fields = { { Key = "image", Placeholder = "Image ID or workspace file", Default = look.Image } },
 				Buttons = {
 					{ Text = "Apply", Callback = function(values, row)
 						local source = (values.image or ""):match("^%s*(.-)%s*$")
@@ -7133,7 +7176,7 @@ guarded("Settings", function()
 					end },
 				},
 			})
-			sliders.ImageTransparency = Interface:Slider({
+			local imageSlider = Backdrop:Slider({
 				Title = "Image Transparency", Min = 0, Max = 1, Decimal = 2,
 				Default = tonumber(look.ImageTransparency) or 0.5,
 				Callback = function(v)
@@ -7141,21 +7184,49 @@ guarded("Settings", function()
 					Window:SetBackgroundImageTransparency(v)
 				end,
 			})
+			table.insert(resets, function()
+				Window:SetBackgroundImage(nil)
+				Window:SetBackgroundImageTransparency(0.5)
+				if imageRow then imageRow:Clear() end
+				imageSlider:Set(0.5, true)
+			end)
+
+			if canParallax then
+				-- The image drifts against the mouse; strength = how far, as a percent of the window size.
+				local strength = tonumber(look.ParallaxStrength) or PARALLAX_DEFAULT
+				local parallaxToggle = Backdrop:Toggle({
+					Title = "Parallax",
+					Default = look.Parallax == true,
+					Callback = function(on)
+						look.Parallax = on
+						Window:SetParallax(on, strength)
+					end,
+				})
+				local strengthSlider = Backdrop:Slider({
+					Title = "Parallax Strength", Min = 1, Max = 10, Increment = 0.5, Suffix = "%",
+					Default = strength * 100,
+					Callback = function(v)
+						strength = v / 100
+						look.ParallaxStrength = strength
+						Window:SetParallax(look.Parallax == true, strength)
+					end,
+				})
+				table.insert(resets, function()
+					strength = PARALLAX_DEFAULT
+					Window:SetParallax(false, strength)
+					parallaxToggle:Set(false, true)
+					strengthSlider:Set(strength * 100, true)
+				end)
+			end
 		end
 
-		Interface:Button({
+		SettingsTab:Button({
 			Title = "Reset Interface",
 			Callback = function()
 				table.clear(look)
 				CWUI.ResetTheme()
 				local defaults = CWUI.GetTheme()
-				for key, picker in pairs(pickers) do picker:Set(defaults[key], true) end
-				for key, slider in pairs(sliders) do slider:Set(defaults[key] or 0.5, true) end
-				if canBackdrop then
-					Window:SetBackgroundImage(nil)
-					Window:SetBackgroundImageTransparency(0.5)
-					if imageRow then imageRow:Clear() end
-				end
+				for _, reset in ipairs(resets) do reset(defaults) end
 				scheduleSave()
 			end,
 		})
