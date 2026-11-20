@@ -24,7 +24,8 @@
 
     PERSONALIZAÇÃO
         CW.SetTheme({ Accent, Text, Background, Sidebar, Panel = Color3, BackgroundTransparency, PanelTransparency = 0..1 })
-        CW.ResetTheme(), CW.GetTheme(); Window:SetBackgroundImage(id ou caminho), Window:SetBackgroundImageTransparency(0..1)
+        CW.ResetTheme(), CW.GetTheme(); Window:SetBackgroundImage(id ou caminho), Window:SetBackgroundImageTransparency(0..1),
+        Window:SetParallax(ligado, força 0..0.1)
 ]]
 
 local CW = { Version = "3.0.0" }
@@ -32,6 +33,7 @@ local CW = { Version = "3.0.0" }
 --// Services ---------------------------------------------------------------
 local cloneref = cloneref or function(x) return x end
 local TweenService     = cloneref(game:GetService("TweenService"))
+local RunService       = cloneref(game:GetService("RunService"))
 local UserInputService = cloneref(game:GetService("UserInputService"))
 local GuiService       = cloneref(game:GetService("GuiService"))
 local CoreGui          = cloneref(game:GetService("CoreGui"))
@@ -45,8 +47,11 @@ local DEFAULT_PALETTE = {
 	Background = Color3.fromRGB(21, 21, 24),
 	Sidebar = Color3.fromRGB(14, 14, 16),
 	Panel = Color3.fromRGB(36, 36, 41),
+	Selector = false,                          -- cor da aba ativa; false = a mesma do destaque
 	BackgroundTransparency = 0,                -- janela e barra lateral
 	PanelTransparency = 0,                     -- cabeçalhos, corpos das seções e linhas
+	SelectorTransparency = 0,                  -- aba ativa e hover das abas
+	Corners = true,                            -- false = cantos retos em tudo (os círculos continuam)
 }
 local Palette = table.clone(DEFAULT_PALETTE)
 local Theme = {}
@@ -73,9 +78,13 @@ local function derive()
 	Theme.Track, Theme.Divider = panel:Lerp(BLACK, 0.58), panel:Lerp(WHITE, 0.1)
 	Theme.ItemSelected = accent:Lerp(Theme.Track, 0.8)
 	Theme.SubText = Palette.Text:Lerp(panel, 0.33)
-	-- Texto sobre o destaque: escuro ou claro, o que for mais legível na cor escolhida.
-	local dark, light = Color3.fromRGB(18, 13, 8), Color3.fromRGB(245, 245, 245)
-	Theme.OnAccent = contrast(accent, dark) >= contrast(accent, light) and dark or light
+	-- Texto sobre o destaque e sobre a aba ativa: escuro ou claro, o que for mais legível na cor escolhida.
+	local function readableOn(color)
+		local dark, light = Color3.fromRGB(18, 13, 8), Color3.fromRGB(245, 245, 245)
+		return contrast(color, dark) >= contrast(color, light) and dark or light
+	end
+	Theme.Selector = Palette.Selector or accent
+	Theme.OnAccent, Theme.OnSelector = readableOn(accent), readableOn(Theme.Selector)
 end
 derive()
 
@@ -96,8 +105,11 @@ local COLOR_PROPS = {
 	BackgroundColor3 = true, TextColor3 = true, PlaceholderColor3 = true,
 	ImageColor3 = true, ScrollBarImageColor3 = true, Color = true,
 }
-local painted = setmetatable({}, { __mode = "k" })  -- instância -> { propriedade = papel }
-local surfaces = setmetatable({}, { __mode = "k" }) -- instância -> "Background" | "Panel" (transparência)
+-- Tabelas comuns, não fracas: no Roblox o objeto Lua de uma instância pode ser coletado com a instância
+-- ainda viva, e ela sairia do registro (pararia de mudar de cor). Instâncias destruídas saem na repintura.
+local painted = {}  -- instância -> { propriedade = papel }
+local surfaces = {} -- instância -> "Background" | "Panel" | "Selector" (transparência)
+local corners = {}  -- UICorner -> raio original (Corners = false zera)
 
 local function remember(inst, prop, role)
 	local roles = painted[inst]
@@ -131,7 +143,11 @@ local function new(class, props, children)
 	return inst
 end
 
-local function corner(r) return new("UICorner", { CornerRadius = UDim.new(0, r) }) end
+local function corner(r)
+	local c = new("UICorner", { CornerRadius = UDim.new(0, Palette.Corners and r or 0) })
+	corners[c] = r
+	return c
+end
 local function circle()  return new("UICorner", { CornerRadius = UDim.new(1, 0) }) end
 
 local function reducedMotion()
@@ -167,24 +183,33 @@ end
 
 --// Tema em tempo real ----------------------------------------------------------
 -- CW.SetTheme({ Accent = Color3, Text = Color3, Background = Color3, Sidebar = Color3, Panel = Color3,
---               BackgroundTransparency = 0..1, PanelTransparency = 0..1 })
+--               Selector = Color3 ou false (segue o destaque), BackgroundTransparency, PanelTransparency,
+--               SelectorTransparency = 0..1, Corners = true/false })
 -- Só as chaves passadas mudam. CW.ResetTheme() volta ao padrão. A repintura acontece uma vez por quadro,
 -- então arrastar um seletor de cor não pesa.
 local repaintQueued = false
 local function repaint()
 	repaintQueued = false
 	for inst, roles in pairs(painted) do
-		for prop, role in pairs(roles) do inst[prop] = Theme[role] end
+		if inst.Parent == nil then
+			painted[inst] = nil
+		else
+			for prop, role in pairs(roles) do inst[prop] = Theme[role] end
+		end
 	end
 	for inst, layer in pairs(surfaces) do
-		inst.BackgroundTransparency = Palette[layer .. "Transparency"]
+		if inst.Parent == nil then surfaces[inst] = nil else inst.BackgroundTransparency = Palette[layer .. "Transparency"] end
+	end
+	for c, r in pairs(corners) do
+		if c.Parent == nil then corners[c] = nil else c.CornerRadius = UDim.new(0, Palette.Corners and r or 0) end
 	end
 end
 
 function CW.SetTheme(changes)
 	for key, value in pairs(changes or {}) do
 		local default = DEFAULT_PALETTE[key]
-		if default ~= nil and typeof(value) == typeof(default) then
+		local valid = default ~= nil and (typeof(value) == typeof(default) or (key == "Selector" and typeof(value) == "Color3"))
+		if valid then
 			Palette[key] = type(value) == "number" and math.clamp(value, 0, 1) or value
 		end
 	end
@@ -420,7 +445,6 @@ function Section:AddToggle(o)
 		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0), Size = UDim2.fromOffset(44, 24),
 		BackgroundColor3 = state and "Accent" or "Track", BorderSizePixel = 0, Parent = row,
 	}, { corner(RADIUS) })
-	local swStroke = new("UIStroke", { Color = "Divider", Thickness = 1, Transparency = state and 1 or 0, Parent = sw })
 	local knob = new("Frame", {
 		AnchorPoint = Vector2.new(0, 0.5), Position = state and ON or OFF, Size = UDim2.fromOffset(18, 18),
 		BackgroundColor3 = state and "OnAccent" or "SubText", BorderSizePixel = 0, Parent = sw,
@@ -430,7 +454,6 @@ function Section:AddToggle(o)
 	function obj:Set(v, silent)
 		state = v and true or false
 		tween(sw, { BackgroundColor3 = state and "Accent" or "Track" })
-		tween(swStroke, { Transparency = state and 1 or 0 })
 		tween(knob, { Position = state and ON or OFF, BackgroundColor3 = state and "OnAccent" or "SubText" })
 		if not silent then safeCall(o.Callback, state) end
 	end
@@ -672,7 +695,7 @@ function Section:AddSlotBoard(o)
 			LayoutOrder = index, BackgroundColor3 = "Track", BorderSizePixel = 0, AutoButtonColor = false,
 			Text = "", Parent = slotArea,
 		}, { corner(RADIUS - 1) })
-		local stroke = new("UIStroke", { Color = "Divider", Thickness = 1, Transparency = 0.5, Parent = cell })
+		local stroke = new("UIStroke", { Color = "Accent", Thickness = 1, Transparency = 1, Parent = cell })
 		local number = new("TextLabel", {
 			BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 1), Size = UDim2.fromOffset(14, 14),
 			Text = label, TextColor3 = "SubText", TextSize = 13, FontFace = Fonts.Title,
@@ -704,7 +727,7 @@ function Section:AddSlotBoard(o)
 			Size = UDim2.new(1, 0, 0, EXTRA_EMPTY_H), Parent = container,
 		}, { corner(RADIUS) })
 		new("Frame", { LayoutOrder = 2, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 4), Parent = container })
-		extraStroke = new("UIStroke", { Color = "Divider", Thickness = 1, Transparency = 0.5, Parent = extraCell })
+		extraStroke = new("UIStroke", { Color = "Accent", Thickness = 1, Transparency = 1, Parent = extraCell })
 		extraLabel = new("TextLabel", {
 			BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -20, 0, EXTRA_EMPTY_H),
 			Text = "", TextColor3 = "SubText", TextSize = 14, FontFace = Fonts.Medium,
@@ -893,13 +916,11 @@ function Section:AddSlotBoard(o)
 	end
 	local function highlight(index)
 		for i, s in ipairs(slotCells) do
-			paint(s.stroke, "Color", (i == index) and "Accent" or "Divider")
-			s.stroke.Transparency = (i == index) and 0 or 0.5
+			s.stroke.Transparency = (i == index) and 0 or 1
 		end
 		if extraStroke then
 			local on = extra and index == extra.Key
-			paint(extraStroke, "Color", on and "Accent" or "Divider")
-			extraStroke.Transparency = on and 0 or 0.5
+			extraStroke.Transparency = on and 0 or 1
 		end
 	end
 
@@ -1152,7 +1173,7 @@ function Section:AddColorpicker(o)
 	local swatch = new("Frame", {
 		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -42, 0.5, 0), Size = UDim2.fromOffset(40, 22),
 		BackgroundColor3 = color, BorderSizePixel = 0, Parent = head,
-	}, { corner(RADIUS - 1), new("UIStroke", { Color = "Divider", Thickness = 1 }) })
+	}, { corner(RADIUS - 1) })
 
 	local panel = new("Frame", {
 		Name = "Panel", BackgroundTransparency = 1, Position = UDim2.fromOffset(10, HEAD + 8),
@@ -1227,7 +1248,7 @@ function Section:AddColorpicker(o)
 	local preview = new("Frame", {
 		Name = "Preview", AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 0), Size = UDim2.fromOffset(40, 26),
 		BackgroundColor3 = color, BorderSizePixel = 0, Parent = hexRow,
-	}, { corner(RADIUS - 1), new("UIStroke", { Color = "Divider", Thickness = 1 }) })
+	}, { corner(RADIUS - 1) })
 
 	--// estado -> tela
 	local function render(exact)
@@ -1887,7 +1908,7 @@ local function navHover(window, btn, label)
 	local function active() return window._selected ~= nil and window._selected._btn == btn end
 	btn.MouseEnter:Connect(function()
 		if active() then return end
-		tween(btn, { BackgroundTransparency = 0 }, 0.12)
+		tween(btn, { BackgroundTransparency = Palette.SelectorTransparency }, 0.12)
 		tween(label, { TextColor3 = "Text" }, 0.12)
 	end)
 	btn.MouseLeave:Connect(function()
@@ -1897,15 +1918,20 @@ local function navHover(window, btn, label)
 	end)
 end
 
--- Aba ativa = placa no destaque com texto contrastante.
+-- Aba ativa = placa na cor do seletor (o destaque, se não escolhida) com texto contrastante.
+-- Só a aba ativa entra no registro de transparência; as outras ficam transparentes até o hover.
 function Window:SelectTab(tab)
 	local changed = self._selected ~= tab
 	for _, t in ipairs(self._tabs) do
 		local on = (t == tab)
 		t._page.Visible = on
 		t._page.ScrollingEnabled = self._scrollLocks == 0
-		tween(t._btn, { BackgroundTransparency = on and 0 or 1, BackgroundColor3 = on and "Accent" or "TabHover" }, 0.15)
-		tween(t._label, { TextColor3 = on and "OnAccent" or "SubText" }, 0.15)
+		surfaces[t._btn] = on and "Selector" or nil
+		tween(t._btn, {
+			BackgroundTransparency = on and Palette.SelectorTransparency or 1,
+			BackgroundColor3 = on and "Selector" or "TabHover",
+		}, 0.15)
+		tween(t._label, { TextColor3 = on and "OnSelector" or "SubText" }, 0.15)
 	end
 	self._selected = tab
 	if changed then
@@ -1970,11 +1996,52 @@ function Window:SetBackgroundImage(source)
 	end
 	local asset = resolveAsset(source)
 	if not asset then return false end
-	self._backdrop.Image = asset
+	self._backdropImage.Image = asset
 	self._backdrop.Visible = true
 	return true
 end
-function Window:SetBackgroundImageTransparency(t) self._backdrop.ImageTransparency = math.clamp(t, 0, 1) end
+function Window:SetBackgroundImageTransparency(t) self._backdropImage.ImageTransparency = math.clamp(t, 0, 1) end
+
+--// Parallax da imagem de fundo --------------------------------------------------
+-- Adaptado de um sistema estilo menu do Rain World: uma "câmera" segue o mouse com aproximação exponencial
+-- (independente do FPS, sem degrau nem parada brusca) e a imagem anda ao contrário. Aqui há uma camada só,
+-- a imagem fica `margin` maior que a janela em cada lado e anda no máximo isso, então a borda nunca aparece.
+-- O mouse é medido em relação à janela: da borda esquerda à direita da janela vai de -1 a 1.
+-- Custo: nada é escrito quando a imagem não precisa mudar; com a janela escondida, sem imagem ou desligado,
+-- o passo volta no início.
+local PARALLAX_SPEED = 5 -- quão rápido a câmera alcança o mouse (o mesmo valor da referência)
+
+-- strength = deslocamento máximo como fração do tamanho da janela (0 a 0.1).
+function Window:SetParallax(enabled, strength)
+	local p = self._parallax
+	p.enabled = enabled == true
+	if strength then p.margin = math.clamp(strength, 0, 0.1) end
+	local grow = p.enabled and 1 + 2 * p.margin or 1
+	self._backdropImage.Size = UDim2.fromScale(grow, grow)
+	if not p.enabled then
+		p.x, p.y, p.shownX, p.shownY = 0, 0, 0, 0
+		self._backdropImage.Position = UDim2.fromScale(0.5, 0.5)
+	end
+end
+
+function Window:_stepParallax(dt)
+	local p = self._parallax
+	if not (p.enabled and self._backdrop.Visible and self._shell.Visible) then return end
+	local pos, size = self._shell.AbsolutePosition, self._shell.AbsoluteSize
+	if size.X <= 0 or size.Y <= 0 then return end
+	local mouse = UserInputService:GetMouseLocation()
+	local tx = math.clamp((mouse.X - pos.X) / size.X * 2 - 1, -1, 1)
+	local ty = math.clamp((mouse.Y - pos.Y) / size.Y * 2 - 1, -1, 1)
+	local follow = 1 - math.exp(-PARALLAX_SPEED * math.min(dt, 0.05)) -- dt limitado: sem salto após um travamento
+	p.x += (tx - p.x) * follow
+	p.y += (ty - p.y) * follow
+	-- Menos de 1/20 de pixel de diferença: não escreve (o CanvasGroup não redesenha à toa).
+	local limit = 0.05 / math.max(size.X, size.Y) / math.max(p.margin, 1e-3)
+	if math.abs(p.x - p.shownX) < limit and math.abs(p.y - p.shownY) < limit then return end
+	p.shownX, p.shownY = p.x, p.y
+	-- Sem arredondar: posição fracionária evita o "degrau" em movimento lento.
+	self._backdropImage.Position = UDim2.fromScale(0.5 - p.x * p.margin, 0.5 - p.y * p.margin)
+end
 
 function Window:Destroy()
 	self._destroyed = true
@@ -2017,18 +2084,24 @@ function CW:CreateWindow(cfg)
 	local baseSize = cfg.Size or UDim2.fromOffset(712, 500)
 
 	-- Active = true: clicar na janela não "atravessa" para o jogo (não atira).
-	-- A borda fina separa a janela do cenário do jogo, que pode ser claro ou escuro.
 	local window = new("Frame", {
 		Name = "Window", Active = true, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
 		Size = baseSize, Surface = "Background", BackgroundColor3 = "Content", BorderSizePixel = 0, Parent = gui,
-	}, { corner(WIN_R), new("UIStroke", { Color = "Divider", Thickness = 1 }) })
+	}, { corner(WIN_R) })
 	self._shell = window
 
-	-- Imagem de fundo (opcional): fica entre a cor da janela e o conteúdo.
-	self._backdrop = new("ImageLabel", {
-		Name = "Backdrop", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ScaleType = Enum.ScaleType.Crop,
-		ImageTransparency = 0.5, Visible = false, ZIndex = 0, Parent = window,
+	-- Imagem de fundo (opcional), entre a cor da janela e o conteúdo. O CanvasGroup é o único contêiner que
+	-- recorta com cantos arredondados, e o parallax precisa de uma imagem maior que a janela.
+	self._backdrop = new("CanvasGroup", {
+		Name = "Backdrop", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 0,
+		Parent = window,
 	}, { corner(WIN_R) })
+	self._backdropImage = new("ImageLabel", {
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(1, 1), ScaleType = Enum.ScaleType.Crop, ImageTransparency = 0.5, Parent = self._backdrop,
+	})
+	self._parallax = { enabled = false, margin = 0.03, x = 0, y = 0, shownX = 0, shownY = 0 }
+	self:_connect(RunService.PreRender, function(dt) self:_stepParallax(dt) end)
 
 	-- Em telas menores que a janela (celular), ela encolhe para caber, sem diminuir texto nem alvos de toque.
 	if baseSize.X.Scale == 0 and baseSize.Y.Scale == 0 then
@@ -2104,10 +2177,6 @@ function CW:CreateWindow(cfg)
 
 	self._footerButtons = {}
 	if hasFooter then
-		new("Frame", {
-			Name = "Divider", Position = UDim2.new(0, 4, 1, -FOOTER_H), Size = UDim2.new(1, -8, 0, 1),
-			BackgroundColor3 = "Divider", BorderSizePixel = 0, Parent = sidebar,
-		})
 		local bar = new("Frame", {
 			BackgroundTransparency = 1, Position = UDim2.new(0, 4, 1, -(FOOTER_H - 6)), Size = UDim2.new(1, -8, 0, ROW_H),
 			Parent = sidebar,
