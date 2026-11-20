@@ -258,12 +258,23 @@ CW.Settings.HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, f
 CW.Settings.HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, false)
 CW.Settings.HITMARKER_FADEOUT         = boolOr(_cfg.HITMARKER_FADEOUT, false)
 
+-- Cursor team check: the cursor takes the enemy color over an enemy and the teammate color over a teammate.
+-- On by default because that is how the cursor always behaved.
+CW.Settings.CURSOR_TEAM_CHECK  = boolOr(_cfg.CURSOR_TEAM_CHECK, true)
+CW.Settings.CURSOR_ENEMY_COLOR = Color3.fromRGB(255, 56, 56)
+CW.Settings.CURSOR_TEAM_COLOR  = Color3.fromRGB(56, 255, 56)
+
+-- UI look (CWUI.SetTheme): only what the player changed. Colors as hex, transparencies 0..1,
+-- Image = Roblox ID or workspace path, ImageTransparency 0..1.
+CW.Settings.UI_THEME = {}
+
 -- Snapshot of the defaults, taken before any saved value is applied. The save routine
 -- writes only the settings whose value differs from these.
 CW.Defaults = {}
 for _, key in ipairs({
 	"HITMARKER_SIZE", "SOUND_VOLUME", "CURSOR_TARGET_SIZE", "HITMARKER_VISIBLE_DURATION",
 	"HITMARKER_FADEOUT_DURATION", "HITMARKER_RANDOM_ROTATION", "HITMARKER_FOLLOW_MOUSE", "HITMARKER_FADEOUT",
+	"CURSOR_TEAM_CHECK", "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR",
 }) do
 	CW.Defaults[key] = CW.Settings[key]
 end
@@ -357,6 +368,13 @@ if settingsFileExists then
 			CW.Log("Loaded saved UI settings and asset selections")
 		end
 	end
+end
+
+-- Colors are saved as hex (Color3 can't go into JSON). Read here, before the cursor is generated.
+for _, key in ipairs({ "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR" }) do
+	local hex = CW._SavedSettings[key .. "_HEX"]
+	local ok, color = pcall(Color3.fromHex, type(hex) == "string" and hex or "")
+	if ok and typeof(color) == "Color3" then CW.Settings[key] = color end
 end
 
 do
@@ -2022,14 +2040,22 @@ local Mouse       = CW.Mouse
 
 local sformat = string.format
 
-local TINT_VARIANTS = {
-	{key="red",   tR=255, tG=56,  tB=56},
-	{key="green", tR=56,  tG=255, tB=56},
-}
+-- "red" = over an enemy, "green" = over a teammate; their colors come from the settings.
+local function tintVariants()
+	local variants = {}
+	for key, setting in pairs({ red = "CURSOR_ENEMY_COLOR", green = "CURSOR_TEAM_COLOR" }) do
+		local color = CW.Settings[setting]
+		table.insert(variants, {
+			key = key, tR = math.floor(color.R * 255 + 0.5), tG = math.floor(color.G * 255 + 0.5), tB = math.floor(color.B * 255 + 0.5),
+		})
+	end
+	table.sort(variants, function(x, y) return x.key < y.key end) -- stable order for the signature
+	return variants
+end
 
 local function computeCursorSourceSignature()
 	local tintSig = ""
-	for _, v in ipairs(TINT_VARIANTS) do
+	for _, v in ipairs(tintVariants()) do
 		tintSig = tintSig.."|"..v.key..":"..v.tR..","..v.tG..","..v.tB
 	end
 	-- "|fit" marks the aspect-preserving resize, so caches made by older versions are rebuilt.
@@ -2127,7 +2153,7 @@ local function reloadCursorFromSource(sigHash, data)
 	writefile(files.white, CW.encodePNG(px, w, h))
 	CW.Assets.white = getcustomasset(files.white)
 
-	for _, v in ipairs(TINT_VARIANTS) do
+	for _, v in ipairs(tintVariants()) do
 		writefile(files[v.key], CW.encodePNG(CW.applyTint(px, w, h, v.tR, v.tG, v.tB), w, h))
 		CW.Assets[v.key] = getcustomasset(files[v.key])
 	end
@@ -2259,7 +2285,7 @@ do
 		local Player = Players:GetPlayerFromCharacter(Target.Parent)
 			or (Target.Parent.Parent and Players:GetPlayerFromCharacter(Target.Parent.Parent))
 
-		if Player and Player ~= LocalPlayer then
+		if Player and Player ~= LocalPlayer and CW.Settings.CURSOR_TEAM_CHECK then
 			setOSCursor(Player.TeamColor == LocalPlayer.TeamColor and "green" or "red")
 		else
 			setOSCursor("white")
@@ -3595,15 +3621,41 @@ end
 -- (Settings vale para o botão do rodapé e para a aba Settings; as outras abas usam o próprio nome.
 --  Effects e Visuals, os nomes antigos, ainda valem para as abas Cursors e Guns.)
 local uiIcons = type(_cfg.UI_ICONS) == "table" and _cfg.UI_ICONS or {}
+
+-- The saved look (CW.Settings.UI_THEME) as CWUI.SetTheme arguments: hex strings become colors.
+-- Applied before the window is built, so it opens with the player's colors already.
+local THEME_COLOR_KEYS = { "Accent", "Text", "Background", "Sidebar", "Panel" }
+local function savedThemeChanges()
+	local look, changes = CW.Settings.UI_THEME, {}
+	for _, key in ipairs(THEME_COLOR_KEYS) do
+		local ok, color = pcall(Color3.fromHex, type(look[key]) == "string" and look[key] or "")
+		if ok and typeof(color) == "Color3" then changes[key] = color end
+	end
+	changes.BackgroundTransparency = tonumber(look.BackgroundTransparency)
+	changes.PanelTransparency = tonumber(look.PanelTransparency)
+	return changes
+end
+local canTheme = type(CWUI.SetTheme) == "function"
+if canTheme then CWUI.SetTheme(savedThemeChanges()) end
+
 local Window = CWUI:CreateWindow({
 	Title = "CW",
 	ToggleKey = false,
 	Logo = uiIcons.Logo,
 	Icons = { Settings = uiIcons.Settings, Discord = uiIcons.Discord, Info = uiIcons.Info },
 	Discord = type(_cfg.DISCORD_URL) == "string" and _cfg.DISCORD_URL or nil,
+	SettingsButton = true,
 })
 CW.UIWindow = Window
 Window.ToggleVisibility = Window.Toggle
+
+local canBackdrop = type(Window.SetBackgroundImage) == "function"
+if canBackdrop then
+	Window:SetBackgroundImageTransparency(tonumber(CW.Settings.UI_THEME.ImageTransparency) or 0.5)
+	if CW.Settings.UI_THEME.Image and not Window:SetBackgroundImage(CW.Settings.UI_THEME.Image) then
+		CW.Warn("Could not load the UI background image: " .. tostring(CW.Settings.UI_THEME.Image))
+	end
+end
 
 local function mapControlOptions(options)
 	options = options or {}
@@ -3689,7 +3741,7 @@ end
 local function createCompatTab(options)
 	options = options or {}
 	local tabName = options.Title or options.Name or "Settings"
-	local tab = Window:AddTab({ Name = tabName, Icon = options.Icon or uiIcons[tabName] })
+	local tab = Window:AddTab({ Name = tabName, Icon = options.Icon or uiIcons[tabName], Footer = options.Footer })
 	-- CWUI 3+: the tab takes the controls itself, so it does not open on one closed section named like the tab.
 	if type(tab.AddToggle) == "function" then return wrapSection(tab) end
 	return wrapSection(tab:AddSection({ Name = tabName, Open = false }))
@@ -4879,20 +4931,19 @@ guarded("Cursors", function()
 			if CW.reloadCursor then CW.reloadCursor() end
 		end
 
-		local cursorSizeDebounceThread = nil
+		-- Size and colors regenerate the cursor images, so that waits until the slider or picker settles.
+		local reloadThread = nil
+		local function scheduleCursorReload(delay)
+			if reloadThread then task.cancel(reloadThread) end
+			reloadThread = task.delay(delay, function()
+				reloadThread = nil
+				if CW.reloadCursor then CW.reloadCursor() end
+			end)
+		end
 
 		local function applyCursorSize(v)
 			CW.Settings.CURSOR_TARGET_SIZE = v
-
-			if cursorSizeDebounceThread then
-				task.cancel(cursorSizeDebounceThread)
-				cursorSizeDebounceThread = nil
-			end
-
-			cursorSizeDebounceThread = task.delay(2, function()
-				cursorSizeDebounceThread = nil
-				if CW.reloadCursor then CW.reloadCursor() end
-			end)
+			scheduleCursorReload(2)
 		end
 
 		CursorGallery = CursorSection:Gallery({
@@ -4915,6 +4966,26 @@ guarded("Cursors", function()
 			Suffix = "px",
 			Callback = applyCursorSize,
 		})
+
+		CursorSection:Toggle({
+			Title = "Team Check",
+			Default = CW.Settings.CURSOR_TEAM_CHECK,
+			Callback = function(on)
+				CW.Settings.CURSOR_TEAM_CHECK = on
+				CW.State.lastTarget = nil -- the cursor loop re-checks what is under the mouse right away
+			end,
+		})
+		for _, entry in ipairs({ { "Enemy Color", "CURSOR_ENEMY_COLOR" }, { "Teammate Color", "CURSOR_TEAM_COLOR" } }) do
+			local key = entry[2]
+			CursorSection:Colorpicker({ -- nil on an old CWUI without the picker: the colors keep their defaults
+				Title = entry[1],
+				Default = CW.Settings[key],
+				Callback = function(color)
+					CW.Settings[key] = color
+					scheduleCursorReload(1)
+				end,
+			})
+		end
 	end)
 
 	-- Hitmarkers: the library, then all the switches together, then all the sliders together.
@@ -6983,7 +7054,112 @@ end
 -- Settings tab (created last so it is also the last tab)
 ------------------------------------------------------------------------------
 guarded("Settings", function()
-	local SettingsTab = createCompatTab({ Title = "Settings" })
+	-- Opened by the Settings button next to Discord (on an old CWUI it is a normal tab in the sidebar).
+	local SettingsTab = createCompatTab({ Title = "Settings", Footer = "Settings" })
+
+	-- Interface: the UI's colors, transparency and background image. Changes show at once and are saved.
+	guarded("Interface", function()
+		if not canTheme then return end
+		local Interface = SettingsTab:AddSubSection("Interface", true)
+		local look = CW.Settings.UI_THEME
+		local current = CWUI.GetTheme()
+		local pickers, sliders = {}, {}
+
+		for _, entry in ipairs({
+			{ "Highlight Color", "Accent" }, { "Text Color", "Text" }, { "Background Color", "Background" },
+			{ "Sidebar Color", "Sidebar" }, { "Panel Color", "Panel" },
+		}) do
+			local key = entry[2]
+			pickers[key] = Interface:Colorpicker({
+				Title = entry[1],
+				Default = current[key],
+				Callback = function(color)
+					look[key] = color:ToHex()
+					CWUI.SetTheme({ [key] = color })
+				end,
+			})
+		end
+		for _, entry in ipairs({ { "Background Transparency", "BackgroundTransparency" }, { "Panel Transparency", "PanelTransparency" } }) do
+			local key = entry[2]
+			sliders[key] = Interface:Slider({
+				Title = entry[1], Min = 0, Max = 1, Decimal = 2, Default = current[key],
+				Callback = function(v)
+					look[key] = v
+					CWUI.SetTheme({ [key] = v })
+				end,
+			})
+		end
+
+		local imageRow
+		if canBackdrop then
+			-- A Roblox image ID (or link) is checked before use; anything else is a file in the workspace.
+			local function applyImage(source, row)
+				local id = CW.CustomIds.parse(source)
+				if id then
+					row:Flash(1, "Checking", 6)
+					checkCustomAsset("rbxassetid://" .. id, "Image", function(loaded)
+						if loaded and Window:SetBackgroundImage("rbxassetid://" .. id) then
+							look.Image = "rbxassetid://" .. id
+							scheduleSave()
+							row:Flash(1, "Applied")
+						else
+							row:Flash(1, "Invalid")
+						end
+					end)
+					return
+				end
+				local found, exists = pcall(function() return isfile(source) end)
+				if found and exists and Window:SetBackgroundImage(source) then
+					look.Image = source
+					scheduleSave()
+					row:Flash(1, "Applied")
+				else
+					row:Flash(1, "Not found")
+				end
+			end
+			imageRow = Interface:InputRow({
+				Fields = { { Key = "image", Placeholder = "Background image: ID or workspace file", Default = look.Image } },
+				Buttons = {
+					{ Text = "Apply", Callback = function(values, row)
+						local source = (values.image or ""):match("^%s*(.-)%s*$")
+						if source == "" then row:Flash(1, "Empty") return end
+						applyImage(source, row)
+					end },
+					{ Text = "Clear", Callback = function(_, row)
+						Window:SetBackgroundImage(nil)
+						look.Image = nil
+						row:Clear()
+						scheduleSave()
+					end },
+				},
+			})
+			sliders.ImageTransparency = Interface:Slider({
+				Title = "Image Transparency", Min = 0, Max = 1, Decimal = 2,
+				Default = tonumber(look.ImageTransparency) or 0.5,
+				Callback = function(v)
+					look.ImageTransparency = v
+					Window:SetBackgroundImageTransparency(v)
+				end,
+			})
+		end
+
+		Interface:Button({
+			Title = "Reset Interface",
+			Callback = function()
+				table.clear(look)
+				CWUI.ResetTheme()
+				local defaults = CWUI.GetTheme()
+				for key, picker in pairs(pickers) do picker:Set(defaults[key], true) end
+				for key, slider in pairs(sliders) do slider:Set(defaults[key] or 0.5, true) end
+				if canBackdrop then
+					Window:SetBackgroundImage(nil)
+					Window:SetBackgroundImageTransparency(0.5)
+					if imageRow then imageRow:Clear() end
+				end
+				scheduleSave()
+			end,
+		})
+	end)
 
 	SettingsTab:Button({
 		Title = "Refresh Asset Library",
@@ -7045,6 +7221,8 @@ guarded("Settings", function()
 		end
 		saveColor("TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX")
 		saveColor("TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX")
+		saveColor("CURSOR_ENEMY_COLOR", "CURSOR_ENEMY_COLOR_HEX")
+		saveColor("CURSOR_TEAM_COLOR", "CURSOR_TEAM_COLOR_HEX")
 
 		local out = {
 			schemaVersion = 3,
