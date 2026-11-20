@@ -1815,8 +1815,16 @@ local function syncLayerLabels(labels, layers, parent, zBase)
 		if label.Image ~= asset then label.Image = asset end
 		label.ImageTransparency = layer.Transparency
 		label.ScaleType = SCALE_TYPES[layer.Scale]
-		label.BackgroundColor3 = layer.Fill
-		label.BackgroundTransparency = layer.FillTransparency
+		-- O preenchimento tinge a imagem (por trás dela não aparecia: a imagem cobre o fundo); sem imagem,
+		-- a camada é só a cor. Transparência 1 = sem cor.
+		if layer.Image then
+			label.ImageColor3 = WHITE:Lerp(layer.Fill, 1 - layer.FillTransparency)
+			label.BackgroundTransparency = 1
+		else
+			label.ImageColor3 = WHITE
+			label.BackgroundColor3 = layer.Fill
+			label.BackgroundTransparency = layer.FillTransparency
+		end
 		label.ZIndex = zBase + layer.rank
 	end
 	for i = #layers + 1, #labels do
@@ -2191,7 +2199,8 @@ function Window:Toggle() self._shell.Visible = not self._shell.Visible end
 --   * nada é lido de atributos a cada quadro, e nada é escrito quando a câmera não andou;
 --   * a ordem de desenho segue a profundidade (a referência prometia isso, mas desenhava na ordem de criação).
 -- Camada: { Image = ID/caminho, X, Y, W, H (frações da janela), Depth = 0..10, Transparency = 0..1,
---           Scale = "Crop" | "Fit" | "Stretch", Fill = Color3, FillTransparency = 0..1 }
+--           Scale = "Crop" | "Fit" | "Stretch", Fill = Color3 (tinge a imagem; sem imagem, preenche),
+--           FillTransparency = 0..1 (1 = sem cor) }
 -- Profundidade 0 fica parada; quanto maior, mais anda e mais à frente é desenhada.
 local PARALLAX_SPEED = 5 -- quão rápido a câmera alcança o mouse (o mesmo valor da referência)
 CW.MaxLayers = MAX_LAYERS
