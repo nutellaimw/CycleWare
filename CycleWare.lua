@@ -271,6 +271,8 @@ CW.Settings.UI_THEME = {}
 -- flat values. Each layer: Image (Roblox ID or workspace path), X, Y, W, H (fractions of the window), Depth,
 -- Transparency, Scale, Fill (hex), FillTransparency.
 CW.Settings.UI_LAYERS = ""
+-- Per-asset settings (see CW.Profiles below): { [category] = { [asset's library path] = { [setting] = value } } }.
+CW.Settings.ASSET_PROFILES = {}
 
 -- Snapshot of the defaults, taken before any saved value is applied. The save routine
 -- writes only the settings whose value differs from these.
@@ -374,11 +376,89 @@ if settingsFileExists then
 	end
 end
 
--- Colors are saved as hex (Color3 can't go into JSON). Read here, before the cursor is generated.
+-- Cursor colors saved by an older build as hex (Color3 can't go into JSON). They are only read once, to
+-- become the profile of the cursor in use (CW.Profiles.start).
 for _, key in ipairs({ "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR" }) do
 	local hex = CW._SavedSettings[key .. "_HEX"]
 	local ok, color = pcall(Color3.fromHex, type(hex) == "string" and hex or "")
 	if ok and typeof(color) == "Color3" then CW.Settings[key] = color end
+end
+
+--// Per-asset settings -------------------------------------------------------------------------------------
+-- Each cursor, hitmarker and hit sound keeps its own settings, saved in ASSET_PROFILES under its category and
+-- its library path ("Cursors/arrow.png", or "id:123" for a custom ID). CW.Settings.<key> always holds the values
+-- of the asset in use, so the code that draws the cursor or the hitmarker reads them as before. Choosing another
+-- asset loads its profile, or the defaults when it has none; a profile only keeps what differs from the defaults.
+CW.Profiles = {
+	keys = {
+		Cursors = { "CURSOR_TARGET_SIZE", "CURSOR_TEAM_CHECK", "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR" },
+		Hitmarkers = {
+			"HITMARKER_SIZE", "HITMARKER_RANDOM_ROTATION", "HITMARKER_FOLLOW_MOUSE", "HITMARKER_FADEOUT",
+			"HITMARKER_VISIBLE_DURATION", "HITMARKER_FADEOUT_DURATION",
+		},
+		HitSounds = { "SOUND_VOLUME" },
+	},
+	current = {},   -- [category] = library path of the asset in use
+	listeners = {}, -- [category] = function() the UI shows the values again
+	isKey = {},     -- these settings are saved per asset, never in the shared list
+}
+for _, keys in pairs(CW.Profiles.keys) do
+	for _, key in ipairs(keys) do CW.Profiles.isKey[key] = true end
+end
+
+local function differsFromDefault(key, value)
+	local default = CW.Defaults[key]
+	if typeof(value) == "Color3" then return typeof(default) ~= "Color3" or value:ToHex() ~= default:ToHex() end
+	if type(value) == "number" and type(default) == "number" then return math.abs(value - default) > 1e-6 end
+	return value ~= default
+end
+
+-- Makes `relative` the asset in use: its saved values (or the defaults) go into CW.Settings.
+function CW.Profiles.use(category, relative)
+	CW.Profiles.current[category] = relative
+	local all = CW.Settings.ASSET_PROFILES[category]
+	local profile = relative and type(all) == "table" and all[relative] or nil
+	for _, key in ipairs(CW.Profiles.keys[category]) do
+		local default, saved = CW.Defaults[key], nil
+		if type(profile) == "table" then saved = profile[key] end -- not `and/or`: a saved false must stay false
+		local value = default
+		if typeof(default) == "Color3" then
+			local ok, color = pcall(Color3.fromHex, type(saved) == "string" and saved or "")
+			if ok and typeof(color) == "Color3" then value = color end
+		elseif type(saved) == type(default) then
+			value = saved
+		end
+		CW.Settings[key] = value
+	end
+	local listener = CW.Profiles.listeners[category]
+	if listener then pcall(listener) end
+end
+
+-- Saves the values in CW.Settings as the profile of the asset in use. Called by every control of that asset.
+function CW.Profiles.store(category)
+	local relative = CW.Profiles.current[category]
+	if not relative then return end
+	local profiles = CW.Settings.ASSET_PROFILES
+	local profile = {}
+	for _, key in ipairs(CW.Profiles.keys[category]) do
+		local value = CW.Settings[key]
+		if differsFromDefault(key, value) then
+			profile[key] = typeof(value) == "Color3" and value:ToHex() or value
+		end
+	end
+	profiles[category] = type(profiles[category]) == "table" and profiles[category] or {}
+	profiles[category][relative] = next(profile) and profile or nil
+	if next(profiles[category]) == nil then profiles[category] = nil end
+end
+
+-- First use of a category: settings saved by an older build (shared by every asset) become the profile of the
+-- asset in use, so nothing the player set is lost. Then that asset's profile is loaded as usual.
+function CW.Profiles.start(category, relative)
+	if CW.Settings.ASSET_PROFILES[category] == nil and relative then
+		CW.Profiles.current[category] = relative
+		CW.Profiles.store(category)
+	end
+	CW.Profiles.use(category, relative)
 end
 
 do
@@ -1541,6 +1621,10 @@ end
 CW.Paths.CURSOR_FILE = CW.Library.selectedPath("Cursors")
 CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
 CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
+-- Before the cursor and the hitmarker are built: they read the settings of the assets in use.
+CW.Profiles.start("Cursors", CW.Library.relative(CW.Paths.CURSOR_FILE))
+CW.Profiles.start("Hitmarkers", CW.Library.relative(CW.Paths.HITMARKER_FILE))
+CW.Profiles.start("HitSounds", CW.Library.relative(CW.Paths.SOUND_FILE))
 end)
 
 runModule("PNG", function()
@@ -3511,6 +3595,11 @@ function CW.reloadCoreAssets()
 	CW.Paths.CURSOR_FILE = CW.Library.selectedPath("Cursors")
 	CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
 	CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
+	-- The sync (or an edited custom ID) can change which asset is in use: its own settings come with it.
+	for category, path in pairs({ Cursors = CW.Paths.CURSOR_FILE, Hitmarkers = CW.Paths.HITMARKER_FILE, HitSounds = CW.Paths.SOUND_FILE }) do
+		local relative = CW.Library.relative(path)
+		if relative ~= CW.Profiles.current[category] then CW.Profiles.use(category, relative) end
+	end
 
 	-- The cursor goes last: generating it yields for a while (PNG codec), and it must not
 	-- delay the textures and the hit sound.
@@ -3711,7 +3800,7 @@ local function withSave(callback)
 end
 
 local function wrapSection(section)
-	local adapter = {}
+	local adapter = { Instance = section.Instance } -- CWUI 3+: hide or show the whole section
 	function adapter:Toggle(control)
 		local o = mapControlOptions(control)
 		o.Callback = withSave(o.Callback)
@@ -3853,11 +3942,14 @@ local function hitSoundLabel(value)
 	return nil
 end
 
+-- Choosing a hit sound brings its own volume (CW.Profiles).
 local function applySoundFile(value)
 	local path = hitSoundPath(value)
 	if not path then return end
 	CW.Paths.SOUND_FILE = path
-	CW.Library.setSelection("HitSounds", nil, CW.Library.relative(path))
+	local relative = CW.Library.relative(path)
+	CW.Library.setSelection("HitSounds", nil, relative)
+	CW.Profiles.use("HitSounds", relative)
 	if CW.reloadSoundAsset then CW.reloadSoundAsset() end
 end
 
@@ -3906,7 +3998,7 @@ end
 --   Category    = "WeaponSounds" | "ReloadSounds"   library folder: <Category>/<Weapon>/<file>
 --   SoundName   = "ShootSound" | "ReloadSound"      the Sound instance the game plays
 --   OverridesKey, EnabledKey, OthersKey, VolumeKey  saved settings (names unchanged for the shoot sounds);
---                                                   VolumeKey holds { [gun] = volume multiplier }
+--                                                   VolumeKey holds { ["<gun>|<sound>"] = volume multiplier }
 --   ConfigKey                                       optional CW_CONFIG table: { ["AK-47"] = "WeaponSounds/AK-47/x.mp3" }
 --   BaseVolume(originalId, player)                  optional: volume the game itself plays this sound at
 -- }
@@ -3917,25 +4009,35 @@ local function createSoundChanger(spec)
 	-- Off by default: nothing changes in the game until the player turns it on.
 	if settings[spec.EnabledKey] == nil then settings[spec.EnabledKey] = _cfg[spec.EnabledKey] == true end
 	if settings[spec.OthersKey] == nil then settings[spec.OthersKey] = _cfg[spec.OthersKey] == true end
-	-- Volume multiplier per gun, relative to the game's own volume (1 = untouched). Only the guns that
-	-- differ from 1 are stored: { ["AK-47"] = 0.5 }. It applies to the game's own sound as well as to a
-	-- replacement file. An older save kept one number for every gun: it becomes that number for each gun.
+	-- Volume multiplier per gun AND per sound, relative to the game's own volume (1 = untouched): each sound a
+	-- gun can use keeps its own volume, so switching the sound brings back the volume it had. Stored as
+	-- { ["AK-47|Default"] = 0.5, ["AK-47|WeaponSounds/AK-47/x.mp3"] = 1.2 }, only when different from 1.
+	-- Older saves kept one volume per gun ({ ["AK-47"] = 0.5 }) or one for every gun (a number): that value
+	-- becomes the volume of the sound each gun uses now.
+	local function volumeKey(weapon, relative)
+		return weapon .. "|" .. (relative or WEAPON_SOUND_DEFAULT)
+	end
 	local volumes = {}
 	local migratedVolume = false
 	do
 		local saved = settings[spec.VolumeKey]
+		local choices = settings[spec.OverridesKey]
+		local function keep(key, value)
+			local number = tonumber(value)
+			if number and math.abs(math.clamp(number, 0, 2) - 1) > 1e-6 then volumes[key] = math.clamp(number, 0, 2) end
+		end
 		if type(saved) == "number" then
-			local all = math.clamp(saved, 0, 2)
-			if math.abs(all - 1) > 1e-6 then
-				for _, weapon in ipairs(soundWeaponNames()) do volumes[weapon] = all end
-			end
+			for _, weapon in ipairs(soundWeaponNames()) do keep(volumeKey(weapon, choices[weapon]), saved) end
 			migratedVolume = true
 		elseif type(saved) == "table" then
-			for weapon, value in pairs(saved) do
-				local number = tonumber(value)
-				if type(weapon) == "string" and number then
-					number = math.clamp(number, 0, 2)
-					if math.abs(number - 1) > 1e-6 then volumes[weapon] = number end
+			for key, value in pairs(saved) do
+				if type(key) == "string" then
+					if key:find("|", 1, true) then
+						keep(key, value)
+					else
+						keep(volumeKey(key, choices[key]), value)
+						migratedVolume = true
+					end
 				end
 			end
 		end
@@ -4028,8 +4130,9 @@ local function createSoundChanger(spec)
 	changer.refreshCatalog()
 
 	--// volume ---------------------------------------------------------------------------
+	-- Volume of the sound the gun uses now.
 	local function volumeOf(weapon)
-		local value = tonumber(volumes[weapon])
+		local value = tonumber(volumes[volumeKey(weapon, overrides[weapon])])
 		if not value then return 1 end
 		return math.clamp(value, 0, 2)
 	end
@@ -4218,13 +4321,11 @@ local function createSoundChanger(spec)
 		end
 	end
 
+	-- Sets the volume of the sound the gun uses now (the other sounds of that gun keep theirs).
 	function changer.setVolume(weapon, value)
 		value = math.clamp(tonumber(value) or 1, 0, 2)
-		if math.abs(value - 1) < 1e-6 then
-			volumes[weapon] = nil
-		else
-			volumes[weapon] = value
-		end
+		local key = volumeKey(weapon, overrides[weapon])
+		volumes[key] = math.abs(value - 1) > 1e-6 and value or nil
 		changer.updateVolumes(weapon)
 	end
 
@@ -4347,6 +4448,10 @@ local function createSoundChanger(spec)
 	-- Moves one gun's choice from one relative path to another (a custom ID that was edited), or clears it.
 	function changer.replaceChoice(weapon, oldRelative, newRelative)
 		if weapon ~= nil and overrides[weapon] == oldRelative then
+			-- The volume goes with the sound (an edited ID keeps it; a removed one leaves nothing behind).
+			local volume = volumes[volumeKey(weapon, oldRelative)]
+			volumes[volumeKey(weapon, oldRelative)] = nil
+			if newRelative then volumes[volumeKey(weapon, newRelative)] = volume end
 			overrides[weapon] = newRelative
 			changer.schedule()
 		end
@@ -4510,8 +4615,8 @@ local function inputRow(section, fields, buttons)
 	return shim
 end
 
--- Edit / Remove live in the header of the asset's own selector (dropdown or gallery), at its right side, and
--- show only while the selected asset is a custom ID. One light loop keeps them in step with the selection.
+-- Add / Edit / Remove live in the header of the asset's own list (dropdown or gallery), next to what they change.
+-- Edit and Remove show only while the selected asset is a custom ID. One light loop keeps them in step.
 local customIdActionUpdaters = {}
 CW.track("customIdActions", game:GetService("RunService").Heartbeat:Connect((function()
 	local elapsed = 0
@@ -4523,23 +4628,43 @@ CW.track("customIdActions", game:GetService("RunService").Heartbeat:Connect((fun
 	end
 end)()))
 
--- Puts Edit / Remove on the controls (or, with an older cached CWUI, as plain buttons under the row).
--- Returns a function(visible) that shows or hides them.
-local function attachActions(section, controls, onEdit, onRemove)
+-- Puts Add (always) and Edit / Remove (when canEdit) in the header of the controls; with an older cached CWUI,
+-- plain buttons under the list. Returns a function(canEdit); it only rebuilds the buttons when that changes.
+local function attachActions(section, controls, onAdd, onEdit, onRemove)
 	local attached = {}
 	for _, control in ipairs(controls or {}) do
-		if type(control) == "table" and type(control.SetActions) == "function" then
-			control:SetActions({ { Text = "Edit", Callback = onEdit }, { Text = "Remove", Callback = onRemove } })
-			table.insert(attached, control)
-		end
+		if type(control) == "table" and type(control.SetActions) == "function" then table.insert(attached, control) end
 	end
 	if #attached == 0 then
+		section:Button({ Title = "Add by ID", Callback = onAdd })
 		section:Button({ Title = "Edit Selected ID", Callback = onEdit })
 		section:Button({ Title = "Remove Selected ID", Callback = onRemove })
 		return function() end
 	end
+	local shown
+	local function update(canEdit)
+		canEdit = canEdit == true
+		if shown == canEdit then return end
+		shown = canEdit
+		local actions = { { Text = "Add", Callback = onAdd } }
+		if canEdit then
+			table.insert(actions, { Text = "Edit", Callback = onEdit })
+			table.insert(actions, { Text = "Remove", Callback = onRemove })
+		end
+		for _, control in ipairs(attached) do
+			pcall(control.SetActions, control, actions)
+			pcall(control.ShowActions, control, true)
+		end
+	end
+	update(false)
+	return update
+end
+
+-- The ID form under a list: hidden until Add or Edit is pressed, hidden again by Cancel or after saving.
+-- (An older cached CWUI has no row Instance: the form then just stays visible.)
+local function formVisibility(row)
 	return function(visible)
-		for _, control in ipairs(attached) do pcall(control.ShowActions, control, visible) end
+		if type(row) == "table" and typeof(row.Instance) == "Instance" then row.Instance.Visible = visible end
 	end
 end
 
@@ -4584,12 +4709,19 @@ local function addCustomIdRow(section, opts)
 			.. (opts.kind == "Audio" and "an audio" or "an image (a Decal ID instead of its Image ID?)") .. "."
 	end
 
-	local row
+	local row, showForm
 	local editingId -- the custom ID being edited; nil while adding
 	local checking = false
 	local function setEditing(id)
 		editingId = id
-		row:SetButtonText(1, id and "Save" or "Add ID")
+		row:SetButtonText(1, id and "Save" or "Add")
+	end
+	-- After a save: the result shows on the button for a moment, then the form closes.
+	local function finish(text)
+		row:Flash(1, text)
+		task.delay(1, function()
+			if not editingId then showForm(false) end
+		end)
 	end
 
 	-- Saves an ID that is known to load (or a new name for one already saved).
@@ -4604,7 +4736,7 @@ local function addCustomIdRow(section, opts)
 			end
 			row:Clear()
 			setEditing(nil)
-			row:Flash(1, oldId and "Saved" or "Added")
+			finish(oldId and "Saved" or "Added")
 			afterChange()
 			return
 		end
@@ -4622,7 +4754,7 @@ local function addCustomIdRow(section, opts)
 		moveChoices(weapon, CW.CustomIds.selectionOf(oldId), CW.CustomIds.selectionOf(newId))
 		row:Clear()
 		setEditing(nil)
-		row:Flash(1, "Saved")
+		finish("Saved")
 		pcall(CW.reloadCoreAssets)
 		afterChange()
 	end
@@ -4661,11 +4793,23 @@ local function addCustomIdRow(section, opts)
 
 	row = inputRow(section, {
 		{ Key = "id", Title = opts.kind .. " ID", Placeholder = opts.kind .. " ID or link", Weight = 0.55 },
-		{ Key = "name", Title = "Name (optional)", Placeholder = "Name", Weight = 0.45 },
+		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
 	}, {
-		{ Text = "Add ID", Title = "Add ID", Callback = function(values) save(values) end },
+		{ Text = "Add", Title = "Add ID", Callback = function(values) save(values) end },
+		{ Text = "Cancel", Title = "Cancel", Callback = function()
+			row:Clear()
+			setEditing(nil)
+			showForm(false)
+		end },
 	})
+	showForm = formVisibility(row)
+	showForm(false)
 
+	local function add()
+		row:Clear()
+		setEditing(nil)
+		showForm(true)
+	end
 	local function edit()
 		local id = selectedId()
 		local entry = id and CW.CustomIds.get(category, currentWeapon(), id)
@@ -4673,6 +4817,7 @@ local function addCustomIdRow(section, opts)
 		row:Set("id", entry.Id)
 		row:Set("name", entry.Name)
 		setEditing(entry.Id)
+		showForm(true)
 	end
 	local function remove()
 		local weapon = currentWeapon()
@@ -4682,12 +4827,12 @@ local function addCustomIdRow(section, opts)
 		if editingId == id then
 			row:Clear()
 			setEditing(nil)
+			showForm(false)
 		end
-		row:Flash(1, "Removed")
 		pcall(CW.reloadCoreAssets)
 		afterChange()
 	end
-	local showActions = attachActions(section, opts.controls, edit, remove)
+	local showActions = attachActions(section, opts.controls, add, edit, remove)
 	table.insert(customIdActionUpdaters, function() showActions(selectedId() ~= nil) end)
 	return row
 end
@@ -4760,7 +4905,7 @@ end
 
 local function addCursorIdRow(section, controls)
 	local busy = false
-	local row
+	local row, showForm
 	local editing -- the entry being edited; nil while adding
 
 	local function afterChange()
@@ -4784,7 +4929,14 @@ local function addCursorIdRow(section, controls)
 	end
 	local function setEditing(entry)
 		editing = entry
-		row:SetButtonText(1, entry and "Save" or "Add ID")
+		row:SetButtonText(1, entry and "Save" or "Add")
+	end
+	-- After a save: the result shows on the button for a moment, then the form closes.
+	local function finish(text)
+		row:Flash(1, text)
+		task.delay(1, function()
+			if not editing and not busy then showForm(false) end
+		end)
 	end
 	-- After a rename or a new ID: the old file goes, the entry and every choice point at the new file.
 	local function replaceEntry(old, id, name, relative)
@@ -4842,7 +4994,7 @@ local function addCursorIdRow(section, controls)
 			end
 			row:Clear()
 			setEditing(nil)
-			row:Flash(1, "Saved")
+			finish("Saved")
 			afterChange()
 			pcall(CW.reloadCoreAssets)
 			return
@@ -4874,7 +5026,7 @@ local function addCursorIdRow(section, controls)
 			if ok then
 				row:Clear()
 				setEditing(nil)
-				row:Flash(1, old and "Saved" or "Added")
+				finish(old and "Saved" or "Added")
 				CW.Log("Cursor ID " .. id .. " saved as " .. relative)
 				afterChange()
 				if old then pcall(CW.reloadCoreAssets) end
@@ -4887,17 +5039,31 @@ local function addCursorIdRow(section, controls)
 
 	row = inputRow(section, {
 		{ Key = "id", Title = "Image or Decal ID", Placeholder = "Image/Decal ID or link", Weight = 0.55 },
-		{ Key = "name", Title = "Name (optional)", Placeholder = "Name", Weight = 0.45 },
+		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
 	}, {
-		{ Text = "Add ID", Title = "Add ID", Callback = function(values) save(values) end },
+		{ Text = "Add", Title = "Add ID", Callback = function(values) save(values) end },
+		{ Text = "Cancel", Title = "Cancel", Callback = function()
+			if busy then return end
+			row:Clear()
+			setEditing(nil)
+			showForm(false)
+		end },
 	})
+	showForm = formVisibility(row)
+	showForm(false)
 
+	local function add()
+		row:Clear()
+		setEditing(nil)
+		showForm(true)
+	end
 	local function edit()
 		local entry = selectedEntry()
 		if not entry then return end
 		row:Set("id", entry.Id)
 		row:Set("name", entry.Name)
 		setEditing(entry)
+		showForm(true)
 	end
 	-- Removes the cursor in use (only cursors added by ID: the others never show the button).
 	local function remove()
@@ -4910,12 +5076,12 @@ local function addCursorIdRow(section, controls)
 		if editing and editing.Id == entry.Id then
 			row:Clear()
 			setEditing(nil)
+			showForm(false)
 		end
-		row:Flash(1, "Removed")
 		afterChange()
 		pcall(CW.reloadCoreAssets)
 	end
-	local showActions = attachActions(section, controls, edit, remove)
+	local showActions = attachActions(section, controls, add, edit, remove)
 	table.insert(customIdActionUpdaters, function() showActions(selectedEntry() ~= nil) end)
 	return row
 end
@@ -4930,6 +5096,24 @@ guarded("Cursors", function()
 	local CursorSection = wrapSection(CursorsTab:AddSection({ Name = "Cursors", Open = false }))
 	local HitSoundSection = wrapSection(CursorsTab:AddSection({ Name = "Hit Sound", Open = false }))
 	local HitmarkerSection = wrapSection(CursorsTab:AddSection({ Name = "Hitmarkers", Open = false }))
+
+	-- Name shown for an asset: a custom ID's name, or the file name without folder and extension.
+	local function assetName(category, relative)
+		if type(relative) ~= "string" then return "none" end
+		local id = relative:match("^id:(%d+)$")
+		if id then
+			local entry = CW.CustomIds.get(category, nil, id)
+			return entry and entry.Name or id
+		end
+		return ((relative:match("([^/]+)$") or relative):gsub("%.%w+$", ""))
+	end
+	-- "Settings for <asset>": tells which asset the controls under it belong to.
+	local function ownerLabel(section, noun)
+		local label = section:AddLabel("")
+		return function(category)
+			label:Set("Settings for " .. assetName(category, CW.Profiles.current[category]) .. ". Each " .. noun .. " keeps its own.")
+		end
+	end
 
 	guarded("Hit Sound", function()
 		HitSoundDropdown = HitSoundSection:Dropdown({
@@ -4946,26 +5130,27 @@ guarded("Cursors", function()
 			})
 		end)
 
-		HitSoundSection:Slider({
-			Title = "Hit Sound Volume",
+		local showOwner = ownerLabel(HitSoundSection, "sound")
+		local volume = HitSoundSection:Slider({
+			Title = "Volume",
 			Min = 0,
 			Max = 2,
 			Default = CW.Settings.SOUND_VOLUME,
 			Decimal = 2,
 			Suffix = "x",
-			Callback = function(v) CW.Settings.SOUND_VOLUME = v end,
+			Callback = function(v)
+				CW.Settings.SOUND_VOLUME = v
+				CW.Profiles.store("HitSounds")
+			end,
 		})
-
+		CW.Profiles.listeners.HitSounds = function()
+			volume:Set(CW.Settings.SOUND_VOLUME, true)
+			showOwner("HitSounds")
+		end
+		showOwner("HitSounds")
 	end)
 
 	guarded("Cursor", function()
-		local function applyCursorFile(value)
-			if type(value) ~= "table" or type(value.Path) ~= "string" then return end
-			CW.Paths.CURSOR_FILE = value.Path
-			CW.Library.setSelection("Cursors", nil, CW.Library.relative(value.Path))
-			if CW.reloadCursor then CW.reloadCursor() end
-		end
-
 		-- Size and colors regenerate the cursor images, so that waits until the slider or picker settles.
 		local reloadThread = nil
 		local function scheduleCursorReload(delay)
@@ -4976,9 +5161,22 @@ guarded("Cursors", function()
 			end)
 		end
 
-		local function applyCursorSize(v)
-			CW.Settings.CURSOR_TARGET_SIZE = v
-			scheduleCursorReload(2)
+		-- Choosing a cursor brings its own settings (CW.Profiles), then the cursor is built with them.
+		local function applyCursorFile(value)
+			if type(value) ~= "table" or type(value.Path) ~= "string" then return end
+			CW.Paths.CURSOR_FILE = value.Path
+			local relative = CW.Library.relative(value.Path)
+			CW.Library.setSelection("Cursors", nil, relative)
+			CW.Profiles.use("Cursors", relative)
+			if reloadThread then task.cancel(reloadThread) reloadThread = nil end
+			if CW.reloadCursor then CW.reloadCursor() end
+		end
+
+		-- Every control below changes the cursor in use and saves it in that cursor's profile.
+		local function change(key, value, reloadDelay)
+			CW.Settings[key] = value
+			CW.Profiles.store("Cursors")
+			if reloadDelay then scheduleCursorReload(reloadDelay) end
 		end
 
 		CursorGallery = CursorSection:Gallery({
@@ -4993,58 +5191,77 @@ guarded("Cursors", function()
 
 		guarded("Cursor Custom IDs", function() addCursorIdRow(CursorSection, { CursorGallery }) end)
 
-		CursorSection:Slider({
+		local showOwner = ownerLabel(CursorSection, "cursor")
+		local controls = {}
+		controls.CURSOR_TARGET_SIZE = CursorSection:Slider({
 			Title = "Cursor Size",
 			Min = 16,
 			Max = 256,
 			Default = CW.Settings.CURSOR_TARGET_SIZE,
 			Suffix = "px",
-			Callback = applyCursorSize,
+			Callback = function(v) change("CURSOR_TARGET_SIZE", v, 2) end,
 		})
-
-		local teamToggle = CursorSection:Toggle({
+		controls.CURSOR_TEAM_CHECK = CursorSection:Toggle({
 			Title = "Team Check",
 			Default = CW.Settings.CURSOR_TEAM_CHECK,
 			Callback = function(on)
-				CW.Settings.CURSOR_TEAM_CHECK = on
+				change("CURSOR_TEAM_CHECK", on)
 				CW.State.lastTarget = nil -- the cursor loop re-checks what is under the mouse right away
 			end,
 		})
-		local teamPickers = {}
+
+		-- The colors sit in their own drawer: they matter only while Team Check is on.
+		local Colors = CursorSection:AddSubSection("Team Check Colors", false)
+		Colors:AddLabel("Over another player, the cursor takes one of these colors.")
 		for _, entry in ipairs({ { "Enemy Color", "CURSOR_ENEMY_COLOR" }, { "Teammate Color", "CURSOR_TEAM_COLOR" } }) do
 			local key = entry[2]
-			teamPickers[key] = CursorSection:Colorpicker({ -- nil on an old CWUI: the colors keep their defaults
+			controls[key] = Colors:Colorpicker({ -- nil on an old CWUI: the colors keep their defaults
 				Title = entry[1],
 				Default = CW.Settings[key],
-				Callback = function(color)
-					CW.Settings[key] = color
-					scheduleCursorReload(1)
-				end,
+				Callback = function(color) change(key, color, 1) end,
 			})
 		end
-		CursorSection:Button({
+		Colors:Button({
 			Title = "Reset Team Check",
 			Callback = function()
-				CW.Settings.CURSOR_TEAM_CHECK = CW.Defaults.CURSOR_TEAM_CHECK
-				teamToggle:Set(CW.Defaults.CURSOR_TEAM_CHECK, true)
-				for key, picker in pairs(teamPickers) do
+				for _, key in ipairs({ "CURSOR_TEAM_CHECK", "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR" }) do
 					CW.Settings[key] = CW.Defaults[key]
-					picker:Set(CW.Defaults[key], true)
+					if controls[key] then controls[key]:Set(CW.Defaults[key], true) end
 				end
+				CW.Profiles.store("Cursors")
 				CW.State.lastTarget = nil
 				scheduleCursorReload(0.1)
 				scheduleSave()
 			end,
 		})
+
+		CW.Profiles.listeners.Cursors = function()
+			for key, control in pairs(controls) do control:Set(CW.Settings[key], true) end
+			CW.State.lastTarget = nil
+			showOwner("Cursors")
+		end
+		showOwner("Cursors")
 	end)
 
-	-- Hitmarkers: the library, then all the switches together, then all the sliders together.
+	-- Hitmarkers: the library, whose hitmarker the settings below belong to, then the size, then two drawers.
 	guarded("Hitmarker", function()
 		local function applyHitmarkerFile(value)
 			if type(value) ~= "table" or type(value.Path) ~= "string" then return end
 			CW.Paths.HITMARKER_FILE = value.Path
-			CW.Library.setSelection("Hitmarkers", nil, CW.Library.relative(value.Path))
+			local relative = CW.Library.relative(value.Path)
+			CW.Library.setSelection("Hitmarkers", nil, relative)
+			CW.Profiles.use("Hitmarkers", relative)
 			if CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
+		end
+
+		local function applySize()
+			local size = CW.Settings.HITMARKER_SIZE
+			if CW.HMTemplate then CW.HMTemplate.Size = UDim2.new(0, size, 0, size) end
+		end
+		local function change(key, value)
+			CW.Settings[key] = value
+			CW.Profiles.store("Hitmarkers")
+			if key == "HITMARKER_SIZE" then applySize() end
 		end
 
 		HitmarkerGallery = HitmarkerSection:Gallery({
@@ -5064,57 +5281,45 @@ guarded("Cursors", function()
 			})
 		end)
 
-		HitmarkerSection:Toggle({
-			Title = "Random Rotation",
-			Default = CW.Settings.HITMARKER_RANDOM_ROTATION,
-			Callback = function(s) CW.Settings.HITMARKER_RANDOM_ROTATION = s end,
+		local showOwner = ownerLabel(HitmarkerSection, "hitmarker")
+		local controls = {}
+		controls.HITMARKER_SIZE = HitmarkerSection:Slider({
+			Title = "Hitmarker Size", Min = 8, Max = 200, Default = CW.Settings.HITMARKER_SIZE, Suffix = "px",
+			Callback = function(v) change("HITMARKER_SIZE", v) end,
 		})
 
-		HitmarkerSection:Toggle({
-			Title = "Follow Mouse",
-			Default = CW.Settings.HITMARKER_FOLLOW_MOUSE,
-			Callback = function(s) CW.Settings.HITMARKER_FOLLOW_MOUSE = s end,
+		local Behavior = HitmarkerSection:AddSubSection("Behavior", false)
+		controls.HITMARKER_RANDOM_ROTATION = Behavior:Toggle({
+			Title = "Random Rotation", Default = CW.Settings.HITMARKER_RANDOM_ROTATION,
+			Callback = function(on) change("HITMARKER_RANDOM_ROTATION", on) end,
+		})
+		controls.HITMARKER_FOLLOW_MOUSE = Behavior:Toggle({
+			Title = "Follow Mouse", Default = CW.Settings.HITMARKER_FOLLOW_MOUSE,
+			Callback = function(on) change("HITMARKER_FOLLOW_MOUSE", on) end,
 		})
 
-		HitmarkerSection:Toggle({
-			Title = "Fadeout",
-			Default = CW.Settings.HITMARKER_FADEOUT,
-			Callback = function(s) CW.Settings.HITMARKER_FADEOUT = s end,
-		})
-
-		HitmarkerSection:Slider({
-			Title = "Hitmarker Size",
-			Min = 8,
-			Max = 200,
-			Default = CW.Settings.HITMARKER_SIZE,
-			Suffix = "px",
-			Callback = function(v)
-				CW.Settings.HITMARKER_SIZE = v
-				if CW.HMTemplate then
-					CW.HMTemplate.Size = UDim2.new(0, v, 0, v)
-				end
-			end,
-		})
-
-		HitmarkerSection:Slider({
-			Title = "Visible Duration",
-			Min = 0,
-			Max = 1,
+		local Timing = HitmarkerSection:AddSubSection("Timing", false)
+		controls.HITMARKER_VISIBLE_DURATION = Timing:Slider({
+			Title = "Visible Duration", Min = 0, Max = 1, Decimal = 2, Suffix = "s",
 			Default = CW.Settings.HITMARKER_VISIBLE_DURATION,
-			Decimal = 2,
-			Suffix = "s",
-			Callback = function(v) CW.Settings.HITMARKER_VISIBLE_DURATION = v end,
+			Callback = function(v) change("HITMARKER_VISIBLE_DURATION", v) end,
+		})
+		controls.HITMARKER_FADEOUT = Timing:Toggle({
+			Title = "Fadeout", Default = CW.Settings.HITMARKER_FADEOUT,
+			Callback = function(on) change("HITMARKER_FADEOUT", on) end,
+		})
+		controls.HITMARKER_FADEOUT_DURATION = Timing:Slider({
+			Title = "Fadeout Duration", Min = 0, Max = 1, Decimal = 2, Suffix = "s",
+			Default = CW.Settings.HITMARKER_FADEOUT_DURATION,
+			Callback = function(v) change("HITMARKER_FADEOUT_DURATION", v) end,
 		})
 
-		HitmarkerSection:Slider({
-			Title = "Fadeout Duration",
-			Min = 0,
-			Max = 1,
-			Default = CW.Settings.HITMARKER_FADEOUT_DURATION,
-			Decimal = 2,
-			Suffix = "s",
-			Callback = function(v) CW.Settings.HITMARKER_FADEOUT_DURATION = v end,
-		})
+		CW.Profiles.listeners.Hitmarkers = function()
+			for key, control in pairs(controls) do control:Set(CW.Settings[key], true) end
+			applySize()
+			showOwner("Hitmarkers")
+		end
+		showOwner("Hitmarkers")
 	end)
 end)
 
@@ -5139,7 +5344,7 @@ guarded("Guns", function()
 		local building = true -- the controls' callbacks while the section is built are not the player's
 
 		local enableToggle = section:Toggle({
-			Title = "Enable " .. label .. " Sound Overrides",
+			Title = "Enable Custom " .. label .. " Sounds",
 			Default = CW.Settings[spec.EnabledKey] == true,
 			Callback = function(enabled)
 				CW.Settings[spec.EnabledKey] = enabled == true
@@ -5198,6 +5403,7 @@ guarded("Guns", function()
 			local target = drawers and section:AddSubSection(weapon, false) or section
 			local prefix = drawers and "" or (weapon .. " ")
 			local entry = changer.catalog[weapon]
+			local volume
 			local dropdown = target:Dropdown({
 				Title = prefix .. label .. " Sound",
 				Options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
@@ -5205,12 +5411,13 @@ guarded("Guns", function()
 				Callback = function(value)
 					if value ~= WEAPON_SOUND_DEFAULT then ensureEnabled() end
 					changer.set(weapon, value)
+					if volume then volume:Set(changer.volumeOf(weapon), true) end -- each sound keeps its own volume
 				end,
 			})
-			table.insert(changer.dropdowns, { weapon = weapon, control = dropdown })
 
-			target:Slider({
-				Title = prefix .. label .. " Volume",
+			-- The volume of the sound chosen above: switching sounds brings back the volume each one had.
+			volume = target:Slider({
+				Title = prefix .. "Volume of This Sound",
 				Min = 0,
 				Max = 2,
 				Default = changer.volumeOf(weapon),
@@ -5221,6 +5428,7 @@ guarded("Guns", function()
 					changer.setVolume(weapon, v)
 				end,
 			})
+			table.insert(changer.dropdowns, { weapon = weapon, control = dropdown, volume = volume })
 
 			if drawers then
 				guarded(weapon .. " " .. label .. " Custom IDs", function()
@@ -5438,7 +5646,7 @@ guarded("Guns", function()
 
 		-- Global switch first, then the drawers.
 		EffectsSection:Toggle({
-			Title = "Tracers: Apply To Others",
+			Title = "Apply to Other Players Locally",
 			Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
 			Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
 		})
@@ -5500,7 +5708,7 @@ guarded("Guns", function()
 				end
 
 				drawer:Button({
-					Title = "Apply To All Guns",
+					Title = "Apply to All Guns",
 					Callback = function() applyToAll(gun) end,
 				})
 
@@ -7095,6 +7303,7 @@ function refreshUIFromLibrary()
 			local catalog = changer.catalog[entry.weapon]
 			entry.control:Refresh(catalog and catalog.options or { WEAPON_SOUND_DEFAULT })
 			entry.control:Set(changer.label(entry.weapon, changer.overrides[entry.weapon]), true)
+			if entry.volume then entry.volume:Set(changer.volumeOf(entry.weapon), true) end
 		end
 		changer.refresh()
 	end
@@ -7106,6 +7315,8 @@ end
 guarded("Settings", function()
 	-- Opened by the Settings button next to Discord (on an old CWUI it is a normal tab in the sidebar).
 	local SettingsTab = createCompatTab({ Title = "Settings", Footer = "Settings" })
+
+	local resetInterface -- set by the Interface block; the button sits in General
 
 	-- Interface: colors, transparency, corners and the background image. Changes show at once and are saved.
 	-- Three drawers so the page reads at a glance; one reset puts all of it back.
@@ -7166,10 +7377,11 @@ guarded("Settings", function()
 			local layers = backgroundLayers
 			local selected = #layers > 0 and 1 or nil
 
-			Layers:AddLabel("Up to " .. CWUI.MaxLayers .. " layers. Depth 0 stays still; a higher depth moves more and is drawn on top.")
+			Layers:AddLabel("Up to " .. CWUI.MaxLayers .. " images, stacked. Click one in the preview to pick it, drag it to move it, drag the orange corner to resize it.")
 
-			local canvas, picker, select
-			local controls = {} -- the selected layer's controls (hidden while there is no layer)
+			local canvas, picker, select, updateActions
+			local controls = {} -- the selected layer's controls
+			local layerDrawers = {} -- their drawers, hidden while there is no layer
 			local function save()
 				CW.Settings.UI_LAYERS = #layers > 0 and HttpService:JSONEncode(layers) or ""
 				scheduleSave()
@@ -7196,30 +7408,39 @@ guarded("Settings", function()
 				end,
 			})
 
+			-- Add and Remove sit in the header of the layer list, like Add / Edit / Remove on every other list.
 			picker = Layers:Dropdown({
 				Title = "Layer", Options = {},
 				Callback = function(name) select(tonumber(tostring(name):match("%d+"))) end,
 			})
-			picker:SetActions({
-				{ Text = "Add", Callback = function()
-					if #layers >= CWUI.MaxLayers then return end
-					table.insert(layers, {
-						X = 0, Y = 0, W = 1, H = 1, Depth = math.min(#layers + 1, 10),
-						Transparency = 0, Scale = "Crop", FillTransparency = 1,
-					})
-					selected = #layers
-					refresh()
-					save()
-				end },
-				{ Text = "Remove", Callback = function()
-					if not selected then return end
-					table.remove(layers, selected)
-					selected = #layers > 0 and math.min(selected, #layers) or nil
-					refresh()
-					save()
-				end },
-			})
-			picker:ShowActions(true)
+			local function addLayer()
+				if #layers >= CWUI.MaxLayers then return end
+				table.insert(layers, {
+					X = 0, Y = 0, W = 1, H = 1, Depth = math.min(#layers + 1, 10),
+					Transparency = 0, Scale = "Crop", FillTransparency = 1,
+				})
+				selected = #layers
+				refresh()
+				save()
+			end
+			local function removeLayer()
+				if not selected then return end
+				table.remove(layers, selected)
+				selected = #layers > 0 and math.min(selected, #layers) or nil
+				refresh()
+				save()
+			end
+			local shownActions
+			updateActions = function()
+				local state = (#layers < CWUI.MaxLayers and "a" or "") .. (selected and "r" or "")
+				if state == shownActions then return end
+				shownActions = state
+				local actions = {}
+				if #layers < CWUI.MaxLayers then table.insert(actions, { Text = "Add", Callback = addLayer }) end
+				if selected then table.insert(actions, { Text = "Remove", Callback = removeLayer }) end
+				picker:SetActions(actions)
+				picker:ShowActions(#actions > 0)
+			end
 
 			-- Every control below edits the selected layer, then redraws and saves.
 			local function edit(change)
@@ -7253,7 +7474,9 @@ guarded("Settings", function()
 					row:Flash(1, "Not found")
 				end
 			end
-			controls.image = Layers:InputRow({
+
+			local Image = Layers:AddSubSection("Image", true)
+			controls.image = Image:InputRow({
 				Fields = { { Key = "image", Placeholder = "Image ID or workspace file" } },
 				Buttons = {
 					{ Text = "Apply", Callback = function(values, row)
@@ -7267,60 +7490,48 @@ guarded("Settings", function()
 					end },
 				},
 			})
-			controls.depth = Layers:Slider({
+			controls.scale = Image:Dropdown({
+				Title = "Scaling", Options = { "Crop", "Fit", "Stretch" }, Default = "Crop",
+				Callback = function(v) edit(function(layer) layer.Scale = v end) end,
+			})
+			controls.transparency = Image:Slider({
+				Title = "Transparency", Min = 0, Max = 1, Decimal = 2, Default = 0,
+				Callback = function(v) edit(function(layer) layer.Transparency = v end) end,
+			})
+
+			local Placement = Layers:AddSubSection("Depth & Placement", false)
+			Placement:AddLabel("Depth 0 stays still. A higher depth moves more with Parallax and is drawn on top.")
+			controls.depth = Placement:Slider({
 				Title = "Depth", Min = 0, Max = 10, Increment = 0.5, Default = 1,
 				Callback = function(v) edit(function(layer) layer.Depth = v end) end,
 			})
-			controls.transparency = Layers:Slider({
-				Title = "Image Transparency", Min = 0, Max = 1, Decimal = 2, Default = 0,
-				Callback = function(v) edit(function(layer) layer.Transparency = v end) end,
-			})
-			controls.scale = Layers:Dropdown({
-				Title = "Image Scaling", Options = { "Crop", "Fit", "Stretch" }, Default = "Crop",
-				Callback = function(v) edit(function(layer) layer.Scale = v end) end,
-			})
-			controls.fill = Layers:Colorpicker({
-				Title = "Fill Color", Default = Color3.new(0, 0, 0),
-				Callback = function(color) edit(function(layer) layer.Fill = color:ToHex() end) end,
-			})
-			controls.fillTransparency = Layers:Slider({
-				Title = "Fill Transparency", Min = 0, Max = 1, Decimal = 2, Default = 1,
-				Callback = function(v) edit(function(layer) layer.FillTransparency = v end) end,
-			})
-			controls.fit = Layers:Button({
+			controls.fit = Placement:Button({
 				Title = "Fill the Whole Window",
 				Callback = function() edit(function(layer) layer.X, layer.Y, layer.W, layer.H = 0, 0, 1, 1 end) end,
 			})
 
-			-- Parallax (all layers), after the layer controls.
-			local strength = tonumber(look.ParallaxStrength) or PARALLAX_DEFAULT
-			local function applyParallax()
-				Window:SetParallax(look.Parallax == true, strength, look.ParallaxHoverOnly == true)
-			end
-			local parallaxToggle = Layers:Toggle({
-				Title = "Parallax", Default = look.Parallax == true,
-				Callback = function(on) look.Parallax = on applyParallax() end,
+			local Fill = Layers:AddSubSection("Fill Color", false)
+			Fill:AddLabel("A solid color behind this layer's image. Fully transparent until you change it.")
+			controls.fill = Fill:Colorpicker({
+				Title = "Color", Default = Color3.new(0, 0, 0),
+				Callback = function(color) edit(function(layer) layer.Fill = color:ToHex() end) end,
 			})
-			local strengthSlider = Layers:Slider({
-				Title = "Parallax Strength", Min = 1, Max = 10, Increment = 0.5, Suffix = "%", Default = strength * 100,
-				Callback = function(v)
-					strength = v / 100
-					look.ParallaxStrength = strength
-					applyParallax()
-				end,
+			controls.fillTransparency = Fill:Slider({
+				Title = "Transparency", Min = 0, Max = 1, Decimal = 2, Default = 1,
+				Callback = function(v) edit(function(layer) layer.FillTransparency = v end) end,
 			})
-			local hoverToggle = Layers:Toggle({
-				Title = "Only With the Mouse Over the Window", Default = look.ParallaxHoverOnly == true,
-				Callback = function(on) look.ParallaxHoverOnly = on applyParallax() end,
-			})
+			layerDrawers = { Image, Placement, Fill }
 
 			-- Shows the chosen layer in every control (without saving), or hides them when there is none.
 			select = function(index)
 				selected = layers[index or 0] and index or nil
 				local layer = selected and layers[selected]
-				for _, control in pairs(controls) do control.Instance.Visible = layer ~= nil end
+				for _, drawer in ipairs(layerDrawers) do
+					if typeof(drawer.Instance) == "Instance" then drawer.Instance.Visible = layer ~= nil end
+				end
 				canvas:Select(selected)
 				picker:Set(layer and ("Layer " .. selected) or nil, true)
+				updateActions()
 				if not layer then return end
 				controls.image:Set("image", layer.Image or "")
 				controls.depth:Set(layer.Depth or 0, true)
@@ -7332,6 +7543,30 @@ guarded("Settings", function()
 			end
 
 			refresh()
+
+			-- Parallax: how all layers react to the mouse. Its own drawer, apart from editing one layer.
+			local Parallax = SettingsTab:AddSubSection("Parallax", false)
+			Parallax:AddLabel("The background layers drift against the mouse; each layer's depth sets how far.")
+			local strength = tonumber(look.ParallaxStrength) or PARALLAX_DEFAULT
+			local function applyParallax()
+				Window:SetParallax(look.Parallax == true, strength, look.ParallaxHoverOnly == true)
+			end
+			local parallaxToggle = Parallax:Toggle({
+				Title = "Parallax", Default = look.Parallax == true,
+				Callback = function(on) look.Parallax = on applyParallax() end,
+			})
+			local strengthSlider = Parallax:Slider({
+				Title = "Strength", Min = 1, Max = 10, Increment = 0.5, Suffix = "%", Default = strength * 100,
+				Callback = function(v)
+					strength = v / 100
+					look.ParallaxStrength = strength
+					applyParallax()
+				end,
+			})
+			local hoverToggle = Parallax:Toggle({
+				Title = "Only With the Mouse Over the Window", Default = look.ParallaxHoverOnly == true,
+				Callback = function(on) look.ParallaxHoverOnly = on applyParallax() end,
+			})
 
 			table.insert(resets, function()
 				table.clear(layers)
@@ -7346,19 +7581,19 @@ guarded("Settings", function()
 			end)
 		end
 
-		SettingsTab:Button({
-			Title = "Reset Interface",
-			Callback = function()
-				table.clear(look)
-				CWUI.ResetTheme()
-				local defaults = CWUI.GetTheme()
-				for _, reset in ipairs(resets) do reset(defaults) end
-				scheduleSave()
-			end,
-		})
+		resetInterface = function()
+			table.clear(look)
+			CWUI.ResetTheme()
+			local defaults = CWUI.GetTheme()
+			for _, reset in ipairs(resets) do reset(defaults) end
+			scheduleSave()
+		end
 	end)
 
-	SettingsTab:Button({
+	-- General: the asset library, saving, and putting the interface back to its defaults.
+	local General = SettingsTab:AddSubSection("General", false)
+	General:AddLabel("Every change is saved by itself about a second later.")
+	General:Button({
 		Title = "Refresh Asset Library",
 		Callback = function()
 			local syncOK, syncError = pcall(CW.Library.sync)
@@ -7369,20 +7604,22 @@ guarded("Settings", function()
 		end,
 	})
 
-	local function serializableValue(value)
+	-- Strings, numbers, booleans and tables of them (nested: ASSET_PROFILES is category -> asset -> setting).
+	local function serializableValue(value, depth)
 		local valueType = type(value)
 		if valueType == "string" or valueType == "number" or valueType == "boolean" then
 			return value
 		end
-		if valueType ~= "table" then return nil end
+		if valueType ~= "table" or (depth or 0) > 4 then return nil end
 
 		local result = {}
 		for key, entry in pairs(value) do
 			local keyType = type(key)
-			local entryType = type(entry)
-			if (keyType == "string" or keyType == "number")
-				and (entryType == "string" or entryType == "number" or entryType == "boolean") then
-				result[key] = entry
+			if keyType == "string" or keyType == "number" then
+				local serialized = serializableValue(entry, (depth or 0) + 1)
+				if serialized ~= nil and not (type(serialized) == "table" and next(serialized) == nil) then
+					result[key] = serialized
+				end
 			end
 		end
 		return result
@@ -7401,7 +7638,8 @@ guarded("Settings", function()
 	local function saveSettings()
 		local savedSettings = {}
 		for key, value in pairs(CW.Settings) do
-			if key ~= "ASSET_SELECTIONS" and key ~= "SOUND_ID" and key ~= "AUTO_RELOAD_LABEL_PATH" then
+			if key ~= "ASSET_SELECTIONS" and key ~= "SOUND_ID" and key ~= "AUTO_RELOAD_LABEL_PATH"
+				and not CW.Profiles.isKey[key] then
 				local serialized = serializableValue(value)
 				if serialized ~= nil and not isDefaultValue(key, serialized) then
 					savedSettings[key] = serialized
@@ -7418,8 +7656,6 @@ guarded("Settings", function()
 		end
 		saveColor("TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX")
 		saveColor("TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX")
-		saveColor("CURSOR_ENEMY_COLOR", "CURSOR_ENEMY_COLOR_HEX")
-		saveColor("CURSOR_TEAM_COLOR", "CURSOR_TEAM_COLOR_HEX")
 
 		local out = {
 			schemaVersion = 3,
@@ -7447,13 +7683,16 @@ guarded("Settings", function()
 		end)
 	end
 
-	SettingsTab:Button({
-		Title = "Save Settings",
+	General:Button({
+		Title = "Save Now",
 		Callback = function()
 			saveSettings()
 			CW.Log("Settings saved.")
 		end,
 	})
+	if resetInterface then
+		General:Button({ Title = "Reset Interface", Callback = function() resetInterface() end })
+	end
 end)
 
 local soundsMigrated = false
