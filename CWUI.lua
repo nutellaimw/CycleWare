@@ -1100,6 +1100,8 @@ function Section:AddDropdown(o)
 		if not actionBox then return end
 		actionBox.Visible = visible == true
 		valLbl.Position = UDim2.new(1, visible and (VALUE_X - actionWidth - 2) or VALUE_X, 0.5, 0)
+		-- With buttons in the header the value keeps to the right half, so a long name never covers the title.
+		valLbl.Size = visible and UDim2.new(0.5, VALUE_X - actionWidth - 2, 1, 0) or UDim2.new(0.4, 0, 1, 0)
 	end
 	function obj:Refresh(newOptions)
 		options = newOptions or {}
@@ -1971,6 +1973,8 @@ local function createSection(window, parentContainer, order, o, nested)
 		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 		LayoutOrder = order, Parent = parentContainer,
 	}, { new("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+	sec.Instance = holder -- para esconder a seção inteira (cabeçalho e corpo)
 
 	local header = new("TextButton", {
 		LayoutOrder = 1, Surface = "Panel", BackgroundColor3 = nested and "Item" or "Header", BorderSizePixel = 0,
