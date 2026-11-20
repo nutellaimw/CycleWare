@@ -4325,12 +4325,42 @@ local ContentProvider = game:GetService("ContentProvider")
 
 -- Checks in the background that Roblox can load the asset. An audio ID that is private (or not
 -- shared with this experience) fails here.
-local function checkCustomAsset(assetId, onResult)
+local function checkCustomAsset(assetId, kind, onResult)
+	-- PreloadAsync with the id as a plain string answers Failure for every audio and image id, even the game's
+	-- own (checked in Studio), so it can't tell anything. What works:
+	--   * audio: a silent Sound in SoundService; a valid audio the experience may play reaches IsLoaded (a
+	--     private audio not shared with the game, a deleted one or a non-audio id never does);
+	--   * image: PreloadAsync of an ImageLabel, whose status is Success for an image and Failure otherwise.
 	task.spawn(function()
+		if kind == "Audio" then
+			local sound = Instance.new("Sound")
+			sound.Volume = 0
+			sound.SoundId = assetId
+			local ok, err = pcall(function() sound.Parent = game:GetService("SoundService") end)
+			if not ok then
+				sound:Destroy()
+				onResult(false, tostring(err))
+				return
+			end
+			pcall(function() ContentProvider:PreloadAsync({ sound }) end)
+			local deadline = os.clock() + 6
+			while not sound.IsLoaded and os.clock() < deadline do task.wait(0.1) end
+			local loaded = sound.IsLoaded
+			sound:Destroy()
+			if loaded then
+				onResult(true)
+			else
+				onResult(false, "did not load in 6 s")
+			end
+			return
+		end
+		local image = Instance.new("ImageLabel")
+		image.Image = assetId
 		local status
 		local ok, err = pcall(function()
-			ContentProvider:PreloadAsync({ assetId }, function(_, fetchStatus) status = fetchStatus end)
+			ContentProvider:PreloadAsync({ image }, function(_, fetchStatus) status = fetchStatus end)
 		end)
+		image:Destroy()
 		if not ok then
 			onResult(false, tostring(err))
 		elseif status == Enum.AssetFetchStatus.Success then
@@ -4457,34 +4487,25 @@ local function addCustomIdRow(section, opts)
 		end
 	end
 
-	local function checkLoads(entry, weapon, row)
-		local where = weapon and (" (" .. weapon .. ")") or ""
-		checkCustomAsset("rbxassetid://" .. entry.Id, function(loaded, why)
-			if loaded then
-				CW.Log("Custom ID " .. entry.Id .. where .. " loads fine")
-			else
-				row:Flash(1, "No load", 3)
-				CW.Warn("Custom ID " .. entry.Id .. where .. " was saved, but Roblox could not load it (" .. tostring(why)
-					.. "). It may be private, deleted, or the wrong kind of asset.")
-			end
-		end)
+	-- Why an ID can't be used, in words.
+	local function loadFailureText(id, why)
+		local what = opts.kind == "Audio" and "audio" or "image"
+		return "Custom ID " .. id .. " not saved: Roblox could not load it as " .. what .. " (" .. tostring(why)
+			.. "). It may be private (not shared with this game), deleted, or not "
+			.. (opts.kind == "Audio" and "an audio" or "an image (a Decal ID instead of its Image ID?)") .. "."
 	end
 
 	local row
 	local editingId -- the custom ID being edited; nil while adding
+	local checking = false
 	local function setEditing(id)
 		editingId = id
 		row:SetButtonText(1, id and "Save" or "Add ID")
 	end
 
-	local function save(values)
-		local weapon = currentWeapon()
-		local newId = CW.CustomIds.parse(values.id)
-		if not newId then
-			row:Flash(1, "Invalid")
-			return
-		end
-		if not editingId or newId == editingId then
+	-- Saves an ID that is known to load (or a new name for one already saved).
+	local function commit(values, weapon, newId, oldId)
+		if not oldId or newId == oldId then
 			-- A new ID, or a new name for the same one.
 			local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, values.name)
 			if not entry then
@@ -4492,17 +4513,15 @@ local function addCustomIdRow(section, opts)
 				CW.Warn("Custom ID not saved: " .. tostring(reason))
 				return
 			end
-			local wasEditing = editingId ~= nil
 			row:Clear()
 			setEditing(nil)
-			row:Flash(1, wasEditing and "Saved" or "Added")
+			row:Flash(1, oldId and "Saved" or "Added")
 			afterChange()
-			if not wasEditing then checkLoads(entry, weapon, row) end
 			return
 		end
 		-- Another ID in place of the edited one: the old one goes, the new one takes its choices.
-		local old = CW.CustomIds.get(category, weapon, editingId)
-		CW.CustomIds.remove(category, weapon, editingId)
+		local old = CW.CustomIds.get(category, weapon, oldId)
+		CW.CustomIds.remove(category, weapon, oldId)
 		local name = (type(values.name) == "string" and values.name:match("%S")) and values.name or (old and old.Name)
 		local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, name)
 		if not entry then
@@ -4511,13 +4530,44 @@ local function addCustomIdRow(section, opts)
 			CW.Warn("Custom ID not saved: " .. tostring(reason))
 			return
 		end
-		moveChoices(weapon, CW.CustomIds.selectionOf(editingId), CW.CustomIds.selectionOf(newId))
+		moveChoices(weapon, CW.CustomIds.selectionOf(oldId), CW.CustomIds.selectionOf(newId))
 		row:Clear()
 		setEditing(nil)
 		row:Flash(1, "Saved")
 		pcall(CW.reloadCoreAssets)
 		afterChange()
-		checkLoads(entry, weapon, row)
+	end
+
+	-- An ID is saved only once Roblox has loaded it (audio as audio, image as image); a new name for an ID
+	-- that is already saved needs no check.
+	local function save(values)
+		if checking then
+			row:Flash(1, "Wait")
+			return
+		end
+		local weapon = currentWeapon()
+		local newId = CW.CustomIds.parse(values.id)
+		if not newId then
+			row:Flash(1, "Invalid")
+			return
+		end
+		local oldId = editingId
+		local known = (oldId and newId == oldId) or (not oldId and CW.CustomIds.get(category, weapon, newId) ~= nil)
+		if known then
+			commit(values, weapon, newId, oldId)
+			return
+		end
+		checking = true
+		row:Flash(1, "Checking", 10)
+		checkCustomAsset("rbxassetid://" .. newId, opts.kind == "Audio" and "Audio" or "Image", function(loaded, why)
+			checking = false
+			if not loaded then
+				row:Flash(1, "Invalid", 2)
+				CW.Warn(loadFailureText(newId, why))
+				return
+			end
+			commit(values, weapon, newId, oldId)
+		end)
 	end
 
 	row = inputRow(section, {
@@ -4963,8 +5013,9 @@ guarded("Guns", function()
 	-- Without it the guns are listed one after the other and a "Custom ID Gun" dropdown picks the gun.
 	local function buildChangerSection(section, changer, label, drawers)
 		local spec = changer.spec
+		local building = true -- the controls' callbacks while the section is built are not the player's
 
-		section:Toggle({
+		local enableToggle = section:Toggle({
 			Title = "Enable " .. label .. " Sound Overrides",
 			Default = CW.Settings[spec.EnabledKey] == true,
 			Callback = function(enabled)
@@ -4972,6 +5023,17 @@ guarded("Guns", function()
 				changer.schedule()
 			end,
 		})
+
+		-- Nothing of a changer applies while its switch is off: not the chosen sound, not the volume. So choosing
+		-- a sound (other than Default) or a volume (other than 1x) turns it on, and the switch shows it.
+		local function ensureEnabled()
+			if building or CW.Settings[spec.EnabledKey] then return end
+			CW.Settings[spec.EnabledKey] = true
+			if enableToggle and enableToggle.Set then pcall(enableToggle.Set, enableToggle, true, true) end
+			CW.Log(label .. " sound overrides turned on (a sound or a volume was chosen)")
+			changer.schedule()
+			scheduleSave()
+		end
 
 		section:Toggle({
 			Title = "Apply to Other Players Locally",
@@ -5018,6 +5080,7 @@ guarded("Guns", function()
 				Options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
 				Default = changer.label(weapon, changer.overrides[weapon]),
 				Callback = function(value)
+					if value ~= WEAPON_SOUND_DEFAULT then ensureEnabled() end
 					changer.set(weapon, value)
 				end,
 			})
@@ -5031,6 +5094,7 @@ guarded("Guns", function()
 				Decimal = 2,
 				Suffix = "x",
 				Callback = function(v)
+					if math.abs((tonumber(v) or 1) - 1) > 1e-6 then ensureEnabled() end
 					changer.setVolume(weapon, v)
 				end,
 			})
@@ -5041,6 +5105,7 @@ guarded("Guns", function()
 				end)
 			end
 		end
+		task.defer(function() building = false end)
 	end
 
 	guarded("Shoot Sounds", function() buildChangerSection(ShootSection, shootSounds, "Shoot", true) end)
@@ -6018,7 +6083,7 @@ guarded("Utilities", function()
 						end
 					end
 					if update and equip then
-						internals = { list = list, update = update, equip = equip }
+						internals = { list = list, update = update, equip = equip, add = fn } -- fn = onToolAdded
 						return internals
 					end
 				end
@@ -6127,43 +6192,31 @@ guarded("Utilities", function()
 	CW.AutoSlotArrangeList = arrangeList -- used by the tests
 
 	--// Hiding -----------------------------------------------------------------------------------------
-	CW.State.autoSlotHidden = CW.State.autoSlotHidden or {} -- tool -> the Backpack it was taken from
-	local hiddenTools = CW.State.autoSlotHidden
+	-- "Hidden" = out of the quick slots (1-9, 0), but still the player's:
+	--   * Roblox's backpack: in its inventory area past the hotbar (open it with the backpack key).
+	--   * the game's bar: it has nothing past its 10 slots, so the tool stays in the Backpack, without a button.
+	-- Older builds took hidden tools out of the Backpack (parent nil): those are put back once, here.
+	CW.State.autoSlotHidden = CW.State.autoSlotHidden or {}
+	for tool, backpack in pairs(CW.State.autoSlotHidden) do
+		CW.State.autoSlotHidden[tool] = nil
+		if tool.Parent == nil and backpack.Parent == LocalPlayer then
+			pcall(function() tool.Parent = backpack end)
+		end
+	end
 
 	local function isHiddenName(name)
+		if not CW.Settings.AUTO_SLOT_ENABLED then return false end
 		for _, hiddenName in ipairs(layout[HIDDEN_KEY] or {}) do
 			if hiddenName == name then return true end
 		end
 		return false
 	end
 
-	-- Puts back every hidden tool that should be visible now (or all of them with all = true).
-	local function restoreHidden(all)
-		for tool, backpack in pairs(hiddenTools) do
-			if all or not isHiddenName(tool.Name) or not CW.Settings.AUTO_SLOT_ENABLED then
-				hiddenTools[tool] = nil
-				-- Only when it is still where this script left it (the server may have moved it since).
-				if tool.Parent == nil and backpack.Parent == LocalPlayer then
-					pcall(function() tool.Parent = backpack end)
-				end
-			end
-		end
-	end
-
-	-- Takes the hidden tools out of the Backpack (never one in hand).
-	local function hideTools(backpack)
-		if not CW.Settings.AUTO_SLOT_ENABLED then return end
-		for _, child in ipairs(backpack:GetChildren()) do
-			if child:IsA("Tool") and isHiddenName(child.Name) then
-				hiddenTools[child] = backpack
-				pcall(function() child.Parent = nil end)
-			end
-		end
-	end
-
 	--// Roblox's own backpack (Use Old Backpack) ----------------------------------------------------------
-	-- Where each tool is in Roblox's backpack, as it decided it: [1..10] = tool or false.
+	-- Where each tool is in Roblox's backpack, as it decided it: [1..10] = tool or false; oldInventory holds
+	-- the tools this script sent to its inventory area.
 	local oldSlots = {}
+	local oldInventory = setmetatable({}, { __mode = "k" })
 	local oldKnown = false   -- false until this script has laid the bar out itself (after a spawn or a start)
 	local rebuildingOld = false
 
@@ -6174,13 +6227,15 @@ guarded("Utilities", function()
 		return nil
 	end
 	local function oldArrived(tool)
-		if rebuildingOld or oldIndex(tool) then return end
+		-- Equipping or unequipping keeps the slot (or the inventory place) the tool already has.
+		if rebuildingOld or oldIndex(tool) or oldInventory[tool] then return end
 		for i = 1, SLOT_COUNT do
 			if not oldSlots[i] then
 				oldSlots[i] = tool
 				return
 			end
 		end
+		oldInventory[tool] = true -- a full hotbar sends it to the inventory area
 	end
 	local function oldLeft(tool, backpack)
 		if rebuildingOld then return end
@@ -6188,18 +6243,30 @@ guarded("Utilities", function()
 		if parent ~= backpack and parent ~= LocalPlayer.Character then
 			local i = oldIndex(tool)
 			if i then oldSlots[i] = false end
+			oldInventory[tool] = nil
 		end
 	end
 
-	-- Where every tool should be in Roblox's backpack: [1..10] = tool or false, plus the tools past the bar.
-	-- A tool with a slot in the layout goes exactly there (Roblox's backpack allows empty slots); every other
-	-- tool keeps the slot it is in when that one is still free, else it takes the lowest free one.
-	local function planOldSlots(current, tools)
-		local desired, used = {}, {}
+	-- Where every tool should be: desired[1..10] = tool or false, and the tools for the inventory area
+	-- (hidden ones, and the ones past slot 10). A tool with a slot in the layout goes exactly there (Roblox's
+	-- backpack allows empty slots); every other tool keeps its slot when that one is still free, else takes
+	-- the lowest free one. fixed = { tool, slot } is a tool in hand that stays where it is.
+	local function planOldSlots(current, tools, fixed)
+		local desired, used, inventory = {}, {}, {}
 		for slot = 1, SLOT_COUNT do desired[slot] = false end
+		if fixed then
+			desired[fixed.slot] = fixed.tool
+			used[fixed.tool] = true
+		end
+		for _, tool in ipairs(tools) do
+			if not used[tool] and isHiddenName(tool.Name) then
+				table.insert(inventory, tool)
+				used[tool] = true
+			end
+		end
 		for slot = 1, SLOT_COUNT do
 			local names = layout[slot]
-			if names then
+			if names and not desired[slot] then
 				for _, name in ipairs(names) do
 					for _, tool in ipairs(tools) do
 						if not used[tool] and tool.Name == name then
@@ -6227,7 +6294,6 @@ guarded("Utilities", function()
 		for _, tool in ipairs(tools) do
 			if not used[tool] then table.insert(rest, tool) end
 		end
-		local overflow = {}
 		for _, tool in ipairs(rest) do
 			local placed = false
 			for slot = 1, SLOT_COUNT do
@@ -6237,38 +6303,43 @@ guarded("Utilities", function()
 					break
 				end
 			end
-			if not placed then table.insert(overflow, tool) end
+			if not placed then table.insert(inventory, tool) end
 		end
-		return desired, overflow
+		return desired, inventory
 	end
 	CW.AutoSlotPlanOld = planOldSlots -- used by the tests
 
-	-- Takes the tools out and puts them back so that each lands in its planned slot. Roblox's backpack fills
-	-- the lowest empty slot, so a slot that must stay empty is held for that moment by a local placeholder
-	-- tool (never replicated), which is removed right after. Yields for three frames.
-	local function rebuildOldBackpack(backpack, desired, overflow)
+	-- Takes the tools out and puts them back so that each lands in its planned place. Roblox's backpack fills
+	-- the lowest empty hotbar slot, and the inventory area once the hotbar is full; so a slot that must stay
+	-- empty is held for that moment by a local placeholder tool (never replicated), removed right after.
+	-- fixedTool (a tool in hand) keeps its slot and is not touched. Yields for three frames.
+	local function rebuildOldBackpack(backpack, desired, inventory, fixedTool)
 		rebuildingOld = true
-		local all = {}
+		local moving = {}
 		for slot = 1, SLOT_COUNT do
-			if desired[slot] then table.insert(all, desired[slot]) end
+			if desired[slot] and desired[slot] ~= fixedTool then table.insert(moving, desired[slot]) end
 		end
-		for _, tool in ipairs(overflow) do table.insert(all, tool) end
-		for _, tool in ipairs(all) do
+		for _, tool in ipairs(inventory) do table.insert(moving, tool) end
+		for _, tool in ipairs(moving) do
 			pcall(function() tool.Parent = nil end)
 		end
-		task.wait() -- Roblox's backpack frees the slots now
+		task.wait() -- Roblox's backpack frees their slots now
 
 		local last = 0
 		for slot = 1, SLOT_COUNT do
 			if desired[slot] then last = slot end
 		end
+		if #inventory > 0 then last = SLOT_COUNT end -- the whole hotbar is held, so the rest go past it
 		local placeholders = {}
 		table.clear(oldSlots)
+		table.clear(oldInventory)
 		for slot = 1, SLOT_COUNT do oldSlots[slot] = false end
 		for slot = 1, last do
 			local tool = desired[slot]
-			-- A tool the server moved meanwhile (dropped, removed) is left where the server put it.
-			if tool and tool.Parent == nil and backpack.Parent == LocalPlayer then
+			if tool and tool == fixedTool then
+				oldSlots[slot] = tool -- in hand: its slot is taken already
+			elseif tool and tool.Parent == nil and backpack.Parent == LocalPlayer then
+				-- (a tool the server moved meanwhile is left where the server put it)
 				if pcall(function() tool.Parent = backpack end) then oldSlots[slot] = tool end
 			else
 				local placeholder = Instance.new("Tool")
@@ -6279,26 +6350,39 @@ guarded("Utilities", function()
 				table.insert(placeholders, placeholder)
 			end
 		end
-		for _, tool in ipairs(overflow) do
-			if tool.Parent == nil and backpack.Parent == LocalPlayer then pcall(function() tool.Parent = backpack end) end
+		for _, tool in ipairs(inventory) do
+			if tool.Parent == nil and backpack.Parent == LocalPlayer then
+				if pcall(function() tool.Parent = backpack end) then oldInventory[tool] = true end
+			end
 		end
-		task.wait() -- each tool now has its slot
+		task.wait() -- every tool now has its place
 		for _, placeholder in ipairs(placeholders) do placeholder:Destroy() end
 		task.wait() -- the placeholders' slots are empty again; these events are not taken as real tools
 		oldKnown = true
 		rebuildingOld = false
 	end
 
+	local function sameOldLayout(current, desired, inventory)
+		for slot = 1, SLOT_COUNT do
+			if (desired[slot] or false) ~= (current[slot] or false) then return false end
+		end
+		for _, tool in ipairs(inventory) do
+			if not oldInventory[tool] then return false end
+		end
+		return true
+	end
+
 	local function arrangeOldBackpack(backpack)
 		if rebuildingOld then return end
-		-- Only with nothing in hand: the tool in hand keeps its slot and can't be moved without unequipping it.
 		local character = LocalPlayer.Character
-		if character and character:FindFirstChildOfClass("Tool") then return end
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local held = character and character:FindFirstChildOfClass("Tool")
 
 		local tools = {}
 		for _, child in ipairs(backpack:GetChildren()) do
 			if child:IsA("Tool") then table.insert(tools, child) end
 		end
+		if held then table.insert(tools, held) end
 		if #tools == 0 then return end
 
 		-- Where the tools are now. Before this script has laid the bar out (after a spawn or a start), Roblox
@@ -6308,39 +6392,150 @@ guarded("Utilities", function()
 		if known then
 			for slot = 1, SLOT_COUNT do
 				local tool = oldSlots[slot]
-				current[slot] = (tool and tool.Parent == backpack) and tool or false
+				current[slot] = (tool and (tool.Parent == backpack or tool == held)) and tool or false
 			end
 			for _, tool in ipairs(tools) do
-				if not table.find(current, tool) then known = false end -- arrived unseen: lay the bar out again
+				if not table.find(current, tool) and not oldInventory[tool] then known = false end -- arrived unseen
 			end
 		end
 		if not known then
 			for slot = 1, SLOT_COUNT do current[slot] = tools[slot] or false end
 		end
 
-		local desired, overflow = planOldSlots(current, tools)
-		if known then
-			local same = true
-			for slot = 1, SLOT_COUNT do
-				if (desired[slot] or false) ~= (current[slot] or false) then
-					same = false
-					break
-				end
+		local heldSlot = held and table.find(current, held)
+		-- A hidden tool in hand stays where it is until it is put away.
+		local fixed = (held and heldSlot and isHiddenName(held.Name)) and { tool = held, slot = heldSlot } or nil
+		local desired, inventory = planOldSlots(current, tools, fixed)
+		if known and sameOldLayout(current, desired, inventory) then return end
+
+		if held and not fixed then
+			if heldSlot and known and desired[heldSlot] == held then
+				-- The tool in hand is already in its slot: the others are laid out around it.
+				rebuildOldBackpack(backpack, desired, inventory, held)
+				return
 			end
-			if same then return end
+			-- The tool in hand has to move: it is put away, the bar is laid out, and it is equipped again at once
+			-- (what pressing its slot key twice does; both replicate like the game's own equipTool).
+			if not humanoid then return end
+			pcall(function() humanoid:UnequipTools() end)
+			task.wait()
+			rebuildOldBackpack(backpack, desired, inventory, nil)
+			if held.Parent == backpack then pcall(function() humanoid:EquipTool(held) end) end
+			return
 		end
-		rebuildOldBackpack(backpack, desired, overflow)
+		rebuildOldBackpack(backpack, desired, inventory, fixed and fixed.tool or nil)
 	end
 
 	--// Arranging ------------------------------------------------------------------------------------------
+	-- The character only while it is alive: after a death LocalPlayer.Character still points at the dead one
+	-- (with the gun that was in hand) until the respawn.
+	local function aliveCharacter()
+		local character = LocalPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if character and character.Parent and humanoid and humanoid.Health > 0 then return character end
+		return nil
+	end
+
+	-- The game's list must have no gaps: updateToolbar walks t1[1..#t1] and indexes .Button. onToolAdded puts a
+	-- returning primary/secondary gun at the slot the previous one left (table.insert(t1, v6, entry)); when the
+	-- list got shorter meanwhile (a team switch, a respawn) that slot is past the end, Luau's table.insert leaves
+	-- a gap there, and updateToolbar fails ("attempt to index nil with 'Button'") with the buttons left stacked.
+	-- This closes any gap, whatever made it. Returns true when it changed the list.
+	local function closeGaps(list)
+		local highest, count = 0, 0
+		for key, value in pairs(list) do
+			if type(key) == "number" and value ~= nil then
+				count += 1
+				if key > highest then highest = key end
+			end
+		end
+		if highest == count then return false end
+		local entries = {}
+		for i = 1, highest do
+			if list[i] ~= nil then table.insert(entries, list[i]) end
+		end
+		table.clear(list) -- the game's own table: same identity, filled again in order
+		for i, entry in ipairs(entries) do list[i] = entry end
+		return true
+	end
+
+	-- The game's bar: a hidden tool loses its button (it stays in the Backpack); when it is un-hidden, or Auto
+	-- Slot is turned off, it gets the button back through the game's own onToolAdded. ONLY those tools: giving
+	-- buttons to new tools is the game's job, and doing it for it raced with its own state (during a team
+	-- switch the new primary went to the old primary's slot, past the end of the list).
+	-- A button whose tool is neither in the Backpack nor in a living character's hand (a leftover) is taken
+	-- off, but only 1.5 s later: the game removes its own buttons and, for a primary/secondary gun, remembers
+	-- that slot for the next one (onToolRemoved). Returns true when the bar's list changed.
+	local LEFTOVER_GRACE = 1.5
+	local leftoverSince = setmetatable({}, { __mode = "k" })
+	local removedByUs = setmetatable({}, { __mode = "k" }) -- tools whose button this script took off
+	local leftoverCheckQueued = false
+	local queueArrangeLater -- set below, once queueArrange exists
+	local function syncBar(found, backpack, keepHidden)
+		local list = found.list
+		local changed = closeGaps(list)
+		local character = aliveCharacter()
+		local now = os.clock()
+		local pending = false
+		for i = #list, 1, -1 do
+			local entry = list[i]
+			if isEntry(entry) then
+				local parent = entry.Tool.Parent
+				local owned = parent == backpack or (character ~= nil and parent == character)
+				local hide = keepHidden and parent == backpack and isHiddenName(entry.Tool.Name)
+				-- (a dead character's gun is left to the game until the respawn: it removes it itself)
+				local leftover = not owned and not (parent ~= nil and parent == LocalPlayer.Character)
+				if leftover then
+					leftoverSince[entry] = leftoverSince[entry] or now
+					if now - leftoverSince[entry] < LEFTOVER_GRACE then
+						leftover = false
+						pending = true
+					end
+				else
+					leftoverSince[entry] = nil
+				end
+				if hide or leftover then
+					table.remove(list, i)
+					pcall(function() entry.Button:Destroy() end)
+					if hide then removedByUs[entry.Tool] = true end
+					changed = true
+				end
+			end
+		end
+		if pending and not leftoverCheckQueued and queueArrangeLater then
+			leftoverCheckQueued = true
+			task.delay(LEFTOVER_GRACE + 0.1, function()
+				leftoverCheckQueued = false
+				queueArrangeLater()
+			end)
+		end
+
+		local onBar = {}
+		for _, entry in ipairs(list) do
+			if isEntry(entry) then onBar[entry.Tool] = true end
+		end
+		for tool in pairs(removedByUs) do
+			local parent = tool.Parent
+			local here = parent == backpack or (character ~= nil and parent == character)
+			if not here and parent ~= LocalPlayer.Character then
+				removedByUs[tool] = nil -- gone (dropped, removed, a respawn): nothing to give back
+			elseif here and not onBar[tool] and #list < SLOT_COUNT and not (keepHidden and isHiddenName(tool.Name)) then
+				removedByUs[tool] = nil
+				pcall(found.add, tool) -- appends it and redraws the bar
+				onBar[tool] = true
+				if closeGaps(list) then changed = true end -- (onToolAdded may have put a returning gun past the end)
+			end
+		end
+		return changed
+	end
+
 	local warnedMissing = false
+	local swapInProgress = function() return false end -- set by the pickup swap below
 	local function arrange()
 		layout = layouts[currentVariantKey()]
-		restoreHidden(false)
-		if not CW.Settings.AUTO_SLOT_ENABLED then return end
+		if not CW.Settings.AUTO_SLOT_ENABLED or swapInProgress() then return end
 		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
 		if not backpack then return end
-		if not rebuildingOld then hideTools(backpack) end
 
 		if usingOldBackpack() then
 			arrangeOldBackpack(backpack) -- needs no executor function
@@ -6362,7 +6557,8 @@ guarded("Utilities", function()
 			local detector = isEntry(entry) and entry.Button:FindFirstChildOfClass("UIDragDetector")
 			if detector and detector:GetAttribute("Dragging") then return end
 		end
-		if arrangeList(list) then
+		local barChanged = syncBar(found, backpack, true)
+		if arrangeList(list) or barChanged then
 			local ok, err = pcall(found.update)
 			if not ok then CW.Warn("Auto Slot could not refresh the inventory bar: " .. tostring(err)) end
 		end
@@ -6378,6 +6574,7 @@ guarded("Utilities", function()
 			arrange()
 		end)
 	end
+	queueArrangeLater = queueArrange
 
 	local function watchBackpack(backpack)
 		oldKnown = false -- a new Backpack (a spawn): Roblox's backpack fills its bar again
@@ -6414,7 +6611,18 @@ guarded("Utilities", function()
 			"autoSlotBackpackWait", "autoSlotCharacter", "autoSlotOldBackpack", "autoSlotTeam" }) do
 			CW.untrack(key)
 		end
-		restoreHidden(true)
+		-- Auto Slot off: hidden tools get their button back on the game's bar. (In Roblox's backpack they stay
+		-- in its inventory area, where the player can still reach them.)
+		if not usingOldBackpack() and autoSlotCaps then
+			local found = findInternals()
+			local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+			if found and backpack then
+				pcall(function()
+					syncBar(found, backpack, false)
+					found.update()
+				end)
+			end
+		end
 	end
 
 	local function setAutoSlot(enabled)
@@ -6451,6 +6659,140 @@ guarded("Utilities", function()
 	-- An older build also picked items up and put armor on: a re-run removes that loop.
 	CW.untrack("autoPickupStep")
 	CW.Settings.AUTO_ARMOR_ENABLED, CW.Settings.AUTO_ARMOR_POLICE, CW.Settings.AUTO_ARMOR_CRIMINAL = nil, nil, nil
+
+	--// Picking a gun: which one the server swaps ------------------------------------------------------------
+	-- The game keeps a set number of primary/secondary guns, and taking another one swaps the gun IN HAND
+	-- (the server decides; BackpackClient then puts the new gun in the slot the old one left). With Auto Slot a
+	-- slot can hold several guns (e.g. slot 2 = M4A1 or M700). So when the player, holding another gun of the
+	-- same kind (the Remington), takes a gun whose slot already holds one of theirs (the M700, for the M4A1):
+	--   1. just before the click's request goes out, that slot's gun (the M4A1) is equipped instead,
+	--   2. the request goes out, and the server swaps the M4A1 for the M700,
+	--   3. the gun the player was holding (the Remington) is equipped again.
+	-- The requests are the game's own (ClientItemHandler): Remotes.InteractWithItem:InvokeServer(part) for
+	-- Prison_ITEMS givers and Remotes.GiverPressed:FireServer(model) for "Giver"/"TouchGiver" models. They are
+	-- seen through a __namecall hook (installed once per session; CAPS.hook) and passed on unchanged.
+	local SLOT_TYPES = {
+		["AK-47"] = "Primary", FAL = "Primary", M4A1 = "Primary", MP5 = "Primary", ["Remington 870"] = "Primary",
+		M700 = "Primary", M9 = "Secondary", Revolver = "Secondary",
+	}
+	local function slotTypeOf(tool)
+		return tool:GetAttribute("SlotType") or SLOT_TYPES[tool.Name]
+	end
+	local swapping = false
+	swapInProgress = function() return swapping end
+
+	-- The tool a pickup request is for, or nil.
+	local function requestedToolName(remoteObject, argument)
+		if typeof(argument) ~= "Instance" then return nil end
+		if remoteObject.Name == "GiverPressed" then
+			local name = argument:GetAttribute("ToolName")
+			return type(name) == "string" and name or nil
+		end
+		local model = argument.Parent
+		local folder = model and model.Parent
+		if folder and (folder.Name == "giver" or folder.Name == "single") then return model.Name end
+		return nil
+	end
+
+	-- Decides whether this pickup should swap the slot's gun instead of the one in hand; when it should,
+	-- equips that gun right away and returns what is needed to put things back.
+	local function prepareSwap(remoteObject, argument)
+		if swapping or not CW.Settings.AUTO_SLOT_ENABLED then return nil end
+		local name = requestedToolName(remoteObject, argument)
+		local kind = name and SLOT_TYPES[name]
+		if not kind then return nil end
+		layout = layouts[currentVariantKey()]
+		local character = LocalPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		local held = character and character:FindFirstChildOfClass("Tool")
+		if not (humanoid and backpack and held) or slotTypeOf(held) ~= kind then return nil end
+		if backpack:FindFirstChild(name) or held.Name == name then return nil end -- already has it
+
+		-- The slot this gun belongs to, and a gun of the player's already in that slot.
+		local partner
+		for slot = 1, SLOT_COUNT do
+			local names = layout[slot]
+			if names and table.find(names, name) then
+				if table.find(names, held.Name) then return nil end -- the gun in hand belongs to that slot itself
+				for _, other in ipairs(names) do
+					local tool = other ~= name and backpack:FindFirstChild(other)
+					if tool and tool:IsA("Tool") and slotTypeOf(tool) == kind then
+						partner = tool
+						break
+					end
+				end
+				if partner then break end
+			end
+		end
+		-- No gun of that slot to swap, or the gun in hand already belongs there: the game's own swap is right.
+		if not partner then return nil end
+
+		swapping = true
+		pcall(function() humanoid:EquipTool(partner) end)
+		return { name = name, held = held, partner = partner, humanoid = humanoid, backpack = backpack }
+	end
+
+	-- After the request: waits (2 s at most) for the server's swap, then equips the gun the player was holding.
+	local function finishSwap(plan)
+		task.spawn(function()
+			local deadline = os.clock() + 2
+			while os.clock() < deadline do
+				local character = LocalPlayer.Character
+				local arrived = plan.backpack:FindFirstChild(plan.name) or (character and character:FindFirstChild(plan.name))
+				if arrived and plan.partner.Parent ~= plan.backpack and plan.partner.Parent ~= character then break end
+				task.wait()
+			end
+			if plan.held.Parent == plan.backpack then
+				pcall(function() plan.humanoid:EquipTool(plan.held) end)
+			end
+			task.wait()
+			swapping = false
+			queueArrange()
+		end)
+	end
+
+	-- The first build of this hook (CW.State.pickupHooked) clobbered the game's call; with its dispatchers
+	-- cleared it only passes calls on, so a re-run fixes the session without rejoining.
+	CW.onPickupRequest, CW.onPickupDone = nil, nil
+	CW.onPickupRequest2 = function(remoteObject, method, argument)
+		if method ~= (remoteObject.Name == "GiverPressed" and "FireServer" or "InvokeServer") then return nil end
+		local ok, plan = pcall(prepareSwap, remoteObject, argument)
+		return ok and plan or nil
+	end
+	CW.onPickupDone2 = function(plan)
+		if plan then finishSwap(plan) end
+	end
+
+	if CW.Caps.hook and not CW.State.pickupHooked2 then
+		local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+		local interact = remotes and remotes:FindFirstChild("InteractWithItem")
+		local giverPressed = remotes and remotes:FindFirstChild("GiverPressed")
+		if interact and giverPressed then
+			local isExecutorCall = type(checkcaller) == "function" and checkcaller or function() return false end
+			local wrap = type(newcclosure) == "function" and newcclosure or function(fn) return fn end
+			local OldNameCall
+			OldNameCall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+				if (self == interact or self == giverPressed) and not isExecutorCall() then
+					-- The method name is read FIRST: every method call made below (FindFirstChild, EquipTool...)
+					-- replaces the one __namecall remembers, so the game's call is then made by its saved name
+					-- (an indexed call, which doesn't come back through this hook).
+					local method = getnamecallmethod()
+					local plan
+					if CW.onPickupRequest2 then
+						local ok, result = pcall(CW.onPickupRequest2, self, method, (...))
+						plan = ok and result or nil
+					end
+					-- The request goes out exactly as the game made it; only the gun in hand may have changed.
+					local results = table.pack(self[method](self, ...))
+					if plan and CW.onPickupDone2 then pcall(CW.onPickupDone2, plan) end
+					return table.unpack(results, 1, results.n)
+				end
+				return OldNameCall(self, ...)
+			end))
+			CW.State.pickupHooked2 = true
+		end
+	end
 
 	-- Riot shield: on the arm as soon as it is equipped (what a click while holding it does).
 	-- ShieldController (decompiled) connects a click listener when the shield enters the character; each click
