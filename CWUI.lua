@@ -2366,7 +2366,7 @@ function CW:CreateWindow(cfg)
 	else
 		new("TextLabel", {
 			BackgroundTransparency = 1, Position = UDim2.fromOffset(18, 0), Size = UDim2.new(1, -28, 1, 0),
-			Text = cfg.Title or "CW", TextColor3 = "Accent", TextSize = 44, FontFace = Fonts.Title,
+			Text = cfg.Title or "Cycle-Ware", TextColor3 = "Accent", TextSize = 44, FontFace = Fonts.Title,
 			TextXAlignment = Enum.TextXAlignment.Left, Parent = logo,
 		})
 	end
