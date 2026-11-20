@@ -267,6 +267,10 @@ CW.Settings.CURSOR_TEAM_COLOR  = Color3.fromRGB(56, 255, 56)
 -- UI look (CWUI.SetTheme): only what the player changed. Colors as hex, transparencies 0..1,
 -- Image = Roblox ID or workspace path, ImageTransparency 0..1.
 CW.Settings.UI_THEME = {}
+-- Background layers (CWUI SetBackgroundLayers), kept as one JSON string because the settings file only holds
+-- flat values. Each layer: Image (Roblox ID or workspace path), X, Y, W, H (fractions of the window), Depth,
+-- Transparency, Scale, Fill (hex), FillTransparency.
+CW.Settings.UI_LAYERS = ""
 
 -- Snapshot of the defaults, taken before any saved value is applied. The save routine
 -- writes only the settings whose value differs from these.
@@ -274,7 +278,7 @@ CW.Defaults = {}
 for _, key in ipairs({
 	"HITMARKER_SIZE", "SOUND_VOLUME", "CURSOR_TARGET_SIZE", "HITMARKER_VISIBLE_DURATION",
 	"HITMARKER_FADEOUT_DURATION", "HITMARKER_RANDOM_ROTATION", "HITMARKER_FOLLOW_MOUSE", "HITMARKER_FADEOUT",
-	"CURSOR_TEAM_CHECK", "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR",
+	"CURSOR_TEAM_CHECK", "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR", "UI_LAYERS",
 }) do
 	CW.Defaults[key] = CW.Settings[key]
 end
@@ -3651,17 +3655,36 @@ local Window = CWUI:CreateWindow({
 CW.UIWindow = Window
 Window.ToggleVisibility = Window.Toggle
 
-local canBackdrop = type(Window.SetBackgroundImage) == "function"
-local canParallax = type(Window.SetParallax) == "function"
+-- Background layers and parallax. The single background image of the previous version becomes layer 1.
+local canLayers = type(Window.SetBackgroundLayers) == "function"
 local PARALLAX_DEFAULT = 0.03
-if canParallax then
-	Window:SetParallax(CW.Settings.UI_THEME.Parallax == true, tonumber(CW.Settings.UI_THEME.ParallaxStrength) or PARALLAX_DEFAULT)
-end
-if canBackdrop then
-	Window:SetBackgroundImageTransparency(tonumber(CW.Settings.UI_THEME.ImageTransparency) or 0.5)
-	if CW.Settings.UI_THEME.Image and not Window:SetBackgroundImage(CW.Settings.UI_THEME.Image) then
-		CW.Warn("Could not load the UI background image: " .. tostring(CW.Settings.UI_THEME.Image))
+local backgroundLayers = {}
+
+-- Saved layers keep the fill as hex; CWUI wants a Color3.
+local function windowLayers(list)
+	local out = {}
+	for i, layer in ipairs(list) do
+		local copy = table.clone(layer)
+		local ok, color = pcall(Color3.fromHex, type(layer.Fill) == "string" and layer.Fill or "")
+		copy.Fill = ok and color or nil
+		out[i] = copy
 	end
+	return out
+end
+
+if canLayers then
+	local look = CW.Settings.UI_THEME
+	local ok, decoded = pcall(HttpService.JSONDecode, HttpService, CW.Settings.UI_LAYERS)
+	if ok and type(decoded) == "table" then backgroundLayers = decoded end
+	if #backgroundLayers == 0 and type(look.Image) == "string" then
+		backgroundLayers[1] = {
+			Image = look.Image, X = 0, Y = 0, W = 1, H = 1, Depth = 5, Transparency = tonumber(look.ImageTransparency) or 0.5,
+		}
+		look.Image, look.ImageTransparency = nil, nil
+		CW.Settings.UI_LAYERS = HttpService:JSONEncode(backgroundLayers)
+	end
+	Window:SetParallax(look.Parallax == true, tonumber(look.ParallaxStrength) or PARALLAX_DEFAULT, look.ParallaxHoverOnly == true)
+	Window:SetBackgroundLayers(windowLayers(backgroundLayers))
 end
 
 local function mapControlOptions(options)
@@ -3736,6 +3759,11 @@ local function wrapSection(section)
 	function adapter:InputRow(control)
 		if type(section.AddInputRow) ~= "function" then return nil end
 		return section:AddInputRow(control)
+	end
+	-- Visual editor of the background layers (CWUI 3+); nil when the loaded CWUI has no AddLayerCanvas.
+	function adapter:LayerCanvas(control)
+		if type(section.AddLayerCanvas) ~= "function" then return nil end
+		return section:AddLayerCanvas(control)
 	end
 	function adapter:AddLabel(text) return section:AddLabel(text) end
 	function adapter:AddSubSection(name, open)
@@ -7133,17 +7161,83 @@ guarded("Settings", function()
 		})
 		table.insert(resets, function(d) cornersToggle:Set(d.Corners, true) end)
 
-		if canBackdrop then
-			local Backdrop = SettingsTab:AddSubSection("Background Image", false)
+		if canLayers then
+			local Layers = SettingsTab:AddSubSection("Background Layers", false)
+			local layers = backgroundLayers
+			local selected = #layers > 0 and 1 or nil
+
+			Layers:AddLabel("Up to " .. CWUI.MaxLayers .. " layers. Depth 0 stays still; a higher depth moves more and is drawn on top.")
+
+			local canvas, picker, select
+			local controls = {} -- the selected layer's controls (hidden while there is no layer)
+			local function save()
+				CW.Settings.UI_LAYERS = #layers > 0 and HttpService:JSONEncode(layers) or ""
+				scheduleSave()
+			end
+			local function apply()
+				Window:SetBackgroundLayers(windowLayers(layers))
+				canvas:SetLayers(windowLayers(layers), selected)
+			end
+			local function refresh()
+				local names = {}
+				for i in ipairs(layers) do names[i] = "Layer " .. i end
+				picker:Refresh(names)
+				apply()
+				select(selected)
+			end
+
+			canvas = Layers:LayerCanvas({
+				OnSelect = function(index) select(index) end,
+				Callback = function(index, rect)
+					local layer = layers[index]
+					layer.X, layer.Y, layer.W, layer.H = rect.X, rect.Y, rect.W, rect.H
+					Window:SetBackgroundLayers(windowLayers(layers))
+					save()
+				end,
+			})
+
+			picker = Layers:Dropdown({
+				Title = "Layer", Options = {},
+				Callback = function(name) select(tonumber(tostring(name):match("%d+"))) end,
+			})
+			picker:SetActions({
+				{ Text = "Add", Callback = function()
+					if #layers >= CWUI.MaxLayers then return end
+					table.insert(layers, {
+						X = 0, Y = 0, W = 1, H = 1, Depth = math.min(#layers + 1, 10),
+						Transparency = 0, Scale = "Crop", FillTransparency = 1,
+					})
+					selected = #layers
+					refresh()
+					save()
+				end },
+				{ Text = "Remove", Callback = function()
+					if not selected then return end
+					table.remove(layers, selected)
+					selected = #layers > 0 and math.min(selected, #layers) or nil
+					refresh()
+					save()
+				end },
+			})
+			picker:ShowActions(true)
+
+			-- Every control below edits the selected layer, then redraws and saves.
+			local function edit(change)
+				local layer = selected and layers[selected]
+				if not layer then return end
+				change(layer)
+				apply()
+				save()
+			end
+
 			-- A Roblox image ID (or link) is checked before use; anything else is a file in the workspace.
-			local function applyImage(source, row)
+			local function checkImage(source, row, onValid)
 				local id = CW.CustomIds.parse(source)
 				if id then
 					row:Flash(1, "Checking", 6)
 					checkCustomAsset("rbxassetid://" .. id, "Image", function(loaded)
-						if loaded and Window:SetBackgroundImage("rbxassetid://" .. id) then
-							look.Image = "rbxassetid://" .. id
-							scheduleSave()
+						if loaded then
+							onValid("rbxassetid://" .. id)
 							row:Flash(1, "Applied")
 						else
 							row:Flash(1, "Invalid")
@@ -7152,72 +7246,104 @@ guarded("Settings", function()
 					return
 				end
 				local found, exists = pcall(function() return isfile(source) end)
-				if found and exists and Window:SetBackgroundImage(source) then
-					look.Image = source
-					scheduleSave()
+				if found and exists then
+					onValid(source)
 					row:Flash(1, "Applied")
 				else
 					row:Flash(1, "Not found")
 				end
 			end
-			local imageRow = Backdrop:InputRow({
-				Fields = { { Key = "image", Placeholder = "Image ID or workspace file", Default = look.Image } },
+			controls.image = Layers:InputRow({
+				Fields = { { Key = "image", Placeholder = "Image ID or workspace file" } },
 				Buttons = {
 					{ Text = "Apply", Callback = function(values, row)
 						local source = (values.image or ""):match("^%s*(.-)%s*$")
 						if source == "" then row:Flash(1, "Empty") return end
-						applyImage(source, row)
+						checkImage(source, row, function(valid) edit(function(layer) layer.Image = valid end) end)
 					end },
 					{ Text = "Clear", Callback = function(_, row)
-						Window:SetBackgroundImage(nil)
-						look.Image = nil
 						row:Clear()
-						scheduleSave()
+						edit(function(layer) layer.Image = nil end)
 					end },
 				},
 			})
-			local imageSlider = Backdrop:Slider({
-				Title = "Image Transparency", Min = 0, Max = 1, Decimal = 2,
-				Default = tonumber(look.ImageTransparency) or 0.5,
+			controls.depth = Layers:Slider({
+				Title = "Depth", Min = 0, Max = 10, Increment = 0.5, Default = 1,
+				Callback = function(v) edit(function(layer) layer.Depth = v end) end,
+			})
+			controls.transparency = Layers:Slider({
+				Title = "Image Transparency", Min = 0, Max = 1, Decimal = 2, Default = 0,
+				Callback = function(v) edit(function(layer) layer.Transparency = v end) end,
+			})
+			controls.scale = Layers:Dropdown({
+				Title = "Image Scaling", Options = { "Crop", "Fit", "Stretch" }, Default = "Crop",
+				Callback = function(v) edit(function(layer) layer.Scale = v end) end,
+			})
+			controls.fill = Layers:Colorpicker({
+				Title = "Fill Color", Default = Color3.new(0, 0, 0),
+				Callback = function(color) edit(function(layer) layer.Fill = color:ToHex() end) end,
+			})
+			controls.fillTransparency = Layers:Slider({
+				Title = "Fill Transparency", Min = 0, Max = 1, Decimal = 2, Default = 1,
+				Callback = function(v) edit(function(layer) layer.FillTransparency = v end) end,
+			})
+			controls.fit = Layers:Button({
+				Title = "Fill the Whole Window",
+				Callback = function() edit(function(layer) layer.X, layer.Y, layer.W, layer.H = 0, 0, 1, 1 end) end,
+			})
+
+			-- Parallax (all layers), after the layer controls.
+			local strength = tonumber(look.ParallaxStrength) or PARALLAX_DEFAULT
+			local function applyParallax()
+				Window:SetParallax(look.Parallax == true, strength, look.ParallaxHoverOnly == true)
+			end
+			local parallaxToggle = Layers:Toggle({
+				Title = "Parallax", Default = look.Parallax == true,
+				Callback = function(on) look.Parallax = on applyParallax() end,
+			})
+			local strengthSlider = Layers:Slider({
+				Title = "Parallax Strength", Min = 1, Max = 10, Increment = 0.5, Suffix = "%", Default = strength * 100,
 				Callback = function(v)
-					look.ImageTransparency = v
-					Window:SetBackgroundImageTransparency(v)
+					strength = v / 100
+					look.ParallaxStrength = strength
+					applyParallax()
 				end,
 			})
-			table.insert(resets, function()
-				Window:SetBackgroundImage(nil)
-				Window:SetBackgroundImageTransparency(0.5)
-				if imageRow then imageRow:Clear() end
-				imageSlider:Set(0.5, true)
-			end)
+			local hoverToggle = Layers:Toggle({
+				Title = "Only With the Mouse Over the Window", Default = look.ParallaxHoverOnly == true,
+				Callback = function(on) look.ParallaxHoverOnly = on applyParallax() end,
+			})
 
-			if canParallax then
-				-- The image drifts against the mouse; strength = how far, as a percent of the window size.
-				local strength = tonumber(look.ParallaxStrength) or PARALLAX_DEFAULT
-				local parallaxToggle = Backdrop:Toggle({
-					Title = "Parallax",
-					Default = look.Parallax == true,
-					Callback = function(on)
-						look.Parallax = on
-						Window:SetParallax(on, strength)
-					end,
-				})
-				local strengthSlider = Backdrop:Slider({
-					Title = "Parallax Strength", Min = 1, Max = 10, Increment = 0.5, Suffix = "%",
-					Default = strength * 100,
-					Callback = function(v)
-						strength = v / 100
-						look.ParallaxStrength = strength
-						Window:SetParallax(look.Parallax == true, strength)
-					end,
-				})
-				table.insert(resets, function()
-					strength = PARALLAX_DEFAULT
-					Window:SetParallax(false, strength)
-					parallaxToggle:Set(false, true)
-					strengthSlider:Set(strength * 100, true)
-				end)
+			-- Shows the chosen layer in every control (without saving), or hides them when there is none.
+			select = function(index)
+				selected = layers[index or 0] and index or nil
+				local layer = selected and layers[selected]
+				for _, control in pairs(controls) do control.Instance.Visible = layer ~= nil end
+				canvas:Select(selected)
+				picker:Set(layer and ("Layer " .. selected) or nil, true)
+				if not layer then return end
+				controls.image:Set("image", layer.Image or "")
+				controls.depth:Set(layer.Depth or 0, true)
+				controls.transparency:Set(layer.Transparency or 0, true)
+				controls.scale:Set(layer.Scale or "Crop", true)
+				local ok, fill = pcall(Color3.fromHex, type(layer.Fill) == "string" and layer.Fill or "")
+				controls.fill:Set(ok and fill or Color3.new(0, 0, 0), true)
+				controls.fillTransparency:Set(layer.FillTransparency or 1, true)
 			end
+
+			refresh()
+
+			table.insert(resets, function()
+				table.clear(layers)
+				selected = nil
+				strength = PARALLAX_DEFAULT
+				applyParallax()
+				parallaxToggle:Set(false, true)
+				strengthSlider:Set(strength * 100, true)
+				hoverToggle:Set(false, true)
+				refresh()
+				CW.Settings.UI_LAYERS = ""
+			end)
 		end
 
 		SettingsTab:Button({
