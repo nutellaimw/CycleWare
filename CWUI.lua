@@ -24,8 +24,8 @@
 
     PERSONALIZAÇÃO
         CW.SetTheme({ Accent, Text, Background, Sidebar, Panel = Color3, BackgroundTransparency, PanelTransparency = 0..1 })
-        CW.ResetTheme(), CW.GetTheme(); Window:SetBackgroundImage(id ou caminho), Window:SetBackgroundImageTransparency(0..1),
-        Window:SetParallax(ligado, força 0..0.1)
+        CW.ResetTheme(), CW.GetTheme(); Window:SetBackgroundLayers({ camada, ... }) (até CW.MaxLayers),
+        Window:SetParallax(ligado, força 0..0.1, só com o mouse em cima); Section:AddLayerCanvas (editor visual)
 ]]
 
 local CW = { Version = "3.0.0" }
@@ -1772,6 +1772,196 @@ end
 --=============================================================================
 -- Seções colapsáveis (aninháveis)
 --=============================================================================
+--// Camadas de fundo: dados e desenho (usados pela janela e pelo editor) ---------------------
+local MAX_LAYERS = 8
+local SCALE_TYPES = { Crop = Enum.ScaleType.Crop, Fit = Enum.ScaleType.Fit, Stretch = Enum.ScaleType.Stretch }
+
+-- Camadas copiadas e limpas; `rank` = ordem de desenho (profundidade, depois a ordem da lista).
+local function normalizeLayers(list)
+	local layers = {}
+	for i, src in ipairs(list or {}) do
+		if i > MAX_LAYERS then break end
+		layers[i] = {
+			Image = src.Image, X = tonumber(src.X) or 0, Y = tonumber(src.Y) or 0,
+			W = math.max(tonumber(src.W) or 1, 0.02), H = math.max(tonumber(src.H) or 1, 0.02),
+			Depth = math.clamp(tonumber(src.Depth) or 0, 0, 10),
+			Transparency = math.clamp(tonumber(src.Transparency) or 0, 0, 1),
+			Scale = SCALE_TYPES[src.Scale] and src.Scale or "Crop",
+			Fill = typeof(src.Fill) == "Color3" and src.Fill or BLACK,
+			FillTransparency = math.clamp(tonumber(src.FillTransparency) or 1, 0, 1),
+		}
+	end
+	local order = {}
+	for i in ipairs(layers) do order[i] = i end
+	table.sort(order, function(a, b)
+		if layers[a].Depth ~= layers[b].Depth then return layers[a].Depth < layers[b].Depth end
+		return a < b
+	end)
+	for z, i in ipairs(order) do layers[i].rank = z end
+	return layers
+end
+
+-- Uma ImageLabel por camada, reaproveitada entre chamadas (sem piscar ao mexer num controle).
+local function syncLayerLabels(labels, layers, parent, zBase)
+	for i, layer in ipairs(layers) do
+		local label = labels[i]
+		if not label then
+			label = new("ImageLabel", { BorderSizePixel = 0, Parent = parent })
+			labels[i] = label
+		end
+		local asset = layer.Image and resolveAsset(layer.Image) or ""
+		if label.Image ~= asset then label.Image = asset end
+		label.ImageTransparency = layer.Transparency
+		label.ScaleType = SCALE_TYPES[layer.Scale]
+		label.BackgroundColor3 = layer.Fill
+		label.BackgroundTransparency = layer.FillTransparency
+		label.ZIndex = zBase + layer.rank
+	end
+	for i = #layers + 1, #labels do
+		labels[i]:Destroy()
+		labels[i] = nil
+	end
+end
+
+-- Editor visual das camadas de fundo, no formato da janela: clicar escolhe a camada (a de cima ganha),
+-- arrastar move, a alça no canto redimensiona. A prévia mostra o lugar de cada camada sem parallax.
+-- o.OnSelect(index); o.Callback(index, { X, Y, W, H }) a cada movimento.
+-- obj:SetLayers(lista, selecionada) com as mesmas camadas de Window:SetBackgroundLayers.
+function Section:AddLayerCanvas(o)
+	o = o or {}
+	local window = self._window
+	local MIN_SIZE = 0.05
+	local row = new("Frame", {
+		Surface = "Panel", BackgroundColor3 = "Item", BorderSizePixel = 0, LayoutOrder = self:_next(),
+		Size = UDim2.new(1, 0, 0, 236), Parent = self._body,
+	}, { corner(RADIUS) })
+	local area = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 10), Size = UDim2.new(1, -20, 0, 190),
+		BackgroundColor3 = "Track", BorderSizePixel = 0, ClipsDescendants = true, Parent = row,
+	}, { corner(RADIUS - 1) })
+	local aspect = new("UIAspectRatioConstraint", { AspectRatio = 1.42, Parent = area })
+	local function syncAspect()
+		local size = window._shell.AbsoluteSize
+		if size.X > 0 and size.Y > 0 then aspect.AspectRatio = size.X / size.Y end
+	end
+	window:_connect(window._shell:GetPropertyChangedSignal("AbsoluteSize"), syncAspect)
+	syncAspect()
+
+	local readout = new("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.new(0, 14, 1, -32), Size = UDim2.new(1, -28, 0, 28),
+		Text = "", TextColor3 = "SubText", TextSize = 14, FontFace = Fonts.Body, Parent = row,
+	})
+	-- Contorno e alça da camada escolhida, por cima das prévias.
+	local selection = new("Frame", { BackgroundTransparency = 1, Visible = false, ZIndex = 20, Parent = area }, {
+		new("UIStroke", { Color = "Accent", Thickness = 2, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }),
+	})
+	local handle = new("TextButton", { -- área de toque de 44 px; o desenho é o quadrado de 12 px no canto
+		AnchorPoint = Vector2.new(1, 1), Position = UDim2.fromScale(1, 1), Size = UDim2.fromOffset(44, 44),
+		BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 21, Parent = selection,
+	})
+	new("Frame", {
+		AnchorPoint = Vector2.new(1, 1), Position = UDim2.fromScale(1, 1), Size = UDim2.fromOffset(12, 12),
+		BackgroundColor3 = "Accent", BorderSizePixel = 0, ZIndex = 22, Parent = handle,
+	})
+
+	local layers, labels, selected = {}, {}, nil
+	local obj = { Instance = row }
+
+	local function percent(v) return math.floor(v * 100 + 0.5) .. "%" end
+	local function render()
+		for i, layer in ipairs(layers) do
+			local label = labels[i]
+			label.Position = UDim2.fromScale(layer.X, layer.Y)
+			label.Size = UDim2.fromScale(layer.W, layer.H)
+			-- Camada sem imagem e sem preenchimento ainda precisa aparecer para ser escolhida.
+			if not layer.Image and layer.FillTransparency >= 1 then
+				label.BackgroundColor3 = Theme.Divider
+				label.BackgroundTransparency = 0.5
+			end
+		end
+		local layer = selected and layers[selected]
+		selection.Visible = layer ~= nil
+		if layer then
+			selection.Position = UDim2.fromScale(layer.X, layer.Y)
+			selection.Size = UDim2.fromScale(layer.W, layer.H)
+			readout.Text = string.format("Layer %d  ·  X %s  ·  Y %s  ·  W %s  ·  H %s",
+				selected, percent(layer.X), percent(layer.Y), percent(layer.W), percent(layer.H))
+		else
+			readout.Text = #layers == 0 and "No layers yet: add one above." or "Click a layer to edit it."
+		end
+	end
+
+	function obj:SetLayers(list, index)
+		layers = normalizeLayers(list)
+		syncLayerLabels(labels, layers, area, 0)
+		selected = layers[index or 0] and index or nil
+		render()
+	end
+	function obj:Select(index)
+		selected = layers[index or 0] and index or nil
+		render()
+	end
+
+	-- A camada de cima que contém o ponto.
+	local function layerAt(point)
+		local pos, size = area.AbsolutePosition, area.AbsoluteSize
+		local x, y = (point.X - pos.X) / size.X, (point.Y - pos.Y) / size.Y
+		local best
+		for i, layer in ipairs(layers) do
+			local inside = x >= layer.X and x <= layer.X + layer.W and y >= layer.Y and y <= layer.Y + layer.H
+			if inside and (not best or layer.rank > layers[best].rank) then best = i end
+		end
+		return best
+	end
+
+	local drag
+	local function startDrag(mode, input)
+		local layer = layers[selected]
+		drag = { mode = mode, start = input.Position, X = layer.X, Y = layer.Y, W = layer.W, H = layer.H }
+		window:_lockScroll(true)
+	end
+	area.InputBegan:Connect(function(input)
+		if drag or not isClick(input) then return end
+		local hit = layerAt(input.Position)
+		if not hit then return end
+		if hit ~= selected then
+			selected = hit
+			render()
+			safeCall(o.OnSelect, hit)
+		end
+		startDrag("move", input)
+	end)
+	handle.InputBegan:Connect(function(input)
+		if not drag and isClick(input) and selected then startDrag("size", input) end
+	end)
+	window:_connect(UserInputService.InputChanged, function(input)
+		if not drag or not layers[selected] then return end
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		local size = area.AbsoluteSize
+		local dx, dy = (input.Position.X - drag.start.X) / size.X, (input.Position.Y - drag.start.Y) / size.Y
+		local layer = layers[selected]
+		if drag.mode == "move" then
+			-- Pelo menos 5% da camada continua dentro da prévia, para dar para pegar de volta.
+			layer.X = math.clamp(drag.X + dx, MIN_SIZE - layer.W, 1 - MIN_SIZE)
+			layer.Y = math.clamp(drag.Y + dy, MIN_SIZE - layer.H, 1 - MIN_SIZE)
+		else
+			layer.W = math.clamp(drag.W + dx, MIN_SIZE, 3)
+			layer.H = math.clamp(drag.H + dy, MIN_SIZE, 3)
+		end
+		render()
+		safeCall(o.Callback, selected, { X = layer.X, Y = layer.Y, W = layer.W, H = layer.H })
+	end)
+	window:_connect(UserInputService.InputEnded, function(input)
+		if drag and isClick(input) then
+			drag = nil
+			window:_lockScroll(false)
+		end
+	end)
+
+	render()
+	return obj
+end
+
 local function createSection(window, parentContainer, order, o, nested)
 	o = type(o) == "string" and { Name = o } or o or {}
 	local sec = setmetatable({ _window = window, Name = o.Name or "Section", _n = 0 }, Section)
@@ -1988,59 +2178,84 @@ end
 function Window:SetVisible(v) self._shell.Visible = v end
 function Window:Toggle() self._shell.Visible = not self._shell.Visible end
 
--- Imagem de fundo: ID do Roblox ou arquivo da workspace; nil ou "" remove. Devolve false se não carregar.
-function Window:SetBackgroundImage(source)
-	if source == nil or source == "" then
-		self._backdrop.Visible = false
-		return true
-	end
-	local asset = resolveAsset(source)
-	if not asset then return false end
-	self._backdropImage.Image = asset
-	self._backdrop.Visible = true
-	return true
-end
-function Window:SetBackgroundImageTransparency(t) self._backdropImage.ImageTransparency = math.clamp(t, 0, 1) end
-
---// Parallax da imagem de fundo --------------------------------------------------
--- Adaptado de um sistema estilo menu do Rain World: uma "câmera" segue o mouse com aproximação exponencial
--- (independente do FPS, sem degrau nem parada brusca) e a imagem anda ao contrário. Aqui há uma camada só,
--- a imagem fica `margin` maior que a janela em cada lado e anda no máximo isso, então a borda nunca aparece.
--- O mouse é medido em relação à janela: da borda esquerda à direita da janela vai de -1 a 1.
--- Custo: nada é escrito quando a imagem não precisa mudar; com a janela escondida, sem imagem ou desligado,
--- o passo volta no início.
+--// Camadas de fundo com parallax ------------------------------------------------
+-- Adaptado do editor de camadas do Iterator Meadow e do parallax estilo Rain World, com estas mudanças:
+--   * posição e tamanho em frações da janela (a referência usava pixels de uma prévia 399x280 e
+--     recalculava atributos a cada redimensionamento);
+--   * uma câmera só, com aproximação exponencial independente do FPS (a referência suavizava duas vezes
+--     com fator fixo por quadro: mais lenta a 30 FPS, mais rápida a 144);
+--   * nada é lido de atributos a cada quadro, e nada é escrito quando a câmera não andou;
+--   * a ordem de desenho segue a profundidade (a referência prometia isso, mas desenhava na ordem de criação).
+-- Camada: { Image = ID/caminho, X, Y, W, H (frações da janela), Depth = 0..10, Transparency = 0..1,
+--           Scale = "Crop" | "Fit" | "Stretch", Fill = Color3, FillTransparency = 0..1 }
+-- Profundidade 0 fica parada; quanto maior, mais anda e mais à frente é desenhada.
 local PARALLAX_SPEED = 5 -- quão rápido a câmera alcança o mouse (o mesmo valor da referência)
+CW.MaxLayers = MAX_LAYERS
 
--- strength = deslocamento máximo como fração do tamanho da janela (0 a 0.1).
-function Window:SetParallax(enabled, strength)
+-- Quanto a camada anda (fração da janela) com a câmera no limite.
+local function travel(layer, strength) return strength * layer.Depth / 5 end
+-- Uma camada que cobre a janela inteira cresce o quanto anda, para a borda nunca aparecer.
+local function coversWindow(l) return l.X <= 0 and l.Y <= 0 and l.X + l.W >= 1 and l.Y + l.H >= 1 end
+
+function Window:SetBackgroundLayers(list)
+	self._layers = normalizeLayers(list)
+	syncLayerLabels(self._layerLabels, self._layers, self._backdrop, 0)
+	self._backdrop.Visible = #self._layers > 0
+	self:_sizeLayers()
+end
+
+-- Tamanho (só muda com as camadas ou a força) e posição com a câmera atual.
+function Window:_sizeLayers()
+	local p = self._parallax
+	p.maxTravel = 0
+	for i, layer in ipairs(self._layers) do
+		layer.travel = p.enabled and travel(layer, p.strength) or 0
+		layer.grow = coversWindow(layer) and layer.travel or 0
+		p.maxTravel = math.max(p.maxTravel, layer.travel)
+		self._layerLabels[i].Size = UDim2.fromScale(layer.W + 2 * layer.grow, layer.H + 2 * layer.grow)
+	end
+	self:_placeLayers()
+end
+
+-- Sem arredondar: posição fracionária evita o "degrau" em movimento lento.
+function Window:_placeLayers()
+	local p = self._parallax
+	for i, layer in ipairs(self._layers) do
+		self._layerLabels[i].Position = UDim2.fromScale(
+			layer.X - layer.grow - p.x * layer.travel, layer.Y - layer.grow - p.y * layer.travel)
+	end
+	p.shownX, p.shownY = p.x, p.y
+end
+
+-- strength = quanto uma camada de profundidade 5 anda, em fração da janela (0 a 0.1).
+-- hoverOnly = a câmera volta ao centro quando o mouse sai da janela.
+function Window:SetParallax(enabled, strength, hoverOnly)
 	local p = self._parallax
 	p.enabled = enabled == true
-	if strength then p.margin = math.clamp(strength, 0, 0.1) end
-	local grow = p.enabled and 1 + 2 * p.margin or 1
-	self._backdropImage.Size = UDim2.fromScale(grow, grow)
-	if not p.enabled then
-		p.x, p.y, p.shownX, p.shownY = 0, 0, 0, 0
-		self._backdropImage.Position = UDim2.fromScale(0.5, 0.5)
-	end
+	p.hoverOnly = hoverOnly == true
+	if strength then p.strength = math.clamp(strength, 0, 0.1) end
+	if not p.enabled then p.x, p.y = 0, 0 end
+	self:_sizeLayers()
 end
 
 function Window:_stepParallax(dt)
 	local p = self._parallax
-	if not (p.enabled and self._backdrop.Visible and self._shell.Visible) then return end
+	if not (p.enabled and p.maxTravel > 0 and self._backdrop.Visible and self._shell.Visible) then return end
 	local pos, size = self._shell.AbsolutePosition, self._shell.AbsoluteSize
 	if size.X <= 0 or size.Y <= 0 then return end
 	local mouse = UserInputService:GetMouseLocation()
-	local tx = math.clamp((mouse.X - pos.X) / size.X * 2 - 1, -1, 1)
-	local ty = math.clamp((mouse.Y - pos.Y) / size.Y * 2 - 1, -1, 1)
+	local tx, ty = (mouse.X - pos.X) / size.X * 2 - 1, (mouse.Y - pos.Y) / size.Y * 2 - 1
+	if p.hoverOnly and (math.abs(tx) > 1 or math.abs(ty) > 1) then
+		tx, ty = 0, 0
+	end
+	tx, ty = math.clamp(tx, -1, 1), math.clamp(ty, -1, 1)
 	local follow = 1 - math.exp(-PARALLAX_SPEED * math.min(dt, 0.05)) -- dt limitado: sem salto após um travamento
 	p.x += (tx - p.x) * follow
 	p.y += (ty - p.y) * follow
-	-- Menos de 1/20 de pixel de diferença: não escreve (o CanvasGroup não redesenha à toa).
-	local limit = 0.05 / math.max(size.X, size.Y) / math.max(p.margin, 1e-3)
+	-- Menos de 1/20 de pixel na camada que mais anda: não escreve (o CanvasGroup não redesenha à toa).
+	local limit = 0.05 / math.max(size.X, size.Y) / p.maxTravel
 	if math.abs(p.x - p.shownX) < limit and math.abs(p.y - p.shownY) < limit then return end
-	p.shownX, p.shownY = p.x, p.y
-	-- Sem arredondar: posição fracionária evita o "degrau" em movimento lento.
-	self._backdropImage.Position = UDim2.fromScale(0.5 - p.x * p.margin, 0.5 - p.y * p.margin)
+	self:_placeLayers()
 end
 
 function Window:Destroy()
@@ -2090,17 +2305,14 @@ function CW:CreateWindow(cfg)
 	}, { corner(WIN_R) })
 	self._shell = window
 
-	-- Imagem de fundo (opcional), entre a cor da janela e o conteúdo. O CanvasGroup é o único contêiner que
-	-- recorta com cantos arredondados, e o parallax precisa de uma imagem maior que a janela.
+	-- Camadas de fundo (opcionais), entre a cor da janela e o conteúdo. O CanvasGroup é o único contêiner que
+	-- recorta com cantos arredondados, e com parallax as camadas passam das bordas da janela.
 	self._backdrop = new("CanvasGroup", {
 		Name = "Backdrop", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 0,
 		Parent = window,
 	}, { corner(WIN_R) })
-	self._backdropImage = new("ImageLabel", {
-		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromScale(1, 1), ScaleType = Enum.ScaleType.Crop, ImageTransparency = 0.5, Parent = self._backdrop,
-	})
-	self._parallax = { enabled = false, margin = 0.03, x = 0, y = 0, shownX = 0, shownY = 0 }
+	self._layers, self._layerLabels = {}, {}
+	self._parallax = { enabled = false, hoverOnly = false, strength = 0.03, x = 0, y = 0, shownX = 0, shownY = 0, maxTravel = 0 }
 	self:_connect(RunService.PreRender, function(dt) self:_stepParallax(dt) end)
 
 	-- Em telas menores que a janela (celular), ela encolhe para caber, sem diminuir texto nem alvos de toque.
