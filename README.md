@@ -17,7 +17,7 @@ Fully Customizable, and open source.
 Differently of other scripts, CycleWare does not use imagelabels as the cursor. Instead, we use the MouseIcon, which offers 0 delay on mov.
 The only thing in usage as imagelabel is the hitmarker. But we plan to change that in the future.
 
-*(Auto sprint, auto reload, and chat toggle)
+*(Auto sprint, auto reload, chat toggle, and auto slot)
 
 ## Requirements
 
