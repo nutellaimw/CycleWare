@@ -6,7 +6,7 @@
 --   stand-in, so a single missing function disables one feature instead of aborting the
 --   whole script. What was found is stored in CW.Caps and reported once at startup.
 --=============================================================================
-local SCRIPT_VERSION = "phase-11"
+local SCRIPT_VERSION = "2.0.0"
 
 local CAPS = {
 	files = type(isfile) == "function" and type(isfolder) == "function"
@@ -167,6 +167,181 @@ function CW.untrackAll()
 	for key in pairs(CW.State.conns) do
 		CW.untrack(key)
 	end
+end
+
+--// GUI parent -----------------------------------------------------------------------
+-- Parents the GUI to the first container that accepts it: gethui() when the executor has it,
+-- otherwise CoreGui, otherwise PlayerGui.
+function CW.attachGui(gui)
+	local candidates = {}
+	if type(gethui) == "function" then
+		local ok, container = pcall(gethui)
+		if ok and typeof(container) == "Instance" then table.insert(candidates, container) end
+	end
+	local okCore, coreGui = pcall(function() return game:GetService("CoreGui") end)
+	if okCore and coreGui then table.insert(candidates, coreGui) end
+	local playerGui = CW.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if playerGui then table.insert(candidates, playerGui) end
+
+	for _, container in ipairs(candidates) do
+		local attached = pcall(function() gui.Parent = container end)
+		if attached and gui.Parent == container then return true end
+	end
+	return false
+end
+
+--// Loading screen -------------------------------------------------------------------
+-- On screen from here until the UI is built (closeLoadingScreen, at the end of the UI), then it fades out.
+-- Laid out at 712x500, the window's size and spot, so it fades into the window; scaled down on a small screen.
+-- Colors, text, color bar, lighter band and ring follow the owner's reference image. Arimo is the closest
+-- Roblox font to the reference's regular sans.
+local closeLoadingScreen
+do
+	local RunService = game:GetService("RunService")
+	local TweenService = game:GetService("TweenService")
+	local W, H = 712, 500
+	local MIN_SHOWN, FADE, GIVE_UP = 1.5, 0.35, 60 -- seconds: shortest time on screen, fade-out, safety close
+	local FONT = Font.new("rbxasset://fonts/families/Arimo.json")
+
+	if CW.closeLoadingScreen then CW.closeLoadingScreen(true) end -- a re-run replaces the last run's screen
+
+	local function make(class, props, parent)
+		local inst = Instance.new(class)
+		for key, value in pairs(props) do inst[key] = value end
+		inst.Parent = parent
+		return inst
+	end
+	local function text(content, size, props, parent)
+		props.BackgroundTransparency = 1
+		props.Text = content
+		props.TextSize = size
+		props.FontFace = FONT
+		props.TextColor3 = Color3.new(1, 1, 1)
+		return make("TextLabel", props, parent)
+	end
+
+	local gui = make("ScreenGui", {
+		Name = "CW_Loading", IgnoreGuiInset = true, ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		DisplayOrder = 1000000, -- over the window (999999), which is built underneath
+	})
+	-- A CanvasGroup clips the turned band to the card and fades everything as one piece.
+	local card = make("CanvasGroup", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(W, H),
+		BackgroundColor3 = Color3.fromRGB(38, 38, 38), BorderSizePixel = 0,
+	}, gui)
+	local scale = make("UIScale", {}, card)
+
+	-- The lighter band: a large square turned so its top edge runs from (218, 500) to (712, 150).
+	local BAND = Color3.fromRGB(64, 64, 64)
+	make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(638, 570), Size = UDim2.fromOffset(1200, 600),
+		Rotation = -35.3, BackgroundColor3 = BAND, BorderSizePixel = 0, ZIndex = 0,
+	}, card)
+
+	text("Cycle-Ware", 58, { Position = UDim2.fromOffset(21, 88), Size = UDim2.fromOffset(288, 58) }, card)
+	text("Developed by Nutella", 30, { Position = UDim2.fromOffset(21, 150), Size = UDim2.fromOffset(288, 30) }, card)
+	local bar = make("Frame", {
+		Position = UDim2.fromOffset(21, 187), Size = UDim2.fromOffset(288, 5), BackgroundTransparency = 1,
+	}, card)
+	make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder }, bar)
+	for i, piece in ipairs({ { 53, "fc5dff" }, { 130, "ff3164" }, { 52, "72ff9a" }, { 53, "00b4ff" } }) do
+		make("Frame", {
+			LayoutOrder = i, Size = UDim2.new(0, piece[1], 1, 0), BackgroundColor3 = Color3.fromHex(piece[2]),
+			BorderSizePixel = 0,
+		}, bar)
+	end
+	text("V" .. SCRIPT_VERSION, 21, {
+		Position = UDim2.fromOffset(8, 474), Size = UDim2.fromOffset(200, 21), TextXAlignment = Enum.TextXAlignment.Left,
+	}, card)
+
+	-- The ring: short pieces around a circle, shaded like the reference (white at the round head, then
+	-- darker around the circle), turning counterclockwise so the head leads.
+	local ring = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(665, 443), Size = UDim2.fromOffset(61, 61),
+		BackgroundTransparency = 1,
+	}, card)
+	local SHADES = { { 0, 255 }, { 0.13, 255 }, { 0.3, 212 }, { 0.53, 241 }, { 0.7, 209 }, { 0.8, 176 }, { 1, 113 } }
+	local function shade(t)
+		for i = 2, #SHADES do
+			local a, b = SHADES[i - 1], SHADES[i]
+			if t <= b[1] then
+				local v = math.floor(a[2] + (b[2] - a[2]) * (t - a[1]) / (b[1] - a[1]) + 0.5)
+				return Color3.fromRGB(v, v, v)
+			end
+		end
+		return Color3.fromRGB(113, 113, 113)
+	end
+	local INNER, OUTER, PIECES, HEAD = 24, 30.5, 48, 80 -- radii of the ring; HEAD: degrees clockwise from 3 o'clock
+	local middle, width = (INNER + OUTER) / 2, OUTER - INNER
+	local function round(props)
+		local frame = make("Frame", props, ring)
+		make("UICorner", { CornerRadius = UDim.new(1, 0) }, frame)
+		return frame
+	end
+	for i = 0, PIECES - 1 do
+		local t = (i + 0.5) / PIECES
+		local angle = math.rad(HEAD + 360 * t)
+		make("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, middle * math.cos(angle), 0.5, middle * math.sin(angle)),
+			Size = UDim2.fromOffset(2 * math.pi * middle / PIECES + 2, width + 2), Rotation = math.deg(angle) + 90,
+			BackgroundColor3 = shade(t), BorderSizePixel = 0,
+		}, ring)
+	end
+	round({ -- the head
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, middle * math.cos(math.rad(HEAD)), 0.5, middle * math.sin(math.rad(HEAD))),
+		Size = UDim2.fromOffset(width, width), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 2,
+	})
+	-- The pieces reach 1 px past both edges; two smooth circles in the band's color (the ring sits on the band)
+	-- trim them to a clean ring.
+	local outerEdge = round({
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(2 * OUTER, 2 * OUTER),
+		BackgroundTransparency = 1, ZIndex = 3,
+	})
+	make("UIStroke", { Color = BAND, Thickness = 3 }, outerEdge)
+	round({
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(2 * INNER, 2 * INNER),
+		BackgroundColor3 = BAND, BorderSizePixel = 0, ZIndex = 3,
+	})
+
+	-- Still when the player turned on Reduced Motion in Roblox's settings.
+	local still = false
+	pcall(function() still = GuiService.ReducedMotionEnabled end)
+	local spin = not still and RunService.RenderStepped:Connect(function(dt)
+		ring.Rotation = (ring.Rotation - 330 * dt) % 360
+	end)
+
+	local function fit()
+		local screen = gui.AbsoluteSize
+		if screen.X > 0 and screen.Y > 0 then scale.Scale = math.min(1, (screen.X - 16) / W, (screen.Y - 16) / H) end
+	end
+	gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(fit)
+	CW.attachGui(gui)
+	fit()
+
+	local shownAt, closed = os.clock(), false
+	-- now: remove it at once (a re-run); otherwise it stays at least MIN_SHOWN seconds, then fades out.
+	function closeLoadingScreen(now)
+		if closed then return end
+		closed = true
+		if CW.closeLoadingScreen == closeLoadingScreen then CW.closeLoadingScreen = nil end
+		local function remove()
+			if spin then spin:Disconnect() end
+			gui:Destroy()
+		end
+		if now then
+			remove()
+			return
+		end
+		task.delay(math.max(0, MIN_SHOWN - (os.clock() - shownAt)), function()
+			local fade = TweenService:Create(card, TweenInfo.new(FADE), { GroupTransparency = 1 })
+			fade.Completed:Connect(remove)
+			fade:Play()
+		end)
+	end
+	CW.closeLoadingScreen = closeLoadingScreen
+	task.delay(GIVE_UP, closeLoadingScreen) -- never left on screen if the UI stops loading
 end
 
 --// Teams ----------------------------------------------------------------------------
@@ -2414,25 +2589,7 @@ local CW = getgenv().__CW_CORE_STATE
 
 local ContentProvider = game:GetService("ContentProvider")
 
--- Parents the GUI to the first container that accepts it: gethui() when the executor has it,
--- otherwise CoreGui, otherwise PlayerGui.
-local function attachGui(gui)
-	local candidates = {}
-	if type(gethui) == "function" then
-		local ok, container = pcall(gethui)
-		if ok and typeof(container) == "Instance" then table.insert(candidates, container) end
-	end
-	local okCore, coreGui = pcall(function() return game:GetService("CoreGui") end)
-	if okCore and coreGui then table.insert(candidates, coreGui) end
-	local playerGui = CW.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	if playerGui then table.insert(candidates, playerGui) end
-
-	for _, container in ipairs(candidates) do
-		local attached = pcall(function() gui.Parent = container end)
-		if attached and gui.Parent == container then return true end
-	end
-	return false
-end
+local attachGui = CW.attachGui
 
 -- Created on the first run, and again on a later run if the GUI is missing or was destroyed.
 if not CW.IAPortable or not CW.IAPortable.Parent then
@@ -4729,44 +4886,30 @@ CW.track("customIdActions", game:GetService("RunService").Heartbeat:Connect((fun
 	end
 end)()))
 
--- Puts Add (always) and Edit / Remove (when canEdit) in the header of the controls; with an older cached CWUI,
--- plain buttons under the list. Returns a function(canEdit); it only rebuilds the buttons when that changes.
-local function attachActions(section, controls, onAdd, onEdit, onRemove)
+-- Puts Edit and Remove in the header of the controls while canEdit; with an older cached CWUI, plain buttons
+-- under the list. Returns a function(canEdit); it only touches the header when that changes.
+local function attachActions(section, controls, onEdit, onRemove)
 	local attached = {}
 	for _, control in ipairs(controls or {}) do
 		if type(control) == "table" and type(control.SetActions) == "function" then table.insert(attached, control) end
 	end
 	if #attached == 0 then
-		section:Button({ Title = "Add by ID", Callback = onAdd })
 		section:Button({ Title = "Edit Selected ID", Callback = onEdit })
 		section:Button({ Title = "Remove Selected ID", Callback = onRemove })
 		return function() end
+	end
+	for _, control in ipairs(attached) do
+		pcall(control.SetActions, control, { { Text = "Edit", Callback = onEdit }, { Text = "Remove", Callback = onRemove } })
 	end
 	local shown
 	local function update(canEdit)
 		canEdit = canEdit == true
 		if shown == canEdit then return end
 		shown = canEdit
-		local actions = { { Text = "Add", Callback = onAdd } }
-		if canEdit then
-			table.insert(actions, { Text = "Edit", Callback = onEdit })
-			table.insert(actions, { Text = "Remove", Callback = onRemove })
-		end
-		for _, control in ipairs(attached) do
-			pcall(control.SetActions, control, actions)
-			pcall(control.ShowActions, control, true)
-		end
+		for _, control in ipairs(attached) do pcall(control.ShowActions, control, canEdit) end
 	end
 	update(false)
 	return update
-end
-
--- The ID form under a gallery: hidden until Add or Edit is pressed, hidden again by Cancel or after saving.
--- (An older cached CWUI has no row Instance: the form then just stays visible.)
-local function formVisibility(row)
-	return function(visible)
-		if type(row) == "table" and typeof(row.Instance) == "Instance" then row.Instance.Visible = visible end
-	end
 end
 
 -- What one list's custom IDs need, however they are shown: add, rename, replace and remove, each asset
@@ -4781,7 +4924,7 @@ end
 local function customIdEditor(opts, view)
 	local category = opts.category
 	local editor = { editingId = nil } -- the custom ID being edited; nil while adding
-	local checking = false
+	local attempt = 0 -- each save or cancel takes a new number; a check that ends under an old one is dropped
 
 	function editor.weapon() return opts.weapon and opts.weapon() or nil end
 	function editor.selectedId()
@@ -4856,12 +4999,10 @@ local function customIdEditor(opts, view)
 	end
 
 	-- An ID is saved only once Roblox has loaded it (audio as audio, image as image); a new name for an ID
-	-- that is already saved needs no check.
+	-- that is already saved needs no check. Pressing again while a check runs starts over with what is typed.
 	function editor.save(values)
-		if checking then
-			view.flash("Wait")
-			return
-		end
+		attempt += 1
+		local mine = attempt
 		local weapon = editor.weapon()
 		local newId = CW.CustomIds.parse(values.id)
 		if not newId then
@@ -4874,10 +5015,9 @@ local function customIdEditor(opts, view)
 			commit(values, weapon, newId, oldId)
 			return
 		end
-		checking = true
 		view.flash("Checking", 10)
 		checkCustomAsset("rbxassetid://" .. newId, opts.kind == "Audio" and "Audio" or "Image", function(loaded, why)
-			checking = false
+			if mine ~= attempt then return end
 			if not loaded then
 				view.flash("Invalid", 2)
 				CW.Warn(loadFailureText(newId, why))
@@ -4885,6 +5025,11 @@ local function customIdEditor(opts, view)
 			end
 			commit(values, weapon, newId, oldId)
 		end)
+	end
+
+	-- Drops a check that is still running: nothing it finds is saved.
+	function editor.cancel()
+		attempt += 1
 	end
 
 	-- Deletes one custom ID and clears every choice that used it. Returns true when it was deleted.
@@ -4901,24 +5046,24 @@ local function customIdEditor(opts, view)
 	return editor
 end
 
--- A gallery's custom IDs: Add, Edit and Remove in the gallery's header (see attachActions), the form hidden
--- under it until one of them is used. opts: as customIdEditor, plus controls = { the gallery }.
+-- A gallery's custom IDs: the form always shown under the gallery, Edit and Remove in the gallery's header
+-- while a custom ID is selected (see attachActions). opts: as customIdEditor, plus controls = { the gallery }.
 local function addCustomIdRow(section, opts)
-	local row, showForm, editor
+	local row, editor
 	local function setEditing(id)
 		editor.editingId = id
 		row:SetButtonText(1, id and "Save" or "Add")
 	end
+	local function reset()
+		editor.cancel()
+		row:Clear()
+		setEditing(nil)
+	end
 	editor = customIdEditor(opts, {
 		flash = function(text, seconds) row:Flash(1, text, seconds) end,
-		-- The result shows on the button for a moment, then the form closes.
 		saved = function(text)
-			row:Clear()
-			setEditing(nil)
+			reset()
 			row:Flash(1, text)
-			task.delay(1, function()
-				if not editor.editingId then showForm(false) end
-			end)
 		end,
 	})
 
@@ -4927,38 +5072,22 @@ local function addCustomIdRow(section, opts)
 		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
 	}, {
 		{ Text = "Add", Title = "Add ID", Callback = function(values) editor.save(values) end },
-		{ Text = "Cancel", Title = "Cancel", Callback = function()
-			row:Clear()
-			setEditing(nil)
-			showForm(false)
-		end },
+		{ Text = "Cancel", Title = "Cancel", Callback = reset },
 	})
-	showForm = formVisibility(row)
-	showForm(false)
 
-	local function add()
-		row:Clear()
-		setEditing(nil)
-		showForm(true)
-	end
 	local function edit()
 		local entry = editor.entry(editor.selectedId())
 		if not entry then return end
 		row:Set("id", entry.Id)
 		row:Set("name", entry.Name)
 		setEditing(entry.Id)
-		showForm(true)
 	end
 	local function remove()
 		local id = editor.selectedId()
 		local wasEditing = id ~= nil and editor.editingId == id
-		if editor.remove(id) and wasEditing then
-			row:Clear()
-			setEditing(nil)
-			showForm(false)
-		end
+		if editor.remove(id) and wasEditing then reset() end
 	end
-	local showActions = attachActions(section, opts.controls, add, edit, remove)
+	local showActions = attachActions(section, opts.controls, edit, remove)
 	table.insert(customIdActionUpdaters, function() showActions(editor.selectedId() ~= nil) end)
 	return row
 end
@@ -4992,6 +5121,7 @@ local function addAssetEditor(section, opts)
 		end
 	end
 	local function reset()
+		editor.cancel()
 		fields:Clear()
 		editor.editingId = nil
 		refresh()
@@ -5033,7 +5163,7 @@ end
 -- One gun's sound, laid out the same in Hit Sound, Shoot Sounds and Reload Sounds:
 --   <title>                    the sound in use (a list)
 --   [ panel: sound by ID ]     the editor of this gun's custom IDs
---   Volume of This Sound       right under it: each sound of the gun keeps its own volume
+--   Volume                     right under it: each sound of the gun keeps its own volume
 -- spec = { title, options, value, volume, volumeNow(), onChoose(label), onVolume(v), editor = customIdEditor opts }
 -- Returns { dropdown, volume }.
 local function buildSoundDrawer(drawer, spec)
@@ -5050,7 +5180,7 @@ local function buildSoundDrawer(drawer, spec)
 	})
 	guarded(spec.title .. " IDs", function() editor = addAssetEditor(drawer, spec.editor) end)
 	volume = drawer:Slider({
-		Title = "Volume of This Sound",
+		Title = "Volume",
 		Min = 0,
 		Max = 2,
 		Default = spec.volume,
@@ -5128,8 +5258,8 @@ local function downloadCursorPng(id)
 end
 
 local function addCursorIdRow(section, controls)
-	local busy = false
-	local row, showForm
+	local attempt = 0 -- each save or cancel takes a new number; a download that ends under an old one is dropped
+	local row
 	local editing -- the entry being edited; nil while adding
 
 	local function afterChange()
@@ -5155,12 +5285,15 @@ local function addCursorIdRow(section, controls)
 		editing = entry
 		row:SetButtonText(1, entry and "Save" or "Add")
 	end
-	-- After a save: the result shows on the button for a moment, then the form closes.
+	local function reset()
+		attempt += 1
+		row:Clear()
+		setEditing(nil)
+	end
+	-- After a save: the form empties and the result shows on the button for a moment.
 	local function finish(text)
+		reset()
 		row:Flash(1, text)
-		task.delay(1, function()
-			if not editing and not busy then showForm(false) end
-		end)
 	end
 	-- After a rename or a new ID: the old file goes, the entry and every choice point at the new file.
 	local function replaceEntry(old, id, name, relative)
@@ -5170,11 +5303,10 @@ local function addCursorIdRow(section, controls)
 		CW.Library.replaceSelectionOf("Cursors", nil, old.File, relative)
 	end
 
+	-- Pressing again while a download runs starts over with what is typed.
 	local function save(values)
-		if busy then
-			row:Flash(1, "Wait")
-			return
-		end
+		attempt += 1
+		local mine = attempt
 		if not CAPS.files then
 			row:Flash(1, "No files", 2)
 			CW.Warn("Cursor by ID needs the executor's file functions")
@@ -5216,8 +5348,6 @@ local function addCursorIdRow(section, controls)
 				writefile(path, data)
 				replaceEntry(old, id, name, relative)
 			end
-			row:Clear()
-			setEditing(nil)
 			finish("Saved")
 			afterChange()
 			pcall(CW.reloadCoreAssets)
@@ -5229,11 +5359,12 @@ local function addCursorIdRow(section, controls)
 			CW.Warn("Cursor by ID needs HttpGet or request in the executor")
 			return
 		end
-		busy = true
 		row:Flash(1, "Loading", 60)
 		task.spawn(function()
+			local downloaded, data, why = pcall(downloadCursorPng, id)
+			if mine ~= attempt then return end
 			local ok, err = pcall(function()
-				local data, why = downloadCursorPng(id)
+				if not downloaded then error(data, 0) end
 				if not data then error(why, 0) end
 				writefile(path, data)
 				if old then
@@ -5246,10 +5377,7 @@ local function addCursorIdRow(section, controls)
 					end
 				end
 			end)
-			busy = false
 			if ok then
-				row:Clear()
-				setEditing(nil)
 				finish(old and "Saved" or "Added")
 				CW.Log("Cursor ID " .. id .. " saved as " .. relative)
 				afterChange()
@@ -5266,46 +5394,28 @@ local function addCursorIdRow(section, controls)
 		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
 	}, {
 		{ Text = "Add", Title = "Add ID", Callback = function(values) save(values) end },
-		{ Text = "Cancel", Title = "Cancel", Callback = function()
-			if busy then return end
-			row:Clear()
-			setEditing(nil)
-			showForm(false)
-		end },
+		{ Text = "Cancel", Title = "Cancel", Callback = reset },
 	})
-	showForm = formVisibility(row)
-	showForm(false)
 
-	local function add()
-		row:Clear()
-		setEditing(nil)
-		showForm(true)
-	end
 	local function edit()
 		local entry = selectedEntry()
 		if not entry then return end
 		row:Set("id", entry.Id)
 		row:Set("name", entry.Name)
 		setEditing(entry)
-		showForm(true)
 	end
 	-- Removes the cursor in use (only cursors added by ID: the others never show the button).
 	local function remove()
-		if busy then return end
 		local entry = selectedEntry()
 		if not entry then return end
 		CW.CustomIds.remove("Cursors", nil, entry.Id)
 		deleteFile(entry.File)
 		CW.Library.clearSelectionOf("Cursors", nil, entry.File)
-		if editing and editing.Id == entry.Id then
-			row:Clear()
-			setEditing(nil)
-			showForm(false)
-		end
+		if editing and editing.Id == entry.Id then reset() end
 		afterChange()
 		pcall(CW.reloadCoreAssets)
 	end
-	local showActions = attachActions(section, controls, add, edit, remove)
+	local showActions = attachActions(section, controls, edit, remove)
 	table.insert(customIdActionUpdaters, function() showActions(selectedEntry() ~= nil) end)
 	return row
 end
@@ -7993,4 +8103,5 @@ end)
 if not uiOk then
 	warn("[CW] UI failed to load: " .. tostring(uiError))
 end
+closeLoadingScreen()
 end
