@@ -1,5 +1,5 @@
 --[[
-    CW UI Library  v3.1
+    CW UI Library  v3.2
 
     VISUAL
       Fundo escuro de concreto com um único destaque: o laranja do uniforme de detento do Prison Life.
@@ -22,6 +22,7 @@
         A própria Tab também aceita elementos direto (sem seção).
         Elementos: Label, Button, Toggle, Slider, Textbox, InputRow, Dropdown, Colorpicker, Gallery, SlotBoard
         Group: painel fixo dentro da seção que junta controles de uma mesma coisa (não abre nem fecha)
+        Pager (na aba): uma página por item, com nome, prévia 3D e, embaixo dela, anterior/próxima e os controles da prévia
 
     PERSONALIZAÇÃO
         CW.SetTheme({ Accent, Text, Background, Sidebar, Panel = Color3, BackgroundTransparency, PanelTransparency = 0..1 })
@@ -29,7 +30,7 @@
         Window:SetParallax(ligado, força 0..0.1, só com o mouse em cima); Section:AddLayerCanvas (editor visual)
 ]]
 
-local CW = { Version = "3.1.0" }
+local CW = { Version = "3.2.0" }
 
 --// Services ---------------------------------------------------------------
 local cloneref = cloneref or function(x) return x end
@@ -2122,6 +2123,275 @@ end
 --// Tab ------------------------------------------------------------------------
 function Tab:AddSection(o)
 	return createSection(self._window, self._page, self:_next(), o, false)
+end
+
+--// Páginas com prévia 3D -----------------------------------------------------------------
+-- Uma página por item (na aba Guns, uma por arma) e só a escolhida aparece. Em cima, sem fundo nenhum: o nome da
+-- página, a posição dela ("3 / 9") e a prévia 3D; logo embaixo da prévia, uma linha com anterior (à esquerda),
+-- próxima (à direita) e, no meio, os controles da prévia: - e + (zoom), Reset e Auto-Rotate. As setas dão a volta:
+-- depois da última vem a primeira.
+-- A prévia: arrastar gira, a roda do mouse aproxima (com Shift, mais rápido), dois cliques voltam à vista inicial.
+-- Auto-Rotate (ligado de início) gira a peça enquanto ninguém mexe; com "Reduzir movimento" do Roblox, não gira.
+-- Com o mouse em cima, a roda não rola a página nem mexe na câmera do jogo.
+-- o = { Pages = { nomes }, Height = altura da prévia (210), Hint = texto de ajuda no alto da prévia,
+--       Changed = function(i, nome) }
+-- Retorno: pager:Page(i) (recebe seções e elementos como uma aba), pager:Select(i), pager:Get() -> i, nome,
+--          pager:SetModel(model, manterCâmera): mostra um Model (ou nada, com nil) e destrói o anterior.
+--          O Model chega com o comprimento no eixo Z; ele é centralizado aqui. A caixa dele enquadra a peça.
+local PAGER_YAW, PAGER_PITCH = math.rad(70), math.rad(-12) -- de lado, um pouco de cima
+local PAGER_SPIN = math.rad(30)                            -- graus por segundo
+local PAGER_FOV = 28                                       -- pouca perspectiva: a ponta que vem não incha
+local PAGER_ZOOM = 0.12                                    -- fração por dente da roda
+local PAGER_CORNERS = {}
+for _, x in ipairs({ -1, 1 }) do
+	for _, y in ipairs({ -1, 1 }) do
+		for _, z in ipairs({ -1, 1 }) do table.insert(PAGER_CORNERS, Vector3.new(x, y, z) / 2) end
+	end
+end
+local ContextActionService = cloneref(game:GetService("ContextActionService"))
+
+function Tab:AddPager(o)
+	o = o or {}
+	local window, tab = self._window, self
+	local names = o.Pages or {}
+	local TITLE_H, COUNT_H, VIEW_H = 34, 18, o.Height or 210
+
+	local holder = new("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = self:_next(), Parent = self._page,
+	}, { new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }) })
+	local header = new("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, TITLE_H + COUNT_H + VIEW_H + ROW_H), LayoutOrder = 0,
+		Parent = holder,
+	})
+	local title = new("TextLabel", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, TITLE_H), Text = "", TextColor3 = "Text", TextSize = 30,
+		FontFace = Fonts.Title, TextTruncate = Enum.TextTruncate.AtEnd, Parent = header,
+	})
+	local count = new("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(0, TITLE_H), Size = UDim2.new(1, 0, 0, COUNT_H), Text = "",
+		TextColor3 = "SubText", TextSize = 14, FontFace = Fonts.Medium, Parent = header,
+	})
+
+	-- A prévia não tem fundo: a arma fica direto sobre a página. A luz acompanha a câmera.
+	local view = new("ViewportFrame", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(0, TITLE_H + COUNT_H), Size = UDim2.new(1, 0, 0, VIEW_H),
+		Ambient = Color3.fromRGB(150, 150, 150), LightColor = Color3.fromRGB(190, 190, 190), Parent = header,
+	})
+	local camera = new("Camera", { FieldOfView = PAGER_FOV, Parent = view })
+	view.CurrentCamera = camera
+	local empty = new("TextLabel", {
+		BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Text = "No preview", TextColor3 = "SubText",
+		TextSize = 15, FontFace = Fonts.Medium, Visible = false, Parent = view,
+	})
+	local surface = new("TextButton", {
+		BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Position = view.Position, Size = view.Size,
+		ZIndex = 2, Parent = header,
+	})
+	new("TextLabel", {
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 4),
+		Size = UDim2.new(1, -16, 0, 18), Text = o.Hint or "", TextColor3 = "SubText", TextSize = 13,
+		FontFace = Fonts.Body, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3, Parent = surface,
+	})
+
+	local pager, pages, current = {}, {}, 0
+	local model, size = nil, Vector3.one
+	local yaw, pitch, distance = PAGER_YAW, PAGER_PITCH, 10
+	local autoRotate = true
+
+	local function place()
+		local rotation = CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0)
+		camera.CFrame = CFrame.lookAt(rotation * Vector3.new(0, 0, distance), Vector3.zero)
+		local cf = camera.CFrame
+		view.LightDirection = (cf.LookVector - cf.UpVector * 0.35 + cf.RightVector * 0.35).Unit
+	end
+	-- Distância em que a peça inteira cabe na prévia em qualquer ponto do giro: os cantos da caixa dela, a cada 15
+	-- graus, vistos da câmera inclinada. Cada canto pede uma distância (a profundidade dele mais o quanto ele sai
+	-- para o lado ou para cima); vale a maior, com uma folga.
+	local function fitDistance()
+		local px = view.AbsoluteSize
+		local tanV = math.tan(math.rad(camera.FieldOfView) / 2)
+		local tanH = tanV * ((px.X > 0 and px.Y > 0) and px.X / px.Y or 2.4)
+		local tilt = CFrame.Angles(-PAGER_PITCH, 0, 0)
+		local need = 0
+		for step = 0, 23 do
+			local turn = tilt * CFrame.Angles(0, step * math.pi / 12, 0)
+			for _, c in ipairs(PAGER_CORNERS) do
+				local p = turn * (size * c)
+				need = math.max(need, p.Z + math.abs(p.X) / tanH, p.Z + math.abs(p.Y) / tanV)
+			end
+		end
+		return need * 1.06
+	end
+	local function reset()
+		yaw, pitch = PAGER_YAW, PAGER_PITCH
+		distance = fitDistance()
+		place()
+	end
+	-- notches > 0 aproxima. Fica entre 0,3x e 4x a distância em que a peça cabe.
+	local function zoom(notches)
+		local base = fitDistance()
+		distance = math.clamp(distance * (1 - PAGER_ZOOM) ^ notches, base * 0.3, base * 4)
+		place()
+	end
+
+	-- Arrastar gira; a página não rola enquanto isso (no toque, arrastar rolaria).
+	local dragging, lastPos, lastClick = false, nil, 0
+	surface.InputBegan:Connect(function(i)
+		if not isClick(i) or dragging then return end
+		local now = os.clock()
+		if now - lastClick < 0.35 then reset() end
+		lastClick = now
+		dragging, lastPos = true, i.Position
+		window:_lockScroll(true)
+	end)
+	local function stopDragging()
+		if not dragging then return end
+		dragging = false
+		window:_lockScroll(false)
+	end
+	window:_connect(UserInputService.InputEnded, function(i)
+		if isClick(i) then stopDragging() end
+	end)
+
+	-- Com o mouse em cima, a roda é da prévia: a página não rola e a câmera do jogo não aproxima (a ação de
+	-- prioridade alta engole a roda antes dela).
+	local WHEEL_ACTION = "CW_PreviewWheel_" .. tostring(math.random(1, 1e9))
+	local hovered = false
+	local function setHovered(on)
+		if hovered == on then return end
+		hovered = on
+		window:_lockScroll(on)
+		pcall(function()
+			if on then
+				ContextActionService:BindActionAtPriority(WHEEL_ACTION, function() return Enum.ContextActionResult.Sink end,
+					false, Enum.ContextActionPriority.High.Value, Enum.UserInputType.MouseWheel)
+			else
+				ContextActionService:UnbindAction(WHEEL_ACTION)
+			end
+		end)
+	end
+	surface.MouseEnter:Connect(function() setHovered(true) end)
+	surface.MouseLeave:Connect(function() setHovered(false) end)
+	view.Destroying:Connect(function() setHovered(false) end)
+
+	window:_connect(UserInputService.InputChanged, function(i)
+		if i.UserInputType == Enum.UserInputType.MouseWheel then
+			if hovered then
+				zoom(i.Position.Z * (UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and 3 or 1))
+			end
+		elseif dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local delta = i.Position - lastPos
+			lastPos = i.Position
+			yaw -= delta.X * 0.01
+			pitch = math.clamp(pitch - delta.Y * 0.01, -1.4, 1.4)
+			place()
+		end
+	end)
+
+	-- Escondida (a janela fechou, outra aba) sem o mouse sair: solta a roda e o arraste.
+	window:_connect(RunService.RenderStepped, function(dt)
+		local shown = window._shell.Visible and window._selected == tab
+		if not shown then
+			setHovered(false)
+			stopDragging()
+			return
+		end
+		if not model or dragging or not autoRotate or reducedMotion() then return end
+		yaw += PAGER_SPIN * math.min(dt, 0.1)
+		place()
+	end)
+
+	for index, name in ipairs(names) do
+		local frame = new("Frame", {
+			BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+			LayoutOrder = index, Visible = false, Parent = holder,
+		}, { new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }) })
+		pages[index] = setmetatable({ _window = window, Name = tostring(name), _n = 0, _page = frame, _body = frame }, Tab)
+	end
+
+	local function select(index)
+		if #names == 0 then return end
+		index = (index - 1) % #names + 1
+		current = index
+		for i, page in ipairs(pages) do page._page.Visible = i == index end
+		title.Text = tostring(names[index]):upper()
+		count.Text = index .. " / " .. #names
+		safeCall(o.Changed, index, names[index])
+	end
+
+	-- A linha embaixo da prévia: setas nas pontas (placas como as linhas da interface, com a seta desenhada) e os
+	-- controles da prévia no meio.
+	local function navButton(anchorX, step)
+		local hit = new("TextButton", {
+			BackgroundTransparency = 1, Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(anchorX, 1),
+			Position = UDim2.new(anchorX, 0, 1, 0), Size = UDim2.fromOffset(ROW_H, ROW_H), Parent = header,
+		})
+		local face = new("Frame", {
+			Surface = "Panel", BackgroundColor3 = "Item", BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(ROW_H - 4, ROW_H - 4), Parent = hit,
+		}, { corner(RADIUS) })
+		makeChevron(face, UDim2.fromScale(0.5, 0.5), 0.9, "Text").Rotation = step < 0 and 90 or -90
+		hoverColors(hit, face, "Item", "ItemHover")
+		hit.MouseButton1Click:Connect(function() select(current + step) end)
+	end
+	navButton(0, -1)
+	navButton(1, 1)
+
+	local tools = new("Frame", {
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 1),
+		Size = UDim2.fromOffset(0, ROW_H), AutomaticSize = Enum.AutomaticSize.X, Parent = header,
+	}, {
+		new("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+		}),
+	})
+	local function toolButton(order, text, width, onClick)
+		local hit, face = smallButton(tools, text, width)
+		hit.LayoutOrder = order
+		hit.MouseButton1Click:Connect(onClick)
+		return face
+	end
+	toolButton(1, "-", 30, function() zoom(-2) end)
+	toolButton(2, "+", 30, function() zoom(2) end)
+	toolButton(3, "Reset", 54, reset)
+	local spinFace
+	spinFace = toolButton(4, "Auto-Rotate", 92, function()
+		autoRotate = not autoRotate
+		paint(spinFace, "TextColor3", autoRotate and "Text" or "SubText") -- apagado = desligado
+	end)
+
+	function pager:Page(index) return pages[index] end
+	function pager:Get() return current, names[current] end
+	function pager:Select(index) select(index) end
+	-- manterCâmera: a mesma vista (o giro e o zoom, na proporção do tamanho novo).
+	function pager:SetModel(newModel, keepCamera)
+		local zoomed = model and distance / fitDistance() or 1
+		if model then model:Destroy() end
+		model = newModel
+		empty.Visible = newModel == nil
+		if not newModel then return end
+		local ok, cf, bounds = pcall(newModel.GetBoundingBox, newModel)
+		if ok then
+			pcall(newModel.TranslateBy, newModel, -cf.Position)
+			size = bounds
+		end
+		newModel.Parent = view
+		if keepCamera then
+			distance = fitDistance() * zoomed
+			place()
+		else
+			reset()
+		end
+	end
+
+	-- A primeira página aparece já; a prévia ajusta a distância quando a página ganha tamanho.
+	view:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		if model then reset() end
+	end)
+	select(1)
+	return pager
 end
 
 --// Window ----------------------------------------------------------------------
