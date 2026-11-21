@@ -273,6 +273,10 @@ CW.Settings.UI_THEME = {}
 CW.Settings.UI_LAYERS = ""
 -- Per-asset settings (see CW.Profiles below): { [category] = { [asset's library path] = { [setting] = value } } }.
 CW.Settings.ASSET_PROFILES = {}
+-- Hit sound of each gun (CW.HitSounds, Sound module): { [gun] = library path or "id:123" }, and the volume of
+-- each gun's sounds: { ["<gun>|<path>"] = volume }.
+CW.Settings.HIT_SOUND_GUNS = {}
+CW.Settings.HIT_SOUND_GUN_VOLUMES = {}
 
 -- Snapshot of the defaults, taken before any saved value is applied. The save routine
 -- writes only the settings whose value differs from these.
@@ -809,7 +813,8 @@ local function scanLibrary(category, weapon)
 end
 
 function CW.Library.list(category, weapon)
-	local key = tostring(category) .. "|" .. tostring(weapon)
+	-- (the weapon only picks a folder in the per-weapon categories; HitSounds files are shared by every gun)
+	local key = tostring(category) .. "|" .. (WEAPON_CATEGORIES[category] and tostring(weapon) or "")
 	local cached = listCache[key]
 	if not cached then
 		cached = scanLibrary(category, weapon)
@@ -993,16 +998,19 @@ end
 --// Custom asset IDs ------------------------------------------------------------------
 -- Roblox asset IDs the player adds in the UI, saved in CycleWare/custom_ids.json:
 --   { "schemaVersion": 2,
---     "HitSounds":  [ { "Name": "Pop", "Id": "123" } ],           one list (Hitmarkers too)
+--     "Hitmarkers": [ { "Name": "Pop", "Id": "123" } ],           one list
 --     "WeaponSounds": { "AK-47": [ { "Name": "...", "Id": "..." } ] }   one list per gun
---     (ReloadSounds and Textures are per gun as well) }
+--     (HitSounds, ReloadSounds and Textures are per gun as well) }
 -- An ID is listed next to the library files of its category (and gun), and choosing it is saved
 -- like a file choice, as "id:<number>".
 -- Without the file functions (CAPS.files) the IDs still work, but only until the player rejoins.
 local CUSTOM_ID_CATEGORIES = { -- true = one list per gun
-	Hitmarkers = false, HitSounds = false, Cursors = false,
-	Textures = true, WeaponSounds = true, ReloadSounds = true,
+	Hitmarkers = false, Cursors = false,
+	HitSounds = true, Textures = true, WeaponSounds = true, ReloadSounds = true,
 }
+-- A list saved before its category was per gun (HitSounds was one list for every gun): it becomes the start
+-- of each gun's own list once the guns are known (CW.CustomIds.splitPerGun).
+local legacyLists = {}
 -- Categories whose IDs are downloaded into a real library file (the cursor needs the PNG's pixels to
 -- make its tinted copies). Their entries also keep File = "<Category>/<name>.png", and they are listed
 -- through that file, not as an rbxassetid item.
@@ -1164,8 +1172,10 @@ function CW.CustomIds.load()
 		local source = data[category]
 		if perGun then
 			local byGun = {}
-			-- Only a map of gun -> list is read (a plain list has no gun to belong to).
-			if type(source) == "table" and source[1] == nil then
+			-- A map of gun -> list; a plain list is from before the category was per gun.
+			if type(source) == "table" and source[1] ~= nil then
+				legacyLists[category] = sanitizeList(source, category)
+			elseif type(source) == "table" then
 				for weapon, list in pairs(source) do
 					if validWeaponName(weapon) then
 						local loaded = sanitizeList(list, category)
@@ -1280,6 +1290,22 @@ function CW.CustomIds.remove(category, weapon, rawId)
 end
 
 -- "id:123" <-> "rbxassetid://123"
+-- Gives every gun that has no list yet a copy of the list saved before the category was per gun (once).
+function CW.CustomIds.splitPerGun(category, guns)
+	local legacy = legacyLists[category]
+	if not legacy or not CUSTOM_ID_CATEGORIES[category] then return end
+	legacyLists[category] = nil
+	local byGun = customLists[category]
+	if type(byGun) ~= "table" then
+		byGun = {}
+		customLists[category] = byGun
+	end
+	for _, gun in ipairs(guns) do
+		if validWeaponName(gun) and byGun[gun] == nil and #legacy > 0 then byGun[gun] = copyEntries(legacy) end
+	end
+	CW.CustomIds.save()
+end
+
 function CW.CustomIds.selectionOf(id) return "id:" .. id end
 function CW.CustomIds.assetOf(selection)
 	local id = type(selection) == "string" and selection:match("^id:(%d+)$")
@@ -2462,76 +2488,155 @@ local SoundService    = game:GetService("SoundService")
 local ContentProvider = game:GetService("ContentProvider")
 local Debris          = game:GetService("Debris")
 
--- A few Sound objects are created ONCE when the hit sound is (re)loaded and preloaded with
--- ContentProvider. A hit then only rewinds one of them and calls :Play(), which is immediate.
--- They are used round-robin so rapid hits overlap instead of cutting each other off.
--- If the pool is unavailable for any reason, a fresh Sound per hit is used as a fallback.
+-- Every gun has its own hit sound (a file of the HitSounds folder or one of that gun's custom IDs) and its
+-- own volume for each sound, so switching sounds brings back the volume that one had:
+--   HIT_SOUND_GUNS        { ["AK-47"] = "HitSounds/pop.mp3" | "id:123" }
+--   HIT_SOUND_GUN_VOLUMES { ["AK-47|HitSounds/pop.mp3"] = 0.6 }   (a sound never set plays at the default)
+-- The one hit sound of older versions (ASSET_SELECTIONS.HitSound, with its volume) is where every gun starts,
+-- and what a hit plays when no gun is in hand.
+--
+-- For each sound in use a few Sound objects are created once and preloaded. A hit then only rewinds one of
+-- them and calls :Play(), which is immediate; they take turns so rapid hits overlap instead of cutting each
+-- other off. If that fails, a fresh Sound per hit is used.
 
 local POOL_SIZE = 4
+local pools = {}   -- asset -> { sounds = { Sound }, index = n }
+local assets = {}  -- library path or "id:123" -> asset, or false when it could not be loaded
+local loading = {} -- paths being loaded right now
 
-local function destroyPool()
-	local pool = CW.State.hitSoundPool
-	CW.State.hitSoundPool = nil
-	CW.State.hitSoundIndex = 0
-	if pool then
-		for _, sound in ipairs(pool) do
-			pcall(function() sound:Destroy() end)
-		end
+local function destroyPool(asset)
+	local pool = pools[asset]
+	pools[asset] = nil
+	for _, sound in ipairs(pool and pool.sounds or {}) do
+		pcall(function() sound:Destroy() end)
 	end
 end
-CW.State.destroyHitSoundPool = destroyPool
+local function destroyPools()
+	for asset in pairs(pools) do destroyPool(asset) end
+end
+CW.State.destroyHitSoundPool = destroyPools
 
-local function buildPool(assetId)
-	destroyPool()
-
-	local pool = {}
+local function poolOf(asset)
+	if pools[asset] then return pools[asset] end
+	local pool = { sounds = {}, index = 0 }
 	for _ = 1, POOL_SIZE do
 		local ok, sound = pcall(function()
 			local snd = Instance.new("Sound")
-			snd.Name     = "CW_HitSound"
-			snd.SoundId  = assetId
-			snd.Volume   = CW.Settings.SOUND_VOLUME
-			snd.Parent   = SoundService
+			snd.Name    = "CW_HitSound"
+			snd.SoundId = asset
+			snd.Parent  = SoundService
 			return snd
 		end)
-		if ok and sound then pool[#pool + 1] = sound end
+		if ok and sound then table.insert(pool.sounds, sound) end
 	end
-	if #pool == 0 then
-		CW.Warn("Could not create the hit sound pool; falling back to on-demand sounds")
-		return
+	pools[asset] = pool
+	if #pool.sounds > 0 then
+		task.spawn(function()
+			local ok, err = pcall(function() ContentProvider:PreloadAsync(pool.sounds) end)
+			if not ok then CW.Log("Hit sound preload skipped: " .. tostring(err)) end
+		end)
 	end
-
-	CW.State.hitSoundPool = pool
-
-	task.spawn(function()
-		local ok, err = pcall(function() ContentProvider:PreloadAsync(pool) end)
-		if not ok then CW.Log("Hit sound preload skipped: " .. tostring(err)) end
-	end)
+	return pool
 end
 
-local function reloadSound()
-	local asset, failReason = CW.loadLibraryAsset({
-		file = CW.Paths.SOUND_FILE,
+-- Loads a library path or a custom ID once (this can yield: an audio file may need a compatible copy).
+local function load(relative)
+	if type(relative) ~= "string" or relative == "" or assets[relative] ~= nil or loading[relative] then return end
+	loading[relative] = true
+	local asset = CW.loadLibraryAsset({
+		file = CW.CustomIds.assetOf(relative) or (CW.Paths.LIBRARY_ROOT .. "/" .. relative),
 		label = "hit sound",
 		audio = true,
 	})
-	if asset then
-		CW.Settings.SOUND_ID = asset
-		buildPool(asset)
-	elseif failReason == "missing" or failReason == "error" then
-		CW.Settings.SOUND_ID = nil
-		destroyPool()
+	loading[relative] = nil
+	assets[relative] = asset or false
+end
+
+local function general()
+	return CW.Settings.ASSET_SELECTIONS.HitSound or CW.Library.relative(CW.Paths.SOUND_FILE)
+end
+local function volumeKey(gun, relative) return gun .. "|" .. tostring(relative) end
+
+CW.HitSounds = {}
+function CW.HitSounds.relative(gun)
+	local choice = gun and CW.Settings.HIT_SOUND_GUNS[gun]
+	if type(choice) == "string" then return choice end
+	return general()
+end
+function CW.HitSounds.volume(gun)
+	if not gun then return CW.Settings.SOUND_VOLUME end
+	local saved = CW.Settings.HIT_SOUND_GUN_VOLUMES[volumeKey(gun, CW.HitSounds.relative(gun))]
+	return tonumber(saved) or CW.Defaults.SOUND_VOLUME or 1
+end
+
+-- Loads every sound in use (each gun's and the one with no gun in hand) and drops the pools of the others.
+local function prepare()
+	local wanted = { [general()] = true }
+	for _, relative in pairs(CW.Settings.HIT_SOUND_GUNS) do wanted[relative] = true end
+	local inUse = {}
+	for relative in pairs(wanted) do
+		load(relative)
+		local asset = assets[relative]
+		if asset then
+			inUse[asset] = true
+			poolOf(asset)
+		end
+	end
+	for asset in pairs(pools) do
+		if not inUse[asset] then destroyPool(asset) end
 	end
 end
 
+function CW.HitSounds.set(gun, relative)
+	CW.Settings.HIT_SOUND_GUNS[gun] = relative
+	task.spawn(prepare)
+end
+function CW.HitSounds.setVolume(gun, volume)
+	CW.Settings.HIT_SOUND_GUN_VOLUMES[volumeKey(gun, CW.HitSounds.relative(gun))] = math.clamp(tonumber(volume) or 1, 0, 2)
+end
+-- One of this gun's custom IDs was replaced by another one (newRelative) or removed (nil): its volume moves
+-- with it, and a gun that was using it takes the new one, or the first library file.
+function CW.HitSounds.replaceChoice(gun, oldRelative, newRelative)
+	local volumes = CW.Settings.HIT_SOUND_GUN_VOLUMES
+	local oldKey = volumeKey(gun, oldRelative)
+	if newRelative then volumes[volumeKey(gun, newRelative)] = volumes[oldKey] end
+	volumes[oldKey] = nil
+	if CW.HitSounds.relative(gun) == oldRelative then
+		local first = CW.Library.list("HitSounds")[1]
+		CW.HitSounds.set(gun, newRelative or (first and first.Relative) or "")
+	end
+end
+-- Every gun of the game starts from the one hit sound of older versions, with its volume (a gun added to the
+-- game later too); the custom IDs of that one list become each gun's own.
+function CW.HitSounds.adoptGuns(guns)
+	local base = general()
+	local profiles = CW.Settings.ASSET_PROFILES.HitSounds
+	local profile = type(profiles) == "table" and base and profiles[base]
+	local baseVolume = type(profile) == "table" and tonumber(profile.SOUND_VOLUME) or CW.Defaults.SOUND_VOLUME or 1
+	for _, gun in ipairs(guns) do
+		if CW.Settings.HIT_SOUND_GUNS[gun] == nil and base then
+			CW.Settings.HIT_SOUND_GUNS[gun] = base
+			CW.Settings.HIT_SOUND_GUN_VOLUMES[volumeKey(gun, base)] = baseVolume
+		end
+	end
+	CW.CustomIds.splitPerGun("HitSounds", guns)
+	task.spawn(prepare)
+end
+
+-- The library changed (a sync, a custom ID edited): everything is loaded again.
+local function reloadSound()
+	table.clear(assets)
+	destroyPools()
+	prepare()
+end
 CW.reloadSoundAsset = reloadSound
 reloadSound()
 
-local function playOnDemand()
+local function playOnDemand(asset, volume)
 	local ok, s = pcall(function()
 		local snd = Instance.new("Sound")
-		snd.SoundId = CW.Settings.SOUND_ID
-		snd.Volume  = CW.Settings.SOUND_VOLUME
+		snd.SoundId = asset
+		snd.Volume  = volume
 		SoundService:PlayLocalSound(snd)
 		return snd
 	end)
@@ -2546,23 +2651,30 @@ local function playOnDemand()
 	Debris:AddItem(s, 10)
 end
 
-function CW.playHitSound()
-	if not CW.Settings.SOUND_ID then return end
+-- gun: the name of the tool in hand when the shot hit (nil when there was none).
+function CW.playHitSound(gun)
+	local relative = CW.HitSounds.relative(gun)
+	if type(relative) ~= "string" or relative == "" then return end -- this gun has no hit sound
+	local asset = assets[relative]
+	if asset == nil then
+		task.spawn(prepare) -- not loaded yet: ready for the next hit
+		return
+	end
+	if not asset then return end
+	local volume = CW.HitSounds.volume(gun)
 
-	local pool = CW.State.hitSoundPool
-	if pool and #pool > 0 then
-		local index = ((CW.State.hitSoundIndex or 0) % #pool) + 1
-		CW.State.hitSoundIndex = index
-		local sound = pool[index]
+	local pool = pools[asset]
+	if pool and #pool.sounds > 0 then
+		pool.index = pool.index % #pool.sounds + 1
+		local sound = pool.sounds[pool.index]
 		local ok = pcall(function()
-			sound.Volume       = CW.Settings.SOUND_VOLUME
+			sound.Volume       = volume
 			sound.TimePosition = 0
 			sound:Play()
 		end)
 		if ok then return end
 	end
-
-	playOnDemand()
+	playOnDemand(asset, volume)
 end
 end)
 
@@ -2651,6 +2763,8 @@ do
 	table.sort(SOUND_WEAPONS)
 end
 CW.SoundWeaponList = SOUND_WEAPONS
+-- Each of these guns has its own hit sound (the Sound module).
+if CW.HitSounds then CW.HitSounds.adoptGuns(SOUND_WEAPONS) end
 
 for _, weaponName in ipairs(SOUND_WEAPONS) do
 	-- Your own mp3, ogg, wav or flac files go in WeaponSounds/<Weapon>/ (shoot) and ReloadSounds/<Weapon>/ (reload).
@@ -3413,7 +3527,10 @@ function CW.processShot(hits)
 		end
 	end
 	if not shotHit then return end
-	CW.playHitSound()
+	-- The hit sound of the gun in hand (this runs at most a frame after the shot).
+	local character = Players.LocalPlayer.Character
+	local tool = character and character:FindFirstChildOfClass("Tool")
+	CW.playHitSound(tool and tool.Name)
 	if not CW.HMTemplate or not CW.IAPortable then return end
 
 	-- Read the real mouse position now; mouseX/Y only update on MouseMovement.
@@ -3855,6 +3972,15 @@ local function wrapSection(section)
 		return section:AddLayerCanvas(control)
 	end
 	function adapter:AddLabel(text) return section:AddLabel(text) end
+	-- A fixed inset panel inside the section that keeps one thing's controls together (CWUI 3.1+); on an older
+	-- CWUI the controls just go into the section.
+	function adapter:Group(caption)
+		if type(section.AddGroup) ~= "function" then return adapter end
+		local group = section:AddGroup({ Name = caption })
+		local wrapped = wrapSection(group)
+		function wrapped:SetCaption(text) group:SetName(text) end
+		return wrapped
+	end
 	function adapter:AddSubSection(name, open)
 		-- Subsections are collapsed unless the caller explicitly asks for them open.
 		return wrapSection(section:AddSubSection({ Name = name, Open = open == true }))
@@ -3883,7 +4009,8 @@ local function galleryItems(category, weapon)
 	return items
 end
 
-local HitmarkerGallery, CursorGallery, HitSoundDropdown
+local HitmarkerGallery, CursorGallery
+local hitSoundDrawers = {} -- { gun, entries, dropdown, volume } per gun
 local textureGalleries = {}
 local refreshUIFromLibrary -- defined after the tabs; the custom ID controls call it
 
@@ -3901,59 +4028,32 @@ end
 ------------------------------------------------------------------------------
 -- Hit sound catalog / weapon sound override logic (no UI here)
 ------------------------------------------------------------------------------
-local hitSoundEntries = {}
-local availableHitSounds = {}
-
-local function refreshHitSoundCatalog()
-	table.clear(hitSoundEntries)
-	table.clear(availableHitSounds)
-	local options, taken = {}, {}
-	for _, item in ipairs(CW.Library.items("HitSounds")) do
+-- One gun's hit sound list: the files of the HitSounds folder, then that gun's custom IDs.
+-- Returns the labels and the entries { label, relative } to translate between them.
+local function hitSoundCatalog(gun)
+	local options, entries, taken = {}, {}, {}
+	for _, item in ipairs(CW.Library.items("HitSounds", gun)) do
 		local label = item.CustomId and customIdLabel(item, taken) or item.Relative:gsub("^HitSounds/", "")
 		taken[label] = true
-		item.Label = label
-		table.insert(hitSoundEntries, item)
-		availableHitSounds[item.Relative] = true
 		table.insert(options, label)
+		table.insert(entries, { label = label, relative = item.Relative })
 	end
-	return options
+	return options, entries
 end
 
-local function hitSoundPath(value)
-	if type(value) ~= "string" then return nil end
-	for _, item in ipairs(hitSoundEntries) do
-		if value == item.Label or value == item.Path or value == item.Relative then
-			return item.Path
-		end
-	end
-	local relative = CW.Library.relative(value) or value
-	if availableHitSounds[relative] then
-		return CW.CustomIds.assetOf(relative) or (CW.Paths.LIBRARY_ROOT .. "/" .. relative)
+local function hitSoundLabel(entries, relative)
+	for _, entry in ipairs(entries) do
+		if entry.relative == relative then return entry.label end
 	end
 	return nil
 end
 
-local function hitSoundLabel(value)
-	local path = hitSoundPath(value)
-	local relative = path and CW.Library.relative(path)
-	for _, item in ipairs(hitSoundEntries) do
-		if item.Relative == relative then return item.Label end
+local function hitSoundRelative(entries, label)
+	for _, entry in ipairs(entries) do
+		if entry.label == label then return entry.relative end
 	end
 	return nil
 end
-
--- Choosing a hit sound brings its own volume (CW.Profiles).
-local function applySoundFile(value)
-	local path = hitSoundPath(value)
-	if not path then return end
-	CW.Paths.SOUND_FILE = path
-	local relative = CW.Library.relative(path)
-	CW.Library.setSelection("HitSounds", nil, relative)
-	CW.Profiles.use("HitSounds", relative)
-	if CW.reloadSoundAsset then CW.reloadSoundAsset() end
-end
-
-local hitSoundOptions = refreshHitSoundCatalog()
 
 ------------------------------------------------------------------------------
 -- Weapon sound changers: one factory, one instance per action (shoot, reload).
@@ -4567,8 +4667,9 @@ end
 
 -- The row itself: CWUI's AddInputRow, or two text boxes and two buttons when an older cached CWUI
 -- has no AddInputRow. Both give :Get(key), :Clear() and :Flash(button, text, seconds).
-local function inputRow(section, fields, buttons)
-	local row = section:InputRow({ Fields = fields, Buttons = buttons })
+-- changed: optional, called on every letter typed (CWUI 3.1+).
+local function inputRow(section, fields, buttons, changed)
+	local row = section:InputRow({ Fields = fields, Buttons = buttons, Changed = changed })
 	if row then return row end
 
 	local boxes, buttonObjs = {}, {}
@@ -4615,8 +4716,8 @@ local function inputRow(section, fields, buttons)
 	return shim
 end
 
--- Add / Edit / Remove live in the header of the asset's own list (dropdown or gallery), next to what they change.
--- Edit and Remove show only while the selected asset is a custom ID. One light loop keeps them in step.
+-- Custom ID controls follow what is selected (Edit and Remove only while it is a custom ID): in a gallery's
+-- header (attachActions), or in a gun sound's own editor (addAssetEditor). One light loop keeps them in step.
 local customIdActionUpdaters = {}
 CW.track("customIdActions", game:GetService("RunService").Heartbeat:Connect((function()
 	local elapsed = 0
@@ -4660,7 +4761,7 @@ local function attachActions(section, controls, onAdd, onEdit, onRemove)
 	return update
 end
 
--- The ID form under a list: hidden until Add or Edit is pressed, hidden again by Cancel or after saving.
+-- The ID form under a gallery: hidden until Add or Edit is pressed, hidden again by Cancel or after saving.
 -- (An older cached CWUI has no row Instance: the form then just stays visible.)
 local function formVisibility(row)
 	return function(visible)
@@ -4668,19 +4769,27 @@ local function formVisibility(row)
 	end
 end
 
+-- What one list's custom IDs need, however they are shown: add, rename, replace and remove, each asset
+-- checked before it is saved.
 -- opts = {
---   category  = "Hitmarkers" | "Textures" | "WeaponSounds" | "ReloadSounds"
+--   category  = "Hitmarkers" | "Textures" | "HitSounds" | "WeaponSounds" | "ReloadSounds"
 --   kind      = "Audio" | "Image" | "Texture"      (placeholder text)
 --   weapon    = function() return gun name end     (per-gun categories)
 --   selected  = function() return saved choice ("id:123" or a file) end
---   controls  = { the dropdown / gallery that selects this asset }
 -- }
-local function addCustomIdRow(section, opts)
+-- view = { flash = function(text, seconds) end, saved = function(text) end }   (saved: after an add or an edit)
+local function customIdEditor(opts, view)
 	local category = opts.category
-	local function currentWeapon() return opts.weapon and opts.weapon() or nil end
-	local function selectedId()
+	local editor = { editingId = nil } -- the custom ID being edited; nil while adding
+	local checking = false
+
+	function editor.weapon() return opts.weapon and opts.weapon() or nil end
+	function editor.selectedId()
 		local selected = opts.selected and opts.selected()
 		return type(selected) == "string" and selected:match("^id:(%d+)$") or nil
+	end
+	function editor.entry(id)
+		return id and CW.CustomIds.get(category, editor.weapon(), id) or nil
 	end
 
 	local function afterChange()
@@ -4691,6 +4800,10 @@ local function addCustomIdRow(section, opts)
 	-- Every saved choice of the old ID (this gun only, for the per-gun categories) moves to the new one,
 	-- or is cleared when there is no new one.
 	local function moveChoices(weapon, oldRelative, newRelative)
+		if category == "HitSounds" then
+			CW.HitSounds.replaceChoice(weapon, oldRelative, newRelative)
+			return
+		end
 		if newRelative then
 			CW.Library.replaceSelectionOf(category, weapon, oldRelative, newRelative)
 		else
@@ -4709,34 +4822,18 @@ local function addCustomIdRow(section, opts)
 			.. (opts.kind == "Audio" and "an audio" or "an image (a Decal ID instead of its Image ID?)") .. "."
 	end
 
-	local row, showForm
-	local editingId -- the custom ID being edited; nil while adding
-	local checking = false
-	local function setEditing(id)
-		editingId = id
-		row:SetButtonText(1, id and "Save" or "Add")
-	end
-	-- After a save: the result shows on the button for a moment, then the form closes.
-	local function finish(text)
-		row:Flash(1, text)
-		task.delay(1, function()
-			if not editingId then showForm(false) end
-		end)
-	end
-
 	-- Saves an ID that is known to load (or a new name for one already saved).
 	local function commit(values, weapon, newId, oldId)
 		if not oldId or newId == oldId then
 			-- A new ID, or a new name for the same one.
 			local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, values.name)
 			if not entry then
-				row:Flash(1, problem == "name" and "Name used" or "Invalid", 2)
+				view.flash(problem == "name" and "Name used" or "Invalid", 2)
 				CW.Warn("Custom ID not saved: " .. tostring(reason))
 				return
 			end
-			row:Clear()
-			setEditing(nil)
-			finish(oldId and "Saved" or "Added")
+			editor.editingId = nil
+			view.saved(oldId and "Saved" or "Added")
 			afterChange()
 			return
 		end
@@ -4747,43 +4844,42 @@ local function addCustomIdRow(section, opts)
 		local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, name)
 		if not entry then
 			if old then CW.CustomIds.add(category, weapon, old.Id, old.Name) end -- put the old one back
-			row:Flash(1, problem == "name" and "Name used" or "Invalid", 2)
+			view.flash(problem == "name" and "Name used" or "Invalid", 2)
 			CW.Warn("Custom ID not saved: " .. tostring(reason))
 			return
 		end
 		moveChoices(weapon, CW.CustomIds.selectionOf(oldId), CW.CustomIds.selectionOf(newId))
-		row:Clear()
-		setEditing(nil)
-		finish("Saved")
+		editor.editingId = nil
+		view.saved("Saved")
 		pcall(CW.reloadCoreAssets)
 		afterChange()
 	end
 
 	-- An ID is saved only once Roblox has loaded it (audio as audio, image as image); a new name for an ID
 	-- that is already saved needs no check.
-	local function save(values)
+	function editor.save(values)
 		if checking then
-			row:Flash(1, "Wait")
+			view.flash("Wait")
 			return
 		end
-		local weapon = currentWeapon()
+		local weapon = editor.weapon()
 		local newId = CW.CustomIds.parse(values.id)
 		if not newId then
-			row:Flash(1, "Invalid")
+			view.flash("Invalid")
 			return
 		end
-		local oldId = editingId
+		local oldId = editor.editingId
 		local known = (oldId and newId == oldId) or (not oldId and CW.CustomIds.get(category, weapon, newId) ~= nil)
 		if known then
 			commit(values, weapon, newId, oldId)
 			return
 		end
 		checking = true
-		row:Flash(1, "Checking", 10)
+		view.flash("Checking", 10)
 		checkCustomAsset("rbxassetid://" .. newId, opts.kind == "Audio" and "Audio" or "Image", function(loaded, why)
 			checking = false
 			if not loaded then
-				row:Flash(1, "Invalid", 2)
+				view.flash("Invalid", 2)
 				CW.Warn(loadFailureText(newId, why))
 				return
 			end
@@ -4791,11 +4887,46 @@ local function addCustomIdRow(section, opts)
 		end)
 	end
 
+	-- Deletes one custom ID and clears every choice that used it. Returns true when it was deleted.
+	function editor.remove(id)
+		local weapon = editor.weapon()
+		if not id or not CW.CustomIds.remove(category, weapon, id) then return false end
+		moveChoices(weapon, CW.CustomIds.selectionOf(id), nil)
+		if editor.editingId == id then editor.editingId = nil end
+		pcall(CW.reloadCoreAssets)
+		afterChange()
+		return true
+	end
+
+	return editor
+end
+
+-- A gallery's custom IDs: Add, Edit and Remove in the gallery's header (see attachActions), the form hidden
+-- under it until one of them is used. opts: as customIdEditor, plus controls = { the gallery }.
+local function addCustomIdRow(section, opts)
+	local row, showForm, editor
+	local function setEditing(id)
+		editor.editingId = id
+		row:SetButtonText(1, id and "Save" or "Add")
+	end
+	editor = customIdEditor(opts, {
+		flash = function(text, seconds) row:Flash(1, text, seconds) end,
+		-- The result shows on the button for a moment, then the form closes.
+		saved = function(text)
+			row:Clear()
+			setEditing(nil)
+			row:Flash(1, text)
+			task.delay(1, function()
+				if not editor.editingId then showForm(false) end
+			end)
+		end,
+	})
+
 	row = inputRow(section, {
 		{ Key = "id", Title = opts.kind .. " ID", Placeholder = opts.kind .. " ID or link", Weight = 0.55 },
 		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
 	}, {
-		{ Text = "Add", Title = "Add ID", Callback = function(values) save(values) end },
+		{ Text = "Add", Title = "Add ID", Callback = function(values) editor.save(values) end },
 		{ Text = "Cancel", Title = "Cancel", Callback = function()
 			row:Clear()
 			setEditing(nil)
@@ -4811,8 +4942,7 @@ local function addCustomIdRow(section, opts)
 		showForm(true)
 	end
 	local function edit()
-		local id = selectedId()
-		local entry = id and CW.CustomIds.get(category, currentWeapon(), id)
+		local entry = editor.entry(editor.selectedId())
 		if not entry then return end
 		row:Set("id", entry.Id)
 		row:Set("name", entry.Name)
@@ -4820,21 +4950,115 @@ local function addCustomIdRow(section, opts)
 		showForm(true)
 	end
 	local function remove()
-		local weapon = currentWeapon()
-		local id = selectedId()
-		if not id or not CW.CustomIds.remove(category, weapon, id) then return end
-		moveChoices(weapon, CW.CustomIds.selectionOf(id), nil)
-		if editingId == id then
+		local id = editor.selectedId()
+		local wasEditing = id ~= nil and editor.editingId == id
+		if editor.remove(id) and wasEditing then
 			row:Clear()
 			setEditing(nil)
 			showForm(false)
 		end
-		pcall(CW.reloadCoreAssets)
-		afterChange()
 	end
 	local showActions = attachActions(section, opts.controls, add, edit, remove)
-	table.insert(customIdActionUpdaters, function() showActions(selectedId() ~= nil) end)
+	table.insert(customIdActionUpdaters, function() showActions(editor.selectedId() ~= nil) end)
 	return row
+end
+
+-- A gun's sound IDs, always shown in its drawer, in a panel of their own:
+--   [Audio ID or link] [Name (optional)]
+--   [Add | Save] [Cancel] [Edit] [Remove]
+-- Add puts a new ID in this gun's list. Edit loads the selected custom ID into the boxes, and Save keeps the
+-- change. Cancel drops what was typed, or the edit, and nothing is applied. Remove deletes the selected custom
+-- ID (the edited one while editing). A button is shown only while it can do something.
+-- opts: as customIdEditor. Returns { refresh } (the drawer calls it when its sound changes).
+local function addAssetEditor(section, opts)
+	local CAPTION = "Add a sound by its ID"
+	local group = section:Group(CAPTION)
+	local fields, buttons, editor
+
+	local function refresh()
+		if not (fields and buttons) then return end
+		local editing = editor.editingId ~= nil
+		local selected = editor.selectedId()
+		local typed = (fields:Get("id") or "") ~= "" or (fields:Get("name") or "") ~= ""
+		buttons:SetButtonText(1, editing and "Save" or "Add")
+		if buttons.SetButtonVisible then
+			buttons:SetButtonVisible(2, editing or typed)                               -- Cancel
+			buttons:SetButtonVisible(3, selected ~= nil and selected ~= editor.editingId) -- Edit
+			buttons:SetButtonVisible(4, (editor.editingId or selected) ~= nil)          -- Remove
+		end
+		if group.SetCaption then
+			local entry = editing and editor.entry(editor.editingId)
+			group:SetCaption(entry and ("Editing " .. entry.Name) or CAPTION)
+		end
+	end
+	local function reset()
+		fields:Clear()
+		editor.editingId = nil
+		refresh()
+	end
+
+	editor = customIdEditor(opts, {
+		flash = function(text, seconds) buttons:Flash(1, text, seconds) end,
+		saved = function(text)
+			reset()
+			buttons:Flash(1, text)
+		end,
+	})
+	fields = inputRow(group, {
+		{ Key = "id", Title = opts.kind .. " ID", Placeholder = opts.kind .. " ID or link", Weight = 0.55 },
+		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
+	}, {}, refresh)
+	buttons = inputRow(group, {}, {
+		{ Text = "Add", Title = "Add ID", Callback = function()
+			editor.save({ id = fields:Get("id"), name = fields:Get("name") })
+		end },
+		{ Text = "Cancel", Title = "Cancel", Callback = reset },
+		{ Text = "Edit", Title = "Edit Selected ID", Callback = function()
+			local entry = editor.entry(editor.selectedId())
+			if not entry then return end
+			editor.editingId = entry.Id
+			fields:Set("id", entry.Id)
+			fields:Set("name", entry.Name)
+			refresh()
+		end },
+		{ Text = "Remove", Title = "Remove Selected ID", Callback = function()
+			if editor.remove(editor.editingId or editor.selectedId()) then reset() end
+		end },
+	})
+	refresh()
+	table.insert(customIdActionUpdaters, refresh) -- the sound can also change from elsewhere (a library refresh)
+	return { refresh = refresh }
+end
+
+-- One gun's sound, laid out the same in Hit Sound, Shoot Sounds and Reload Sounds:
+--   <title>                    the sound in use (a list)
+--   [ panel: sound by ID ]     the editor of this gun's custom IDs
+--   Volume of This Sound       right under it: each sound of the gun keeps its own volume
+-- spec = { title, options, value, volume, volumeNow(), onChoose(label), onVolume(v), editor = customIdEditor opts }
+-- Returns { dropdown, volume }.
+local function buildSoundDrawer(drawer, spec)
+	local volume, editor
+	local dropdown = drawer:Dropdown({
+		Title = spec.title,
+		Options = spec.options,
+		Default = spec.value,
+		Callback = function(value)
+			spec.onChoose(value)
+			if volume then volume:Set(spec.volumeNow(), true) end
+			if editor then editor.refresh() end
+		end,
+	})
+	guarded(spec.title .. " IDs", function() editor = addAssetEditor(drawer, spec.editor) end)
+	volume = drawer:Slider({
+		Title = "Volume of This Sound",
+		Min = 0,
+		Max = 2,
+		Default = spec.volume,
+		Decimal = 2,
+		Suffix = "x",
+		Callback = spec.onVolume,
+	})
+	return { dropdown = dropdown, volume = volume }
 end
 
 ------------------------------------------------------------------------------
@@ -5115,32 +5339,34 @@ guarded("Cursors", function()
 		end
 	end
 
+	-- Hit Sound: what the drawers are about, then one drawer per gun, laid out like the shoot and reload sounds.
 	guarded("Hit Sound", function()
-		HitSoundDropdown = HitSoundSection:Dropdown({
-			Title = "Hit Sound",
-			Options = hitSoundOptions,
-			Default = hitSoundLabel(CW.Paths.SOUND_FILE),
-			Callback = applySoundFile,
-		})
-
-		local showOwner = ownerLabel(HitSoundSection, "sound")
-		local volume = HitSoundSection:Slider({
-			Title = "Volume",
-			Min = 0,
-			Max = 2,
-			Default = CW.Settings.SOUND_VOLUME,
-			Decimal = 2,
-			Suffix = "x",
-			Callback = function(v)
-				CW.Settings.SOUND_VOLUME = v
-				CW.Profiles.store("HitSounds")
-			end,
-		})
-		CW.Profiles.listeners.HitSounds = function()
-			volume:Set(CW.Settings.SOUND_VOLUME, true)
-			showOwner("HitSounds")
+		HitSoundSection:AddLabel("Each gun keeps its own hit sound, custom IDs and volume. Changes save on their own.")
+		for _, gunName in ipairs(soundWeaponNames()) do
+			local gun = gunName
+			local options, entries = hitSoundCatalog(gun)
+			local drawer = { gun = gun, entries = entries }
+			local controls = buildSoundDrawer(HitSoundSection:AddSubSection(gun, false), {
+				title = "Hit Sound",
+				options = options,
+				value = hitSoundLabel(entries, CW.HitSounds.relative(gun)),
+				volume = CW.HitSounds.volume(gun),
+				volumeNow = function() return CW.HitSounds.volume(gun) end,
+				onChoose = function(label)
+					local relative = hitSoundRelative(drawer.entries, label)
+					if relative then CW.HitSounds.set(gun, relative) end
+				end,
+				onVolume = function(v) CW.HitSounds.setVolume(gun, v) end,
+				editor = {
+					category = "HitSounds",
+					kind = "Audio",
+					weapon = function() return gun end,
+					selected = function() return CW.HitSounds.relative(gun) end,
+				},
+			})
+			drawer.dropdown, drawer.volume = controls.dropdown, controls.volume
+			table.insert(hitSoundDrawers, drawer)
 		end
-		showOwner("HitSounds")
 	end)
 
 	guarded("Cursor", function()
@@ -5327,12 +5553,9 @@ guarded("Guns", function()
 	local TextureSection = wrapSection(GunsTab:AddSection({ Name = "Textures", Open = false }))
 	local EffectsSection = wrapSection(GunsTab:AddSection({ Name = "Effects", Open = false }))
 
-	-- Same controls for every changer: the two switches, then each gun's sound file with its own volume
-	-- (the volume also applies while the gun keeps the game's own sound) and its own custom IDs.
-	-- With drawers = true every gun gets its own collapsed subsection (like Textures):
-	--   <Gun>  ->  Sound dropdown, Volume slider, [ID] [Name] [Add ID] [Remove] for that gun only.
-	-- Without it the guns are listed one after the other and a "Custom ID Gun" dropdown picks the gun.
-	local function buildChangerSection(section, changer, label, drawers)
+	-- Same layout for every changer: first what applies to all guns (the two switches), then one drawer per gun
+	-- with its sound, its custom IDs and its volume (buildSoundDrawer), all of them that gun's own.
+	local function buildChangerSection(section, changer, label)
 		local spec = changer.spec
 		local building = true -- the controls' callbacks while the section is built are not the player's
 
@@ -5365,75 +5588,38 @@ guarded("Guns", function()
 			end,
 		})
 
-		local function customIdOptions(getWeapon, controls)
-			return {
-				category = spec.Category, kind = "Audio", controls = controls,
-				weapon = getWeapon,
-				selected = function()
-					local weapon = getWeapon()
-					return weapon and changer.overrides[weapon]
-				end,
-			}
-		end
-
-		if not drawers then
-			-- Custom IDs: pick the gun, type the ID, Add ID. The ID goes only into that gun's list.
-			guarded(label .. " Custom IDs", function()
-				local guns = soundWeaponNames()
-				local idGun = guns[1]
-				section:Dropdown({
-					Title = "Custom ID Gun",
-					Options = guns,
-					Default = idGun,
-					Callback = function(value) idGun = value end,
-				})
-				addCustomIdRow(section, customIdOptions(function() return idGun end))
-			end)
-		end
-
+		section:AddLabel("Each gun keeps its own " .. label:lower() .. " sound, custom IDs and volume. Changes save on their own.")
 		for _, weaponName in ipairs(soundWeaponNames()) do
 			local weapon = weaponName
-			local target = drawers and section:AddSubSection(weapon, false) or section
-			local prefix = drawers and "" or (weapon .. " ")
 			local entry = changer.catalog[weapon]
-			local volume
-			local dropdown = target:Dropdown({
-				Title = prefix .. label .. " Sound",
-				Options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
-				Default = changer.label(weapon, changer.overrides[weapon]),
-				Callback = function(value)
+			local controls = buildSoundDrawer(section:AddSubSection(weapon, false), {
+				title = label .. " Sound",
+				options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
+				value = changer.label(weapon, changer.overrides[weapon]),
+				volume = changer.volumeOf(weapon),
+				volumeNow = function() return changer.volumeOf(weapon) end,
+				onChoose = function(value)
 					if value ~= WEAPON_SOUND_DEFAULT then ensureEnabled() end
 					changer.set(weapon, value)
-					if volume then volume:Set(changer.volumeOf(weapon), true) end -- each sound keeps its own volume
 				end,
-			})
-
-			-- The volume of the sound chosen above: switching sounds brings back the volume each one had.
-			volume = target:Slider({
-				Title = prefix .. "Volume of This Sound",
-				Min = 0,
-				Max = 2,
-				Default = changer.volumeOf(weapon),
-				Decimal = 2,
-				Suffix = "x",
-				Callback = function(v)
+				onVolume = function(v)
 					if math.abs((tonumber(v) or 1) - 1) > 1e-6 then ensureEnabled() end
 					changer.setVolume(weapon, v)
 				end,
+				editor = {
+					category = spec.Category,
+					kind = "Audio",
+					weapon = function() return weapon end,
+					selected = function() return changer.overrides[weapon] end,
+				},
 			})
-			table.insert(changer.dropdowns, { weapon = weapon, control = dropdown, volume = volume })
-
-			if drawers then
-				guarded(weapon .. " " .. label .. " Custom IDs", function()
-					addCustomIdRow(target, customIdOptions(function() return weapon end, { dropdown }))
-				end)
-			end
+			table.insert(changer.dropdowns, { weapon = weapon, control = controls.dropdown, volume = controls.volume })
 		end
 		task.defer(function() building = false end)
 	end
 
-	guarded("Shoot Sounds", function() buildChangerSection(ShootSection, shootSounds, "Shoot", true) end)
-	guarded("Reload Sounds", function() buildChangerSection(ReloadSection, reloadSounds, "Reload", true) end)
+	guarded("Shoot Sounds", function() buildChangerSection(ShootSection, shootSounds, "Shoot") end)
+	guarded("Reload Sounds", function() buildChangerSection(ReloadSection, reloadSounds, "Reload") end)
 
 	guarded("Textures", function()
 		for _, weaponName in ipairs(CW.WeaponList or {}) do
@@ -7349,7 +7535,6 @@ end)
 -- by CW.reloadCoreAssets (so this never touches the cursor/texture pipeline).
 -- The gallery drops its own asset cache entries on every rebuild, so no extra cache clear is needed.
 function refreshUIFromLibrary()
-	hitSoundOptions = refreshHitSoundCatalog()
 	for _, changer in ipairs(soundChangers) do changer.refreshCatalog() end
 
 	local function syncGallery(gallery, category, weapon, selectedFile)
@@ -7372,9 +7557,12 @@ function refreshUIFromLibrary()
 		syncGallery(entry.gallery, "Textures", entry.weapon, CW.Library.selectedPath("Textures", entry.weapon))
 	end
 
-	if HitSoundDropdown then
-		HitSoundDropdown:Refresh(hitSoundOptions)
-		HitSoundDropdown:Set(hitSoundLabel(CW.Paths.SOUND_FILE) or "None", true)
+	for _, drawer in ipairs(hitSoundDrawers) do
+		local options, entries = hitSoundCatalog(drawer.gun)
+		drawer.entries = entries
+		drawer.dropdown:Refresh(options)
+		drawer.dropdown:Set(hitSoundLabel(entries, CW.HitSounds.relative(drawer.gun)) or "None", true)
+		drawer.volume:Set(CW.HitSounds.volume(drawer.gun), true)
 	end
 	for _, changer in ipairs(soundChangers) do
 		for _, entry in ipairs(changer.dropdowns) do
