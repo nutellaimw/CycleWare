@@ -550,6 +550,7 @@ CW.Settings.ASSET_SELECTIONS = CW.Settings.ASSET_SELECTIONS or {
 	Hitmarker = nil,
 	HitSound = nil,
 	Textures = {},
+	Meshes = {},
 }
 CW._SavedSettings = {}
 
@@ -626,8 +627,8 @@ if settingsFileExists then
 						CW.Settings.ASSET_SELECTIONS[key] = selections[key]
 					end
 				end
-				if type(selections.Textures) == "table" then
-					CW.Settings.ASSET_SELECTIONS.Textures = selections.Textures
+				for _, key in ipairs({ "Textures", "Meshes" }) do
+					if type(selections[key]) == "table" then CW.Settings.ASSET_SELECTIONS[key] = selections[key] end
 				end
 			end
 
@@ -1256,13 +1257,16 @@ end
 --   { "schemaVersion": 2,
 --     "Hitmarkers": [ { "Name": "Pop", "Id": "123" } ],           one list
 --     "WeaponSounds": { "AK-47": [ { "Name": "...", "Id": "..." } ] }   one list per gun
---     (HitSounds, ReloadSounds and Textures are per gun as well) }
+--     (HitSounds, ReloadSounds, Textures and Meshes are per gun as well) }
 -- An ID is listed next to the library files of its category (and gun), and choosing it is saved
 -- like a file choice, as "id:<number>".
+-- A mesh ID also keeps what was found behind it when it was added (see CW.resolveMeshAsset): Mesh (the mesh
+-- asset shown; another ID when the ID was an accessory or a model), Texture (the texture that came with it) and
+-- Facing (1 to 3, which way it is turned on the gun; none = as fitted).
 -- Without the file functions (CAPS.files) the IDs still work, but only until the player rejoins.
 local CUSTOM_ID_CATEGORIES = { -- true = one list per gun
 	Hitmarkers = false, Cursors = false,
-	HitSounds = true, Textures = true, WeaponSounds = true, ReloadSounds = true,
+	HitSounds = true, Textures = true, WeaponSounds = true, ReloadSounds = true, Meshes = true,
 }
 -- A list saved before its category was per gun (HitSounds was one list for every gun): it becomes the start
 -- of each gun's own list once the guns are known (CW.CustomIds.splitPerGun).
@@ -1341,10 +1345,24 @@ local function listOf(category, weapon, create)
 	return list
 end
 
+local function copyEntry(entry)
+	return { Name = entry.Name, Id = entry.Id, File = entry.File, Mesh = entry.Mesh, Texture = entry.Texture, Facing = entry.Facing }
+end
+
 local function copyEntries(source)
 	local entries = {}
-	for _, entry in ipairs(source) do table.insert(entries, { Name = entry.Name, Id = entry.Id, File = entry.File }) end
+	for _, entry in ipairs(source) do table.insert(entries, copyEntry(entry)) end
 	return entries
+end
+
+-- The mesh fields of an entry, checked: IDs as digits, Facing 1 to 3 (0, the default, is not kept).
+local function meshFields(source)
+	local facing = tonumber(source.Facing)
+	return {
+		Mesh = parseAssetId(source.Mesh),
+		Texture = parseAssetId(source.Texture),
+		Facing = (facing and facing >= 1 and facing <= 3) and math.floor(facing) or nil,
+	}
 end
 
 -- A downloaded file must stay inside its own category folder, outside the official one.
@@ -1401,7 +1419,12 @@ local function sanitizeList(source, category)
 		local fileOk = not downloaded or validDownloadedFile(category, entry.File)
 		if id and fileOk and not seen[id] and #loaded < CUSTOM_ID_LIMIT then
 			seen[id] = true
-			table.insert(loaded, { Name = cleanName(entry.Name, id), Id = id, File = downloaded and entry.File or nil })
+			local clean = { Name = cleanName(entry.Name, id), Id = id, File = downloaded and entry.File or nil }
+			if category == "Meshes" then
+				local fields = meshFields(entry)
+				clean.Mesh, clean.Texture, clean.Facing = fields.Mesh, fields.Texture, fields.Facing
+			end
+			table.insert(loaded, clean)
 		end
 	end
 	return loaded
@@ -1454,7 +1477,7 @@ end
 -- The entry whose downloaded file is this relative path (Cursors), or nil.
 function CW.CustomIds.byFile(category, weapon, relative)
 	for _, entry in ipairs(listOf(category, weapon, false) or {}) do
-		if entry.File and entry.File == relative then return { Name = entry.Name, Id = entry.Id, File = entry.File } end
+		if entry.File and entry.File == relative then return copyEntry(entry) end
 	end
 	return nil
 end
@@ -1463,9 +1486,22 @@ end
 function CW.CustomIds.get(category, weapon, rawId)
 	local id = parseAssetId(rawId)
 	for _, entry in ipairs(listOf(category, weapon, false) or {}) do
-		if entry.Id == id then return { Name = entry.Name, Id = entry.Id, File = entry.File } end
+		if entry.Id == id then return copyEntry(entry) end
 	end
 	return nil
+end
+
+-- Changes which way a custom mesh faces (0 to 3) and saves it. Returns true when the ID was found.
+function CW.CustomIds.setFacing(weapon, rawId, facing)
+	local id = parseAssetId(rawId)
+	for _, entry in ipairs(listOf("Meshes", weapon, false) or {}) do
+		if entry.Id == id then
+			entry.Facing = meshFields({ Facing = facing }).Facing
+			CW.CustomIds.save()
+			return true
+		end
+	end
+	return false
 end
 
 function CW.CustomIds.has(category, weapon, rawId)
@@ -1495,7 +1531,8 @@ function CW.CustomIds.nameTaken(category, weapon, name, exceptId, exceptFile)
 end
 
 -- Adds an ID (or renames it when it is already there). Returns the entry, or nil, the reason and the
--- kind of problem ("name" when the name is taken). extra.File: the downloaded file (Cursors).
+-- kind of problem ("name" when the name is taken). extra.File: the downloaded file (Cursors); extra.Mesh,
+-- Texture, Facing: what a mesh ID turned out to be (Meshes).
 function CW.CustomIds.add(category, weapon, rawId, name, extra)
 	if CUSTOM_ID_CATEGORIES[category] == nil then return nil, "this category has no custom IDs" end
 	local id = parseAssetId(rawId)
@@ -1519,16 +1556,26 @@ function CW.CustomIds.add(category, weapon, rawId, name, extra)
 	local taken = CW.CustomIds.nameTaken(category, weapon, newName, existing and existing.Id, file)
 	if taken then return nil, taken, "name" end
 
+	-- What a mesh ID turned out to be; a rename passes nothing and keeps what it had.
+	local function keepMeshFields(entry)
+		if category ~= "Meshes" or type(extra) ~= "table" then return end
+		local fields = meshFields(extra)
+		entry.Mesh, entry.Texture = fields.Mesh, fields.Texture
+		if extra.Facing ~= nil then entry.Facing = fields.Facing end
+	end
+
 	if existing then
 		existing.Name = newName
+		keepMeshFields(existing)
 		CW.CustomIds.save()
-		return { Name = existing.Name, Id = id }, nil
+		return copyEntry(existing), nil
 	end
 	if #list >= CUSTOM_ID_LIMIT then return nil, "limit of " .. CUSTOM_ID_LIMIT .. " IDs reached" end
 	local entry = { Name = newName, Id = id, File = downloaded and file or nil }
+	keepMeshFields(entry)
 	table.insert(list, entry)
 	CW.CustomIds.save()
-	return { Name = entry.Name, Id = id, File = entry.File }, nil
+	return copyEntry(entry), nil
 end
 
 function CW.CustomIds.remove(category, weapon, rawId)
@@ -1592,14 +1639,17 @@ function CW.Library.items(category, weapon)
 	return items
 end
 
+-- Categories chosen per gun: ASSET_SELECTIONS.<category> = { [gun] = relative path or "id:123" }, nothing = the
+-- game's own look.
+local PER_GUN_SELECTIONS = { Textures = true, Meshes = true }
+
 -- Clears the saved choice of one category (and gun) when it points at a relative path
 -- (used when a custom ID is removed). The weapon sounds keep their choices in the sound changers.
 function CW.Library.replaceSelectionOf(category, weapon, oldRelative, newRelative)
 	local selections = CW.Settings.ASSET_SELECTIONS
-	if category == "Textures" then
-		if type(selections.Textures) == "table" and selections.Textures[weapon] == oldRelative then
-			selections.Textures[weapon] = newRelative
-		end
+	if PER_GUN_SELECTIONS[category] then
+		local byGun = selections[category]
+		if type(byGun) == "table" and byGun[weapon] == oldRelative then byGun[weapon] = newRelative end
 		return
 	end
 	local key = SELECTION_KEYS[category]
@@ -1607,22 +1657,14 @@ function CW.Library.replaceSelectionOf(category, weapon, oldRelative, newRelativ
 end
 
 function CW.Library.clearSelectionOf(category, weapon, relative)
-	local selections = CW.Settings.ASSET_SELECTIONS
-	if category == "Textures" then
-		if type(selections.Textures) == "table" and selections.Textures[weapon] == relative then
-			selections.Textures[weapon] = nil
-		end
-		return
-	end
-	local key = SELECTION_KEYS[category]
-	if key and selections[key] == relative then selections[key] = nil end
+	CW.Library.replaceSelectionOf(category, weapon, relative, nil)
 end
 
 function CW.Library.setSelection(category, weapon, relative)
 	local selections = CW.Settings.ASSET_SELECTIONS
-	if category == "Textures" then
-		selections.Textures = selections.Textures or {}
-		selections.Textures[weapon] = relative
+	if PER_GUN_SELECTIONS[category] then
+		if type(selections[category]) ~= "table" then selections[category] = {} end
+		selections[category][weapon] = relative
 	else
 		local key = SELECTION_KEYS[category]
 		if key then selections[key] = relative end
@@ -1635,8 +1677,8 @@ end
 function CW.Library.selectedPath(category, weapon)
 	local selections = CW.Settings.ASSET_SELECTIONS
 	local selected
-	if category == "Textures" then
-		selected = selections.Textures and selections.Textures[weapon]
+	if PER_GUN_SELECTIONS[category] then
+		selected = type(selections[category]) == "table" and selections[category][weapon] or nil
 	else
 		local key = SELECTION_KEYS[category]
 		selected = key and selections[key]
@@ -1644,7 +1686,7 @@ function CW.Library.selectedPath(category, weapon)
 	for _, item in ipairs(CW.Library.items(category, weapon)) do
 		if item.Relative == selected then return item.Path, item.Relative end
 	end
-	if category == "Textures" then return nil, nil end
+	if PER_GUN_SELECTIONS[category] then return nil, nil end
 
 	-- Nothing chosen (or the chosen file is missing): the first library file is used, but it is NOT
 	-- saved as a selection. Only a choice made by the player is persisted. A custom ID is never
@@ -3117,32 +3159,349 @@ local function applyCustomTexture(tool, cfg)
 	return true
 end
 
-local function applyTexture(tool)
-	local cfg = CUSTOM_MESH_WEAPONS[tool.Name]
-	if cfg then return applyCustomTexture(tool, cfg) end
-	return applyRegularTexture(tool)
-end
-
-local function applyToContainer(container)
-	for _, child in ipairs(container:GetChildren()) do
-		if child:IsA("Tool") and TEXTURABLE[child.Name] then applyTexture(child) end
+--// Custom meshes (the Mesh list of each gun in the Guns tab) --------------------------------------------
+-- A gun whose Meshes choice is one of its custom mesh IDs shows that mesh instead of its own: a MeshPart named
+-- CW_Mesh, welded to the Handle, with the game's pieces hidden (the same bookkeeping as the FAL/M700 meshes above).
+-- It is placed in the box the gun's own pieces fill around the Handle (the grip and the Muzzle included): its
+-- longest side along the barrel, the middle one upright, scaled evenly to the gun's length. A mesh made the other
+-- way round is fixed by the Facing stored with its ID: 1 turned around, 2 upside down, 3 both.
+-- Texture: the gun's chosen texture, otherwise the one that came with the mesh (an accessory or a model brings one).
+-- Until the mesh has loaded the gun keeps its own look, and a mesh that cannot be loaded leaves it that way.
+local AssetService = game:GetService("AssetService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local MESH_PART = "CW_Mesh"
+local MESH_ASSET_TYPE = 4
+-- mesh ID -> a loaded MeshPart to clone (false: it could not be loaded). Kept across re-runs: it is a download.
+local meshTemplates = CW.State.meshTemplates or {}
+CW.State.meshTemplates = meshTemplates
+local meshLoading = {}
+local OWN_MESHES = { [MESH_PART] = true } -- parts we add, never measured as the gun's own pieces
+for _, cfg in pairs(CUSTOM_MESH_WEAPONS) do OWN_MESHES[cfg.meshName] = true end
+local FACING_TURNS = {
+	[1] = CFrame.Angles(0, math.pi, 0),
+	[2] = CFrame.Angles(0, 0, math.pi),
+	[3] = CFrame.Angles(0, math.pi, 0) * CFrame.Angles(0, 0, math.pi),
+}
+local BOX_CORNERS = {}
+for _, x in ipairs({ -1, 1 }) do
+	for _, y in ipairs({ -1, 1 }) do
+		for _, z in ipairs({ -1, 1 }) do table.insert(BOX_CORNERS, Vector3.new(x, y, z)) end
 	end
 end
 
--- Looked up through CW at call time, so the latest run's code is the one that runs.
-CW.applyWeaponTexture = function(tool)
-	if tool:IsA("Tool") and TEXTURABLE[tool.Name] then return applyTexture(tool) end
+-- Yields. A MeshPart with this mesh loaded, or nil and why.
+local function loadMeshPart(meshId)
+	local uri = "rbxassetid://" .. meshId
+	local created, part = pcall(function() return AssetService:CreateMeshPartAsync(uri) end)
+	if created and typeof(part) == "Instance" and part:IsA("MeshPart") then return part end
+	local fresh = Instance.new("MeshPart")
+	local assigned, err = pcall(function() fresh.MeshId = uri end)
+	if not assigned then
+		fresh:Destroy()
+		return nil, tostring(created and "no mesh" or part) .. "; " .. tostring(err)
+	end
+	local deadline = os.clock() + 6
+	while fresh.MeshSize == Vector3.zero and os.clock() < deadline do task.wait(0.1) end
+	if fresh.MeshSize == Vector3.zero then
+		fresh:Destroy()
+		return nil, "it did not load in 6 s"
+	end
+	return fresh
+end
+
+local function digitsOf(value)
+	if type(value) ~= "string" then return nil end
+	return value:match("^rbxassetid://(%d+)$") or value:match("[?&][iI][dD]=(%d+)") or value:match("^(%d+)$")
+end
+
+-- The first mesh inside an item (a MeshPart or a SpecialMesh), with the texture it uses: { Mesh, Texture } or nil.
+local function meshInside(object)
+	local function read(candidate)
+		local meshId, textureId
+		if candidate:IsA("MeshPart") then
+			meshId, textureId = candidate.MeshId, candidate.TextureID
+			local look = textureId == "" and candidate:FindFirstChildWhichIsA("SurfaceAppearance")
+			if look then pcall(function() textureId = look.ColorMap end) end
+		elseif candidate:IsA("FileMesh") then
+			meshId, textureId = candidate.MeshId, candidate.TextureId
+		end
+		local mesh = digitsOf(meshId)
+		return mesh and { Mesh = mesh, Texture = digitsOf(textureId) } or nil
+	end
+	local found = read(object)
+	if found then return found end
+	for _, descendant in ipairs(object:GetDescendants()) do
+		found = read(descendant)
+		if found then return found end
+	end
+	return nil
+end
+
+-- What a mesh ID shows (yields), as in the 3D viewer reference: a Mesh asset is the mesh itself; any other item (an
+-- accessory, a gear, a model) is opened with game:GetObjects and its first mesh is used, with the texture that
+-- comes with it. Returns { Mesh, Texture, Name (the item's name) } or nil and why.
+function CW.resolveMeshAsset(id)
+	local okInfo, info = pcall(function() return MarketplaceService:GetProductInfo(tonumber(id)) end)
+	local assetType = okInfo and type(info) == "table" and tonumber(info.AssetTypeId) or nil
+	local result = { Mesh = id }
+	if assetType ~= MESH_ASSET_TYPE then
+		local opened, objects = pcall(function() return game:GetObjects("rbxassetid://" .. id) end)
+		if opened and type(objects) == "table" then
+			for _, object in ipairs(objects) do
+				local found = typeof(object) == "Instance" and meshInside(object)
+				if found then
+					result.Mesh, result.Texture = found.Mesh, found.Texture
+					break
+				end
+			end
+			-- The downloaded copy goes a moment later, so destroying a big item does not land on this frame.
+			task.delay(1, function()
+				for _, object in ipairs(objects) do pcall(function() object:Destroy() end) end
+			end)
+		end
+		if assetType ~= nil and result.Mesh == id then
+			return nil, "no mesh was found in this item (or the executor cannot open it)"
+		end
+	end
+	local part, why = loadMeshPart(result.Mesh)
+	if not part then return nil, why end
+	meshTemplates[result.Mesh] = part
+	if assetType ~= MESH_ASSET_TYPE and okInfo and type(info.Name) == "string" and info.Name ~= "" then
+		result.Name = info.Name
+	end
+	return result
+end
+
+-- Loads meshes in the background, then puts them on the guns (CW.reloadTextures) and tells the preview.
+local function requestMeshes(ids)
+	local missing = {}
+	for _, id in ipairs(ids) do
+		if meshTemplates[id] == nil and not meshLoading[id] then
+			meshLoading[id] = true
+			table.insert(missing, id)
+		end
+	end
+	if #missing == 0 then return end
+	task.spawn(function()
+		for _, id in ipairs(missing) do
+			local part, why = loadMeshPart(id)
+			meshLoading[id] = nil
+			meshTemplates[id] = part or false
+			if not part then CW.Warn("Mesh " .. id .. " could not be loaded: " .. tostring(why)) end
+		end
+		if CW.reloadTextures then pcall(CW.reloadTextures) end
+		if CW.onMeshLoaded then pcall(CW.onMeshLoaded) end
+	end)
+end
+
+-- A mesh that failed to load is tried again when the player picks it again.
+function CW.retryMesh(meshId)
+	if meshTemplates[meshId] == false then meshTemplates[meshId] = nil end
+end
+
+-- The mesh chosen for this gun (one of its custom mesh IDs), or nil for its own.
+local function chosenMesh(gun)
+	local selections = CW.Settings.ASSET_SELECTIONS.Meshes
+	local selected = type(selections) == "table" and selections[gun]
+	local id = type(selected) == "string" and selected:match("^id:(%d+)$")
+	return id and CW.CustomIds.get("Meshes", gun, id) or nil
+end
+
+-- What a piece shows, in its own space: size and center. A mesh inside it (the FAL's blocks and wedges, the
+-- Taser's and the M700's files) is scaled and moved by it, and a file mesh has a size of its own, whatever the
+-- Part's: that one is known once the file is loaded. Returns the size, the center and the file still to load.
+local function pieceShape(part)
+	local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
+	if not mesh then return part.Size, Vector3.zero end
+	local scale = Vector3.new(math.abs(mesh.Scale.X), math.abs(mesh.Scale.Y), math.abs(mesh.Scale.Z))
+	if not (mesh:IsA("SpecialMesh") and mesh.MeshType == Enum.MeshType.FileMesh) then
+		return part.Size * scale, mesh.Offset
+	end
+	local id = digitsOf(mesh.MeshId)
+	local file = id and meshTemplates[id]
+	if file then return file.MeshSize * scale, mesh.Offset end
+	return part.Size, Vector3.zero, (id and file == nil) and id or nil
+end
+
+-- The box the gun's own pieces fill in the Handle's space (pieces hidden by us count as they were), together with
+-- the grip (the Handle's center) and the Muzzle; with shown, also what it shows now (a mesh of ours).
+-- Returns its center and size, and the files still to load.
+local function gunBox(tool, handle, shown)
+	local low, high, pending = Vector3.zero, Vector3.zero, {}
+	local function add(point)
+		low, high = low:Min(point), high:Max(point)
+	end
+	local muzzle = tool:FindFirstChild("Muzzle")
+	if muzzle and muzzle:IsA("BasePart") then add(handle.CFrame:PointToObjectSpace(muzzle.Position)) end
+	for _, part in ipairs(tool:GetDescendants()) do
+		local own = part:IsA("BasePart") and part ~= handle and part ~= muzzle and not OWN_MESHES[part.Name]
+			and (part:GetAttribute(ORIGINAL_TRANSPARENCY) or part.Transparency) < 1
+		if own or (shown and part:IsA("BasePart") and part ~= handle and part.Transparency < 1) then
+			local size, offset, missing = pieceShape(part)
+			if missing then table.insert(pending, missing) end
+			local relative = handle.CFrame:ToObjectSpace(part.CFrame) * CFrame.new(offset)
+			for _, corner in ipairs(BOX_CORNERS) do add(relative * (size / 2 * corner)) end
+		end
+	end
+	return (low + high) / 2, high - low, pending
+end
+
+-- The turn that lays the mesh's longest side along the barrel (the Handle's -Z, toward the Muzzle), the middle one
+-- upright and the shortest across, as the game's own gun meshes sit. Returns it and the longest side.
+local function meshRotation(meshSize)
+	local axes = { { Vector3.xAxis, meshSize.X }, { Vector3.yAxis, meshSize.Y }, { Vector3.zAxis, meshSize.Z } }
+	table.sort(axes, function(a, b) return a[2] < b[2] end)
+	local across, up, along = axes[1][1], axes[2][1], axes[3][1]
+	local side = across:Cross(up):Dot(along) > 0 and -1 or 1 -- keeps it a turn, not a mirror
+	return CFrame.fromMatrix(Vector3.zero, across * side, up, -along):Inverse(), axes[3][2]
+end
+
+local function hideAllPieces(tool, keep)
+	for _, part in ipairs(tool:GetDescendants()) do
+		if part:IsA("BasePart") and part ~= keep and part.Name ~= "Handle" and part.Name ~= "Muzzle"
+			and part.Transparency < 1 then
+			if part:GetAttribute(ORIGINAL_TRANSPARENCY) == nil then part:SetAttribute(ORIGINAL_TRANSPARENCY, part.Transparency) end
+			part.Transparency = 1
+		end
+	end
+end
+
+local function removeCustomMesh(tool)
+	local part = tool:FindFirstChild(MESH_PART)
+	if not part then return end
+	part:Destroy()
+	showOriginalPieces(tool)
+end
+
+-- Returns false while the mesh cannot be shown: no Handle yet, the mesh (or a file the gun's size depends on) is
+-- loading, or it could not be loaded.
+local function applyCustomMesh(tool, entry)
+	local handle = tool:FindFirstChild("Handle")
+	if not handle then return false end
+	local meshId = entry.Mesh or entry.Id
+	local facing = entry.Facing or 0
+	local key = meshId .. "/" .. facing
+	local part = tool:FindFirstChild(MESH_PART)
+	if part and part:GetAttribute("CW_MeshKey") ~= key then
+		part:Destroy()
+		part = nil
+	end
+	if not part then
+		local template = meshTemplates[meshId]
+		local center, box, pending = gunBox(tool, handle)
+		if template == nil then table.insert(pending, meshId) end
+		requestMeshes(pending)
+		if not template or #pending > 0 then return false end
+
+		local cfg = CUSTOM_MESH_WEAPONS[tool.Name]
+		local textureMesh = cfg and tool:FindFirstChild(cfg.meshName)
+		if textureMesh then textureMesh:Destroy() end
+		local rotation, longest = meshRotation(template.MeshSize)
+		part = template:Clone()
+		part.Name = MESH_PART
+		part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch, part.Massless = false, false, false, false, true
+		part.Size = template.MeshSize * (box.Z / math.max(longest, 1e-3))
+		part.CFrame = handle.CFrame * CFrame.new(center) * (FACING_TURNS[facing] or CFrame.identity) * rotation
+		part:SetAttribute("CW_MeshKey", key)
+		part.Parent = tool
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0, weld.Part1 = handle, part
+		weld.Parent = part
+	end
+	local texture = CW.Assets.weaponTextures[tool.Name] or (entry.Texture and "rbxassetid://" .. entry.Texture) or ""
+	if part.TextureID ~= texture then pcall(function() part.TextureID = texture end) end
+	hideAllPieces(tool, part)
 	return true
+end
+
+-- Mesh first (when one is chosen and ready), otherwise the gun's own pieces with its texture. Returns false when
+-- the tool is not complete yet (no Handle, or no MeshPart for its texture), so it is tried again shortly.
+local function applyLook(tool)
+	local entry = chosenMesh(tool.Name)
+	if entry and applyCustomMesh(tool, entry) then return true end
+	removeCustomMesh(tool)
+	local textured = true
+	if TEXTURABLE[tool.Name] then
+		local cfg = CUSTOM_MESH_WEAPONS[tool.Name]
+		if cfg then textured = applyCustomTexture(tool, cfg) else textured = applyRegularTexture(tool) end
+	end
+	return textured and (entry == nil or tool:FindFirstChild("Handle") ~= nil)
+end
+
+-- Every gun that can get a mesh or a texture: the texturable ones and every gun with a ToolProperties module.
+local LOOK_WEAPONS = table.clone(TEXTURABLE)
+for _, name in ipairs(SOUND_WEAPONS) do LOOK_WEAPONS[name] = true end
+
+local function applyToContainer(container)
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Tool") and LOOK_WEAPONS[child.Name] then applyLook(child) end
+	end
+end
+
+-- Looked up through CW at call time, so the latest run's code is the one that runs. Also used on a copy of the
+-- gun for the Guns tab preview, so the preview shows exactly what the gun in your hand shows.
+CW.applyWeaponLook = function(tool)
+	if tool:IsA("Tool") and LOOK_WEAPONS[tool.Name] then return applyLook(tool) end
+	return true
+end
+CW.applyWeaponTexture = CW.applyWeaponLook
+
+-- A copy of the gun as it looks in your hand (its mesh and its texture), for the preview in the Guns tab: a Model in
+-- the Handle's space (the barrel along -Z) with only what shows, anchored. An invisible part spans what it shows, so
+-- the preview frames it by that: a part's size says nothing about a file mesh inside it (the Taser's), whose size
+-- is known once the file has loaded (then CW.onMeshLoaded redraws the preview). nil when the game has no such gun.
+function CW.weaponPreview(gun)
+	local tools = ReplicatedStorage:FindFirstChild("Tools")
+	local guns = tools and tools:FindFirstChild("Guns")
+	local source = guns and guns:FindFirstChild(gun)
+	local tool = source and source:IsA("Tool") and source:Clone()
+	local handle = tool and tool:FindFirstChild("Handle")
+	if not handle then
+		if tool then tool:Destroy() end
+		return nil
+	end
+	pcall(applyLook, tool)
+	local center, size, pending = gunBox(tool, handle, true)
+	requestMeshes(pending)
+
+	local model = Instance.new("Model")
+	model.Name = gun
+	local shown = {}
+	for _, part in ipairs(tool:GetDescendants()) do
+		if part:IsA("BasePart") and part.Transparency < 1 then
+			table.insert(shown, { part, handle.CFrame:ToObjectSpace(part.CFrame) })
+		end
+	end
+	for _, item in ipairs(shown) do item[1].Parent = model end
+	for _, inner in ipairs(model:GetDescendants()) do
+		if inner:IsA("JointInstance") or inner:IsA("WeldConstraint") or inner:IsA("Constraint")
+			or inner:IsA("LuaSourceContainer") or (inner:IsA("BasePart") and inner.Transparency >= 1) then
+			inner:Destroy()
+		end
+	end
+	for _, item in ipairs(shown) do
+		item[1].Anchored = true
+		item[1].CFrame = item[2]
+	end
+	local bounds = Instance.new("Part")
+	bounds.Name = "Bounds"
+	bounds.Transparency = 1
+	bounds.Anchored, bounds.CanCollide, bounds.CanQuery, bounds.CanTouch = true, false, false, false
+	bounds.Size = size:Max(Vector3.one * 0.05)
+	bounds.CFrame = CFrame.new(center)
+	bounds.Parent = model
+	tool:Destroy()
+	return model
 end
 
 -- A tool arrives with its parts, so one pass is enough; if the mesh (or the Handle) is not there
 -- yet, it is retried once shortly after.
 local function monitor(container, key)
 	CW.track(key, container.ChildAdded:Connect(function(child)
-		local apply = CW.applyWeaponTexture
+		local apply = CW.applyWeaponLook
 		if apply and not apply(child) then
 			task.wait(0.1)
-			apply = CW.applyWeaponTexture
+			apply = CW.applyWeaponLook
 			-- The tool may have been dropped or destroyed while waiting: do not rebuild pieces on it.
 			if apply and child.Parent == container then apply(child) end
 		end
@@ -3217,12 +3576,6 @@ local LocalPlayer = CW.LocalPlayer
 
 -- (boolOr, numOr and _cfg come from the top of the script.)
 
--- UPPER_CASE is the standard key; the old camelCase keys still work.
-local function cfgValue(upperKey, legacyKey)
-	if _cfg[upperKey] ~= nil then return _cfg[upperKey] end
-	return _cfg[legacyKey]
-end
-
 local function colorOr(v, default)
 	if typeof(v) == "Color3" then return v end
 	return default
@@ -3231,8 +3584,6 @@ end
 local function unitOr(v, default) -- a number from 0 to 1 (transparency)
 	return math.clamp(numOr(v, default), 0, 1)
 end
-
-CW.Settings.TRACER_APPLY_TO_OTHERS = boolOr(cfgValue("TRACER_APPLY_TO_OTHERS", "applyToOthers"), false)
 
 -- The Sniper (M700) and the Taser have a tracer of their own. Every other gun has one too (the
 -- TRACER_GUN_* maps below). A kind's width, lifetime and transparency only apply while its ENABLED
@@ -3260,6 +3611,8 @@ end
 -- is a map from the gun's name to a value, so it is saved as it is: ENABLED[gun] = true, COLOR[gun] and
 -- GLOW[gun] = "rrggbb", WIDTH[gun], LIFETIME[gun], TRANSPARENCY[gun], LIGHT[gun] = true. A field that
 -- was never set for a gun starts from CW.GunTracerDefaults. A gun without ENABLED keeps the game's tracer.
+-- OTHERS[gun] = true (every gun, the M700 and the Taser included) also gives other players' shots with that gun
+-- its tracer, on your screen only.
 local function copyMap(source)
 	local map = {}
 	if type(source) == "table" then
@@ -3269,13 +3622,12 @@ local function copyMap(source)
 	end
 	return map
 end
-for _, field in ipairs({ "ENABLED", "COLOR", "GLOW", "WIDTH", "LIFETIME", "TRANSPARENCY", "LIGHT" }) do
+for _, field in ipairs({ "ENABLED", "COLOR", "GLOW", "WIDTH", "LIFETIME", "TRANSPARENCY", "LIGHT", "OTHERS" }) do
 	CW.Settings["TRACER_GUN_" .. field] = copyMap(_cfg["TRACER_GUN_" .. field])
 end
 
 CW.Defaults = CW.Defaults or {}
 for _, key in ipairs({
-	"TRACER_APPLY_TO_OTHERS",
 	"TRACER_SNIPER_ENABLED", "TRACER_SNIPER_COLOR", "TRACER_SNIPER_WIDTH", "TRACER_SNIPER_LIFETIME", "TRACER_SNIPER_TRANSPARENCY",
 	"TRACER_TASER_ENABLED", "TRACER_TASER_COLOR", "TRACER_TASER_WIDTH", "TRACER_TASER_LIFETIME", "TRACER_TASER_TRANSPARENCY",
 }) do
@@ -3371,6 +3723,12 @@ local function gunValue(field, weapon)
 	return map[weapon]
 end
 
+-- Whether other players' shots with this gun get its tracer too (the gun's own "Apply To Other Players Locally").
+local function othersFor(weapon)
+	return gunValue("OTHERS", weapon) == true
+end
+local KIND_GUN = { Sniper = "M700", Taser = "Taser" }
+
 local function hasGunTracers()
 	local map = CW.Settings.TRACER_GUN_ENABLED
 	if type(map) ~= "table" then return false end
@@ -3395,15 +3753,17 @@ local function gunStyle(weapon)
 end
 
 -- The style for a bullet tracer that starts at startPos: the firing gun's own, or nil.
--- Your own shots read the gun straight from the Tool in your hand (exact). Other players' shots are
--- only matched when "apply to others" is on.
+-- Your own shots read the gun straight from the Tool in your hand (exact). Another player's shot gets the style
+-- of the gun it was matched to only when that gun's "apply to others" is on.
 local function bulletShotStyle(startPos)
 	local tool = localShotTool(startPos)
 	if not tool then
-		if not CW.Settings.TRACER_APPLY_TO_OTHERS then return nil end
+		local others = CW.Settings.TRACER_GUN_OTHERS
+		if type(others) ~= "table" or next(others) == nil then return nil end
 		tool = findShooterTool(startPos, "Bullet")
+		if not (tool and othersFor(tool.Name)) then return nil end
 	end
-	return tool and gunStyle(tool.Name) or nil
+	return gunStyle(tool.Name)
 end
 
 -- Part pool: tracer parts are reused instead of created and destroyed for every bullet
@@ -3583,12 +3943,12 @@ local function recolorNewRayParts(before, color)
 end
 
 -- The colour to give the game's own tracer of this kind, or nil to leave it alone: the colour setting
--- is still the game's own, or the shot is another player's and "apply to others" is off.
+-- is still the game's own, or the shot is another player's and that gun's "apply to others" is off.
 local function kindRecolor(kind, startPos)
 	local color, default = CW.Settings[KINDS[kind].prefix .. "COLOR"], KIND_DEFAULTS[kind].color
 	if typeof(color) ~= "Color3" then return nil end
 	if color.R == default.R and color.G == default.G and color.B == default.B then return nil end
-	if CW.Settings.TRACER_APPLY_TO_OTHERS or isLocalPlayerShot(startPos) then return color end
+	if othersFor(KIND_GUN[kind]) or isLocalPlayerShot(startPos) then return color end
 	return nil
 end
 
@@ -3638,14 +3998,14 @@ local function makeRecolorWrapper(kind)
 end
 
 -- Taser and sniper: the kind's own tracer when its ENABLED setting is on (and the shot is yours, or
--- "apply to others" is on); otherwise the recolor behaviour above. Never throws into the game.
+-- that gun's "apply to others" is on); otherwise the recolor behaviour above. Never throws into the game.
 local function makeKindWrapper(kind)
 	local info = KINDS[kind]
 	local fallback = makeRecolorWrapper(kind)
 	return function(startPos, endPos)
 		if CW.Settings[info.prefix .. "ENABLED"] == true then
 			local okOwn, own = pcall(function()
-				return CW.Settings.TRACER_APPLY_TO_OTHERS or isLocalPlayerShot(startPos)
+				return othersFor(KIND_GUN[kind]) or isLocalPlayerShot(startPos)
 			end)
 			if okOwn and own then
 				local okDraw, err = pcall(createKindTracer, kind, startPos, endPos)
@@ -4012,6 +4372,33 @@ for key, value in pairs(CW._SavedSettings or {}) do
 	end
 end
 
+-- Switches that were one for every gun are one per gun now (map gun -> true). An old switch that was on turns on
+-- every gun's own, once: the old one is dropped, so it is not saved again. Before the first save, an old key in
+-- CW_CONFIG counts the same way.
+local switchesMigrated = false
+for _, keys in ipairs({
+	{ "WEAPON_SOUND_OVERRIDE_ENABLED", "WEAPON_SHOOT_SOUND_ENABLED_GUNS" },
+	{ "WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS", "WEAPON_SHOOT_SOUND_OTHERS_GUNS" },
+	{ "WEAPON_RELOAD_SOUND_OVERRIDE_ENABLED", "WEAPON_RELOAD_SOUND_ENABLED_GUNS" },
+	{ "WEAPON_RELOAD_SOUND_OVERRIDE_APPLY_TO_OTHERS", "WEAPON_RELOAD_SOUND_OTHERS_GUNS" },
+	{ "TRACER_APPLY_TO_OTHERS", "TRACER_GUN_OTHERS", "applyToOthers" },
+}) do
+	local oldKey, newKey, legacyKey = keys[1], keys[2], keys[3]
+	local old
+	if CW._SavedSettings then
+		old = CW._SavedSettings[oldKey]
+		if old ~= nil then switchesMigrated = true end
+	else
+		old = _cfg[oldKey]
+		if old == nil and legacyKey then old = _cfg[legacyKey] end
+	end
+	if type(CW.Settings[newKey]) ~= "table" then CW.Settings[newKey] = {} end
+	if old == true and next(CW.Settings[newKey]) == nil then
+		for _, gun in ipairs(CW.SoundWeaponList or {}) do CW.Settings[newKey][gun] = true end
+	end
+	CW.Settings[oldKey] = nil
+end
+
 local HttpService = game:GetService("HttpService")
 
 -- Runs one UI section in isolation so a failure in one tab doesn't take the others down.
@@ -4253,6 +4640,8 @@ end
 local HitmarkerGallery, CursorGallery
 local hitSoundDrawers = {} -- { gun, entries, dropdown, volume } per gun
 local textureGalleries = {}
+local meshControls = {} -- one refresh function per gun page (its Mesh list and Mesh Facing)
+local refreshGunPreview -- (gun or nil, keepCamera): the Guns tab redraws the preview of the gun shown
 local refreshUIFromLibrary -- defined after the tabs; the custom ID controls call it
 
 -- Label of a custom ID in the sound dropdowns: just the name the player gave it (or its ID when it was
@@ -4338,8 +4727,10 @@ end
 -- spec = {
 --   Category    = "WeaponSounds" | "ReloadSounds"   library folder: <Category>/<Weapon>/<file>
 --   SoundName   = "ShootSound" | "ReloadSound"      the Sound instance the game plays
---   OverridesKey, EnabledKey, OthersKey, VolumeKey  saved settings (names unchanged for the shoot sounds);
+--   OverridesKey, VolumeKey                         saved settings (names unchanged for the shoot sounds);
 --                                                   VolumeKey holds { ["<gun>|<sound>"] = volume multiplier }
+--   EnabledKey, OthersKey                           saved per gun, { [gun] = true }: the gun's sound applies at all,
+--                                                   and also to other players' shots with that gun (locally)
 --   ConfigKey                                       optional CW_CONFIG table: { ["AK-47"] = "WeaponSounds/AK-47/x.mp3" }
 --   BaseVolume(originalId, player)                  optional: volume the game itself plays this sound at
 -- }
@@ -4347,9 +4738,12 @@ local function createSoundChanger(spec)
 	local settings = CW.Settings
 	local configured = settings[spec.OverridesKey] or _cfg[spec.ConfigKey]
 	settings[spec.OverridesKey] = type(configured) == "table" and configured or {}
-	-- Off by default: nothing changes in the game until the player turns it on.
-	if settings[spec.EnabledKey] == nil then settings[spec.EnabledKey] = _cfg[spec.EnabledKey] == true end
-	if settings[spec.OthersKey] == nil then settings[spec.OthersKey] = _cfg[spec.OthersKey] == true end
+	-- Off by default: nothing changes in the game until the player turns a gun on.
+	for _, key in ipairs({ spec.EnabledKey, spec.OthersKey }) do
+		if type(settings[key]) ~= "table" then settings[key] = {} end
+	end
+	local function enabledFor(weapon) return settings[spec.EnabledKey][weapon] == true end
+	local function othersFor(weapon) return settings[spec.OthersKey][weapon] == true end
 	-- Volume multiplier per gun AND per sound, relative to the game's own volume (1 = untouched): each sound a
 	-- gun can use keeps its own volume, so switching the sound brings back the volume it had. Stored as
 	-- { ["AK-47|Default"] = 0.5, ["AK-47|WeaponSounds/AK-47/x.mp3"] = 1.2 }, only when different from 1.
@@ -4629,14 +5023,13 @@ local function createSoundChanger(spec)
 
 	local function applyToTool(tool, player, container)
 		if not tool:IsA("Tool") then return end
-		if not settings[spec.EnabledKey] then return end
-		if player ~= LocalPlayer and not settings[spec.OthersKey] then return end
-
-		local relativePath = overrides[tool.Name]
+		-- The gun's switch is on, and the gun is yours (or its "apply to others" is on too).
+		local applies = enabledFor(tool.Name) and (player == LocalPlayer or othersFor(tool.Name))
+		local relativePath = applies and overrides[tool.Name] or nil
 		local targetId = type(relativePath) == "string" and resolveAsset(relativePath) or nil
-		if not targetId and math.abs(volumeOf(tool.Name) - 1) < 1e-6 then
-			-- Nothing to change for this gun (no usable replacement file, and the game's own volume):
-			-- put back whatever was changed before.
+		if not applies or (not targetId and math.abs(volumeOf(tool.Name) - 1) < 1e-6) then
+			-- Nothing to change for this gun (switched off, or no usable replacement file and the game's own
+			-- volume): put back whatever was changed before.
 			for sound, data in pairs(active) do
 				if data.tool == tool then restoreSound(sound) end
 			end
@@ -4652,7 +5045,6 @@ local function createSoundChanger(spec)
 	-- Applies the current volume of one gun (or of every gun) to the sounds already there, without a
 	-- full refresh: the sliders call this on every step while they are dragged.
 	function changer.updateVolumes(weapon)
-		if not settings[spec.EnabledKey] then return end
 		for container, data in pairs(watched) do
 			for _, child in ipairs(container:GetChildren()) do
 				if child:IsA("Tool") and (weapon == nil or child.Name == weapon) then
@@ -4746,9 +5138,11 @@ local function createSoundChanger(spec)
 		end
 	end
 
+	local function anyEnabled() return next(settings[spec.EnabledKey]) ~= nil end
+
 	function changer.refresh()
 		changer.stop()
-		if not settings[spec.EnabledKey] then return end
+		if not anyEnabled() then return end
 		local current = generation -- taken after the stop: a newer refresh cancels this one
 		for _, player in ipairs(Players:GetPlayers()) do
 			watchPlayer(player)
@@ -4765,7 +5159,7 @@ local function createSoundChanger(spec)
 				if type(relative) == "string" then table.insert(pending, relative) end
 			end
 			for _, relative in ipairs(pending) do
-				if current ~= generation or not settings[spec.EnabledKey] then return end
+				if current ~= generation or not anyEnabled() then return end
 				pcall(resolveAsset, relative)
 			end
 		end)
@@ -4798,6 +5192,17 @@ local function createSoundChanger(spec)
 		end
 	end
 
+	-- A gun's two switches: its sound applies at all, and also to other players' shots with that gun.
+	changer.enabledFor, changer.othersFor = enabledFor, othersFor
+	function changer.setEnabled(weapon, on)
+		settings[spec.EnabledKey][weapon] = on == true or nil
+		changer.schedule()
+	end
+	function changer.setOthers(weapon, on)
+		settings[spec.OthersKey][weapon] = on == true or nil
+		changer.schedule()
+	end
+
 	-- value is what the weapon's dropdown shows: "Default" (the game's own sound) or a file label.
 	function changer.set(weapon, value)
 		if value == WEAPON_SOUND_DEFAULT then
@@ -4823,8 +5228,8 @@ local shootSounds = createSoundChanger({
 	SoundName = "ShootSound",
 	OverridesKey = "WEAPON_SHOOT_SOUND_OVERRIDES",
 	ConfigKey = "WEAPON_SHOOT_SOUNDS",
-	EnabledKey = "WEAPON_SOUND_OVERRIDE_ENABLED",
-	OthersKey = "WEAPON_SOUND_OVERRIDE_APPLY_TO_OTHERS",
+	EnabledKey = "WEAPON_SHOOT_SOUND_ENABLED_GUNS",
+	OthersKey = "WEAPON_SHOOT_SOUND_OTHERS_GUNS",
 	VolumeKey = "WEAPON_SOUND_VOLUME",
 })
 
@@ -4834,8 +5239,8 @@ local reloadSounds = createSoundChanger({
 	SoundName = "ReloadSound",
 	OverridesKey = "WEAPON_RELOAD_SOUND_OVERRIDES",
 	ConfigKey = "WEAPON_RELOAD_SOUNDS",
-	EnabledKey = "WEAPON_RELOAD_SOUND_OVERRIDE_ENABLED",
-	OthersKey = "WEAPON_RELOAD_SOUND_OVERRIDE_APPLY_TO_OTHERS",
+	EnabledKey = "WEAPON_RELOAD_SOUND_ENABLED_GUNS",
+	OthersKey = "WEAPON_RELOAD_SOUND_OTHERS_GUNS",
 	VolumeKey = "WEAPON_RELOAD_SOUND_VOLUME",
 	-- The game plays OTHER players' taser reload at 0.1 by checking for this exact SoundId. Once the id
 	-- is replaced that check no longer matches, so the same level is applied here instead.
@@ -4859,14 +5264,24 @@ end
 local ContentProvider = game:GetService("ContentProvider")
 
 -- Checks in the background that Roblox can load the asset. An audio ID that is private (or not
--- shared with this experience) fails here.
+-- shared with this experience) fails here. onResult(loaded, why, extra): extra is what a mesh ID turned out to be.
 local function checkCustomAsset(assetId, kind, onResult)
 	-- PreloadAsync with the id as a plain string answers Failure for every audio and image id, even the game's
 	-- own (checked in Studio), so it can't tell anything. What works:
 	--   * audio: a silent Sound in SoundService; a valid audio the experience may play reaches IsLoaded (a
 	--     private audio not shared with the game, a deleted one or a non-audio id never does);
-	--   * image: PreloadAsync of an ImageLabel, whose status is Success for an image and Failure otherwise.
+	--   * image: PreloadAsync of an ImageLabel, whose status is Success for an image and Failure otherwise;
+	--   * mesh: the mesh is loaded for real (CW.resolveMeshAsset, which also opens accessories and models).
 	task.spawn(function()
+		if kind == "Mesh" then
+			local ok, found, why = pcall(CW.resolveMeshAsset, assetId:match("%d+$"))
+			if ok and found then
+				onResult(true, nil, found)
+			else
+				onResult(false, ok and why or found)
+			end
+			return
+		end
 		if kind == "Audio" then
 			local sound = Instance.new("Sound")
 			sound.Volume = 0
@@ -5043,17 +5458,25 @@ local function customIdEditor(opts, view)
 
 	-- Why an ID can't be used, in words.
 	local function loadFailureText(id, why)
+		if opts.kind == "Mesh" then
+			return "Custom ID " .. id .. " not saved: no mesh could be loaded from it (" .. tostring(why)
+				.. "). It may be private, deleted, or not a mesh, an accessory or a model."
+		end
 		local what = opts.kind == "Audio" and "audio" or "image"
 		return "Custom ID " .. id .. " not saved: Roblox could not load it as " .. what .. " (" .. tostring(why)
 			.. "). It may be private (not shared with this game), deleted, or not "
 			.. (opts.kind == "Audio" and "an audio" or "an image (a Decal ID instead of its Image ID?)") .. "."
 	end
 
-	-- Saves an ID that is known to load (or a new name for one already saved).
-	local function commit(values, weapon, newId, oldId)
+	-- Saves an ID that is known to load (or a new name for one already saved). extra: what a mesh ID turned out to
+	-- be; with no name typed, the item's own name is used.
+	local function commit(values, weapon, newId, oldId, extra)
+		if extra and extra.Name and not (type(values.name) == "string" and values.name:match("%S")) then
+			values = { id = values.id, name = extra.Name }
+		end
 		if not oldId or newId == oldId then
 			-- A new ID, or a new name for the same one.
-			local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, values.name)
+			local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, values.name, extra)
 			if not entry then
 				view.flash(problem == "name" and "Name used" or "Invalid", 2)
 				CW.Warn("Custom ID not saved: " .. tostring(reason))
@@ -5068,9 +5491,9 @@ local function customIdEditor(opts, view)
 		local old = CW.CustomIds.get(category, weapon, oldId)
 		CW.CustomIds.remove(category, weapon, oldId)
 		local name = (type(values.name) == "string" and values.name:match("%S")) and values.name or (old and old.Name)
-		local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, name)
+		local entry, reason, problem = CW.CustomIds.add(category, weapon, newId, name, extra)
 		if not entry then
-			if old then CW.CustomIds.add(category, weapon, old.Id, old.Name) end -- put the old one back
+			if old then CW.CustomIds.add(category, weapon, old.Id, old.Name, old) end -- put the old one back
 			view.flash(problem == "name" and "Name used" or "Invalid", 2)
 			CW.Warn("Custom ID not saved: " .. tostring(reason))
 			return
@@ -5100,14 +5523,15 @@ local function customIdEditor(opts, view)
 			return
 		end
 		view.flash("Checking", 10)
-		checkCustomAsset("rbxassetid://" .. newId, opts.kind == "Audio" and "Audio" or "Image", function(loaded, why)
+		local kind = (opts.kind == "Audio" or opts.kind == "Mesh") and opts.kind or "Image"
+		checkCustomAsset("rbxassetid://" .. newId, kind, function(loaded, why, extra)
 			if mine ~= attempt then return end
 			if not loaded then
 				view.flash("Invalid", 2)
 				CW.Warn(loadFailureText(newId, why))
 				return
 			end
-			commit(values, weapon, newId, oldId)
+			commit(values, weapon, newId, oldId, extra)
 		end)
 	end
 
@@ -5184,7 +5608,7 @@ end
 -- ID (the edited one while editing). A button is shown only while it can do something.
 -- opts: as customIdEditor. Returns { refresh } (the drawer calls it when its sound changes).
 local function addAssetEditor(section, opts)
-	local CAPTION = "Add a sound by its ID"
+	local CAPTION = opts.kind == "Mesh" and "Add a mesh by its ID" or "Add a sound by its ID"
 	local group = section:Group(CAPTION)
 	local fields, buttons, editor
 
@@ -5737,358 +6161,436 @@ guarded("Cursors", function()
 end)
 
 ------------------------------------------------------------------------------
--- Guns tab: Shoot Sounds, Reload Sounds, Textures, Effects (tracers)
--- The sound controls keep the saved settings they always had, so nothing already saved is lost.
+-- Guns tab: one page per gun (on an older CWUI, one section per gun). A page starts with the gun's 3D preview, then
+-- its Mesh and its Texture (always open: the preview shows them), then its Gun Settings (Shoot Sound, Effect, Reload
+-- Sound). Everything on a page is that gun's own and is saved on its own. The sound and tracer controls keep the
+-- saved settings they always had, so nothing already saved is lost.
 ------------------------------------------------------------------------------
 guarded("Guns", function()
 	local GunsTab = Window:AddTab({ Name = "Guns", Icon = uiIcons.Guns or uiIcons.Visuals })
-	local ShootSection = wrapSection(GunsTab:AddSection({ Name = "Shoot Sounds", Open = false }))
-	local ReloadSection = wrapSection(GunsTab:AddSection({ Name = "Reload Sounds", Open = false }))
-	local TextureSection = wrapSection(GunsTab:AddSection({ Name = "Textures", Open = false }))
-	local EffectsSection = wrapSection(GunsTab:AddSection({ Name = "Effects", Open = false }))
+	local guns = soundWeaponNames()
+	local texturable = {}
+	for _, name in ipairs(CW.WeaponList or {}) do texturable[name] = true end
 
-	-- Same layout for every changer: first what applies to all guns (the two switches), then one drawer per gun
-	-- with its sound, its custom IDs and its volume (buildSoundDrawer), all of them that gun's own.
-	local function buildChangerSection(section, changer, label)
-		local spec = changer.spec
-		local building = true -- the controls' callbacks while the section is built are not the player's
+	local pager
+	-- The preview shows the gun of the page in view, as it looks in your hand. keep: same gun, so the camera stays.
+	refreshGunPreview = function(gun, keep)
+		if not pager then return end
+		local _, shown = pager:Get()
+		if not shown or (gun and gun ~= shown) then return end
+		local ok, model = pcall(CW.weaponPreview, shown)
+		pager:SetModel(ok and model or nil, keep)
+	end
+	if type(GunsTab.AddPager) == "function" then
+		pager = GunsTab:AddPager({
+			Pages = guns,
+			Hint = "Drag to rotate, scroll to zoom",
+			Changed = function() refreshGunPreview(nil, false) end,
+		})
+	end
+	-- A mesh that finished loading shows on the guns already (Texture module); the preview follows.
+	CW.onMeshLoaded = function() refreshGunPreview(nil, true) end
 
-		local enableToggle = section:Toggle({
-			Title = "Enable Custom " .. label .. " Sounds",
-			Default = CW.Settings[spec.EnabledKey] == true,
-			Callback = function(enabled)
-				CW.Settings[spec.EnabledKey] = enabled == true
-				changer.schedule()
+	-- After the Mesh or the Texture of a gun changes: the gun in your hand, then the preview.
+	local function lookChanged(gun)
+		if CW.reloadTextures then CW.reloadTextures() end
+		refreshGunPreview(gun, true)
+	end
+
+	-- Mesh: the gun's own (Default) or one of its custom mesh IDs, which are added right under the list.
+	local FACINGS = { "Normal", "Backward", "Upside Down", "Backward + Upside Down" } -- Facing 0 to 3
+	local function selectedMeshId(gun)
+		local selections = CW.Settings.ASSET_SELECTIONS.Meshes
+		local selected = type(selections) == "table" and selections[gun]
+		return type(selected) == "string" and selected:match("^id:(%d+)$") or nil
+	end
+	local function meshCatalog(gun)
+		local options, byLabel, taken = { "Default" }, {}, {}
+		for _, item in ipairs(CW.Library.items("Meshes", gun)) do
+			local label = customIdLabel(item, taken)
+			taken[label] = true
+			byLabel[label] = item.CustomId
+			table.insert(options, label)
+		end
+		return options, byLabel
+	end
+	local function meshLabel(byLabel, id)
+		for label, savedId in pairs(byLabel) do
+			if savedId == id then return label end
+		end
+		return "Default"
+	end
+
+	local function buildMesh(page, gun)
+		local options, byLabel = meshCatalog(gun)
+		local list, facing
+		local function showFacing()
+			local id = selectedMeshId(gun)
+			local entry = id and CW.CustomIds.get("Meshes", gun, id)
+			if facing.Instance then facing.Instance.Visible = entry ~= nil end
+			if entry then facing:Set(FACINGS[(entry.Facing or 0) + 1], true) end
+		end
+		list = page:Dropdown({
+			Title = "Mesh",
+			Options = options,
+			Default = meshLabel(byLabel, selectedMeshId(gun)),
+			Callback = function(label)
+				local id = byLabel[label]
+				local entry = id and CW.CustomIds.get("Meshes", gun, id)
+				if entry then CW.retryMesh(entry.Mesh or entry.Id) end -- one that failed before is tried again
+				CW.Library.setSelection("Meshes", gun, id and CW.CustomIds.selectionOf(id) or nil)
+				showFacing()
+				lookChanged(gun)
 			end,
 		})
+		guarded(gun .. " Mesh IDs", function()
+			addAssetEditor(page, {
+				category = "Meshes", kind = "Mesh",
+				weapon = function() return gun end,
+				selected = function()
+					local id = selectedMeshId(gun)
+					return id and CW.CustomIds.selectionOf(id) or nil
+				end,
+			})
+		end)
+		-- Which way the custom mesh is turned on the gun, for a mesh made the other way round (kept with its ID).
+		facing = page:Dropdown({
+			Title = "Mesh Facing",
+			Options = FACINGS,
+			Default = FACINGS[1],
+			Callback = function(label)
+				local id = selectedMeshId(gun)
+				if not id then return end
+				CW.CustomIds.setFacing(gun, id, (table.find(FACINGS, label) or 1) - 1)
+				lookChanged(gun)
+			end,
+		})
+		showFacing()
+		table.insert(meshControls, function()
+			options, byLabel = meshCatalog(gun)
+			list:Refresh(options)
+			list:Set(meshLabel(byLabel, selectedMeshId(gun)), true)
+			showFacing()
+		end)
+	end
 
-		-- Nothing of a changer applies while its switch is off: not the chosen sound, not the volume. So choosing
-		-- a sound (other than Default) or a volume (other than 1x) turns it on, and the switch shows it.
+	local function buildTexture(page, gun)
+		local gallery = page:Gallery({
+			Name = "Texture",
+			Items = galleryItems("Textures", gun),
+			Default = CW.Library.selectedPath("Textures", gun),
+			AllowDeselect = true,
+			LazyLoad = true,
+			Columns = 4,
+			MaxHeight = 260,
+			Callback = function(item)
+				CW.Library.setSelection("Textures", gun, type(item) == "table" and CW.Library.relative(item.Path) or nil)
+				lookChanged(gun)
+			end,
+		})
+		table.insert(textureGalleries, { weapon = gun, gallery = gallery })
+		-- Custom IDs for this gun only, right under its gallery.
+		guarded(gun .. " Texture Custom IDs", function()
+			addCustomIdRow(page, {
+				category = "Textures", kind = "Texture", controls = { gallery },
+				weapon = function() return gun end,
+				selected = function()
+					local textures = CW.Settings.ASSET_SELECTIONS.Textures
+					return type(textures) == "table" and textures[gun] or nil
+				end,
+			})
+		end)
+	end
+
+	-- Shoot Sound / Reload Sound: the gun's two switches, then its sound, its custom IDs and its volume
+	-- (buildSoundDrawer). Nothing of it applies while "Apply Custom Sound" is off, so choosing a sound (other than
+	-- Default) or a volume (other than 1x) turns it on, and the switch shows it.
+	local function buildSound(holder, changer, label, gun)
+		local drawer = holder:AddSubSection(label .. " Sound", false)
+		local building = true -- the controls' callbacks while the drawer is built are not the player's
+		local enabled = drawer:Toggle({
+			Title = "Apply Custom Sound",
+			Default = changer.enabledFor(gun),
+			Callback = function(on) changer.setEnabled(gun, on) end,
+		})
+		drawer:Toggle({
+			Title = "Apply To Other Players Locally",
+			Default = changer.othersFor(gun),
+			Callback = function(on) changer.setOthers(gun, on) end,
+		})
 		local function ensureEnabled()
-			if building or CW.Settings[spec.EnabledKey] then return end
-			CW.Settings[spec.EnabledKey] = true
-			if enableToggle and enableToggle.Set then pcall(enableToggle.Set, enableToggle, true, true) end
-			CW.Log(label .. " sound overrides turned on (a sound or a volume was chosen)")
-			changer.schedule()
+			if building or changer.enabledFor(gun) then return end
+			changer.setEnabled(gun, true)
+			if enabled and enabled.Set then pcall(enabled.Set, enabled, true, true) end
+			CW.Log(gun .. " " .. label:lower() .. " sound turned on (a sound or a volume was chosen)")
 			scheduleSave()
 		end
-
-		section:Toggle({
-			Title = "Apply to Other Players Locally",
-			Default = CW.Settings[spec.OthersKey] == true,
-			Callback = function(enabled)
-				CW.Settings[spec.OthersKey] = enabled == true
-				changer.schedule()
+		local entry = changer.catalog[gun]
+		local controls = buildSoundDrawer(drawer, {
+			title = "Sound",
+			options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
+			value = changer.label(gun, changer.overrides[gun]),
+			volume = changer.volumeOf(gun),
+			volumeNow = function() return changer.volumeOf(gun) end,
+			onChoose = function(value)
+				if value ~= WEAPON_SOUND_DEFAULT then ensureEnabled() end
+				changer.set(gun, value)
 			end,
+			onVolume = function(v)
+				if math.abs((tonumber(v) or 1) - 1) > 1e-6 then ensureEnabled() end
+				changer.setVolume(gun, v)
+			end,
+			editor = {
+				category = changer.spec.Category,
+				kind = "Audio",
+				weapon = function() return gun end,
+				selected = function() return changer.overrides[gun] end,
+			},
 		})
-
-		section:AddLabel("Each gun keeps its own " .. label:lower() .. " sound, custom IDs and volume. Changes save on their own.")
-		for _, weaponName in ipairs(soundWeaponNames()) do
-			local weapon = weaponName
-			local entry = changer.catalog[weapon]
-			local controls = buildSoundDrawer(section:AddSubSection(weapon, false), {
-				title = label .. " Sound",
-				options = entry and entry.options or { WEAPON_SOUND_DEFAULT },
-				value = changer.label(weapon, changer.overrides[weapon]),
-				volume = changer.volumeOf(weapon),
-				volumeNow = function() return changer.volumeOf(weapon) end,
-				onChoose = function(value)
-					if value ~= WEAPON_SOUND_DEFAULT then ensureEnabled() end
-					changer.set(weapon, value)
-				end,
-				onVolume = function(v)
-					if math.abs((tonumber(v) or 1) - 1) > 1e-6 then ensureEnabled() end
-					changer.setVolume(weapon, v)
-				end,
-				editor = {
-					category = spec.Category,
-					kind = "Audio",
-					weapon = function() return weapon end,
-					selected = function() return changer.overrides[weapon] end,
-				},
-			})
-			table.insert(changer.dropdowns, { weapon = weapon, control = controls.dropdown, volume = controls.volume })
-		end
+		table.insert(changer.dropdowns, { weapon = gun, control = controls.dropdown, volume = controls.volume })
 		task.defer(function() building = false end)
 	end
 
-	guarded("Shoot Sounds", function() buildChangerSection(ShootSection, shootSounds, "Shoot") end)
-	guarded("Reload Sounds", function() buildChangerSection(ReloadSection, reloadSounds, "Reload") end)
+	-- Effect: the gun's tracer. The switches come first, then the sliders, then the colors.
+	local tracerPalette = {
+		Violet = Color3.fromRGB(170, 0, 255),
+		Lilac = Color3.fromRGB(200, 100, 255),
+		Red = Color3.fromRGB(255, 64, 64),
+		Green = Color3.fromRGB(64, 220, 96),
+		Cyan = Color3.fromRGB(64, 210, 255),
+		White = Color3.fromRGB(255, 255, 255),
+	}
 
-	guarded("Textures", function()
-		for _, weaponName in ipairs(CW.WeaponList or {}) do
-			local weapon = weaponName
-			local weaponSection = TextureSection:AddSubSection(weapon, false)
-			local selectedPath = CW.Library.selectedPath("Textures", weapon)
-			local gallery = weaponSection:Gallery({
-				Name = weapon .. " Textures",
-				Items = galleryItems("Textures", weapon),
-				Default = selectedPath,
-				AllowDeselect = true,
-				LazyLoad = true,
-				Columns = 4,
-				MaxHeight = 260,
-				Callback = function(item)
-					CW.Library.setSelection("Textures", weapon,
-						type(item) == "table" and CW.Library.relative(item.Path) or nil)
-					if CW.reloadTextures then CW.reloadTextures() end
-				end,
-			})
-			table.insert(textureGalleries, { weapon = weapon, gallery = gallery })
-
-			-- Custom IDs for this gun only, right under its gallery.
-			guarded(weapon .. " Texture Custom IDs", function()
-				addCustomIdRow(weaponSection, {
-					category = "Textures", kind = "Texture", controls = { gallery },
-					weapon = function() return weapon end,
-					selected = function()
-						local textures = CW.Settings.ASSET_SELECTIONS.Textures
-						return type(textures) == "table" and textures[weapon] or nil
-					end,
-				})
-			end)
+	-- Only used by the palette dropdown, which is the fallback when the loaded CWUI has no color picker.
+	local function colorName(color)
+		for name, paletteColor in pairs(tracerPalette) do
+			if color == paletteColor then return name end
 		end
-	end)
+		return "Violet"
+	end
 
-	-- Effects: one set of tracer controls for every gun (the Sniper M700 and the Taser included), shown
-	-- for the gun picked in the Gun dropdown. The switches come first, then the sliders, then the colors.
-	guarded("Effects", function()
-		local tracerPalette = {
-			Violet = Color3.fromRGB(170, 0, 255),
-			Lilac = Color3.fromRGB(200, 100, 255),
-			Red = Color3.fromRGB(255, 64, 64),
-			Green = Color3.fromRGB(64, 220, 96),
-			Cyan = Color3.fromRGB(64, 210, 255),
-			White = Color3.fromRGB(255, 255, 255),
+	-- Colors are userdata and can't be serialised: the Sniper and Taser colors are saved as hex strings
+	-- (TRACER_SNIPER_COLOR_HEX, ...). The bullet guns store their colors as hex inside their own maps.
+	local function colorFromHex(hex)
+		if type(hex) ~= "string" then return nil end
+		local ok, color = pcall(Color3.fromHex, hex)
+		if ok and typeof(color) == "Color3" then return color end
+		return nil
+	end
+	for _, entry in ipairs({
+		{ "TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX" },
+		{ "TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX" },
+	}) do
+		local settingKey, hexKey = entry[1], entry[2]
+		CW.Settings[settingKey] = colorFromHex(CW.Settings[hexKey]) or CW.Settings[settingKey]
+		-- The saved values are consumed here. If they stayed in CW.Settings, the generic save loop would
+		-- write them back even after the player picks another color (or goes back to the default).
+		CW.Settings[hexKey] = nil
+	end
+
+	-- A colour control. Returns a function that moves it to another colour without calling onChange,
+	-- and the control itself.
+	local function addColorControl(section, title, initial, onChange)
+		local picker = section:Colorpicker({
+			Title = title,
+			Default = initial,
+			Callback = onChange,
+		})
+		if picker then
+			return function(color) picker:Set(color, true) end, picker
+		end
+
+		-- No color picker in the loaded CWUI: keep the old palette dropdown.
+		local dropdown = section:Dropdown({
+			Title = title,
+			Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
+			Default = colorName(initial),
+			Callback = function(name)
+				onChange(tracerPalette[name])
+			end,
+		})
+		return function(color) dropdown:Set(colorName(color), true) end, dropdown
+	end
+
+	-- The Sniper and the Taser keep their settings in TRACER_SNIPER_* / TRACER_TASER_*; every other gun
+	-- keeps them in the TRACER_GUN_* maps (gun name -> value). OTHERS is a map for every gun.
+	local SPECIAL = { M700 = "TRACER_SNIPER_", Taser = "TRACER_TASER_" }
+	local KEYS = {
+		enabled = "ENABLED", color = "COLOR", glow = "GLOW", width = "WIDTH",
+		life = "LIFETIME", transparency = "TRANSPARENCY", light = "LIGHT", others = "OTHERS",
+	}
+	local D = CW.GunTracerDefaults
+
+	local function gunMap(field) -- the settings map of one field (created again if a saved file replaced it)
+		local key = "TRACER_GUN_" .. KEYS[field]
+		if type(CW.Settings[key]) ~= "table" then CW.Settings[key] = {} end
+		return CW.Settings[key]
+	end
+
+	-- The value of one field for one gun: its own, or the starting one.
+	local function getFor(gun, field)
+		local prefix = SPECIAL[gun]
+		if prefix then
+			local value = CW.Settings[prefix .. KEYS[field]]
+			if field == "enabled" then return value == true end
+			if field == "light" or field == "glow" then return nil end -- these two do not apply to them
+			if value == nil then return D[field] end
+			return value
+		end
+		local stored = gunMap(field)[gun]
+		if field == "enabled" or field == "light" then return stored == true end
+		if field == "color" or field == "glow" then return colorFromHex(stored) or D[field] end
+		return tonumber(stored) or D[field]
+	end
+
+	local function setFor(gun, field, value)
+		local prefix = SPECIAL[gun]
+		if prefix then
+			if field == "light" or field == "glow" then return end
+			if field == "enabled" then value = value == true end
+			CW.Settings[prefix .. KEYS[field]] = value
+			return
+		end
+		if field == "enabled" or field == "light" then
+			value = value and true or nil
+		elseif field == "color" or field == "glow" then
+			value = value:ToHex()
+		end
+		gunMap(field)[gun] = value
+	end
+
+	-- The Sniper and the Taser have no glow and no light, and a longer lifetime range (their tracer fades
+	-- over seconds).
+	local perGun = {} -- gun -> its controls, so "Apply To All Guns" can update the other pages
+
+	-- Puts a gun's saved values back into its controls without saving anything.
+	local function refreshGun(gun)
+		local c = perGun[gun]
+		if not c then return end
+		c.enabled:Set(getFor(gun, "enabled"), true)
+		if c.light then c.light:Set(getFor(gun, "light") == true, true) end
+		c.width:Set(getFor(gun, "width"), true)
+		c.life:Set(getFor(gun, "life"), true)
+		c.transparency:Set(getFor(gun, "transparency"), true)
+		c.setColor(getFor(gun, "color"))
+		if c.setGlow then c.setGlow(getFor(gun, "glow") or D.glow) end
+	end
+
+	-- Copies one gun's tracer look to every gun. The Sniper and the Taser only get the color.
+	local function applyToAll(sourceGun)
+		local special = SPECIAL[sourceGun] ~= nil
+		local look = {
+			enabled = getFor(sourceGun, "enabled"),
+			color = getFor(sourceGun, "color"),
+			width = getFor(sourceGun, "width"),
+			life = getFor(sourceGun, "life"),
+			transparency = getFor(sourceGun, "transparency"),
 		}
-
-		-- Only used by the palette dropdown, which is the fallback when the loaded CWUI has no color picker.
-		local function colorName(color)
-			for name, paletteColor in pairs(tracerPalette) do
-				if color == paletteColor then return name end
-			end
-			return "Violet"
+		if not special then
+			look.glow = getFor(sourceGun, "glow")
+			look.light = getFor(sourceGun, "light")
 		end
 
-		-- Colors are userdata and can't be serialised: the Sniper and Taser colors are saved as hex strings
-		-- (TRACER_SNIPER_COLOR_HEX, ...). The bullet guns store their colors as hex inside their own maps.
-		local function colorFromHex(hex)
-			if type(hex) ~= "string" then return nil end
-			local ok, color = pcall(Color3.fromHex, hex)
-			if ok and typeof(color) == "Color3" then return color end
-			return nil
-		end
-		for _, entry in ipairs({
-			{ "TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX" },
-			{ "TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX" },
-		}) do
-			local settingKey, hexKey = entry[1], entry[2]
-			CW.Settings[settingKey] = colorFromHex(CW.Settings[hexKey]) or CW.Settings[settingKey]
-			-- The saved values are consumed here. If they stayed in CW.Settings, the generic save loop would
-			-- write them back even after the player picks another color (or goes back to the default).
-			CW.Settings[hexKey] = nil
-		end
-
-		-- A colour control. Returns a function that moves it to another colour without calling onChange,
-		-- and the control itself.
-		local function addColorControl(section, title, initial, onChange)
-			local picker = section:Colorpicker({
-				Title = title,
-				Default = initial,
-				Callback = onChange,
-			})
-			if picker then
-				return function(color) picker:Set(color, true) end, picker
-			end
-
-			-- No color picker in the loaded CWUI: keep the old palette dropdown.
-			local dropdown = section:Dropdown({
-				Title = title,
-				Options = { "Violet", "Lilac", "Red", "Green", "Cyan", "White" },
-				Default = colorName(initial),
-				Callback = function(name)
-					onChange(tracerPalette[name])
-				end,
-			})
-			return function(color) dropdown:Set(colorName(color), true) end, dropdown
-		end
-
-		local gunNames = {}
-		for _, name in ipairs(soundWeaponNames()) do table.insert(gunNames, name) end
-		if #gunNames == 0 then
-			gunNames = { "AK-47", "FAL", "M4A1", "M9", "MP5", "Remington 870", "Revolver", "M700", "Taser" }
-		end
-
-		-- The Sniper and the Taser keep their settings in TRACER_SNIPER_* / TRACER_TASER_*; every other gun
-		-- keeps them in the TRACER_GUN_* maps (gun name -> value).
-		local SPECIAL = { M700 = "TRACER_SNIPER_", Taser = "TRACER_TASER_" }
-		local KEYS = {
-			enabled = "ENABLED", color = "COLOR", glow = "GLOW", width = "WIDTH",
-			life = "LIFETIME", transparency = "TRANSPARENCY", light = "LIGHT",
-		}
-		local D = CW.GunTracerDefaults
-
-		local function gunMap(field) -- the settings map of one field (created again if a saved file replaced it)
-			local key = "TRACER_GUN_" .. KEYS[field]
-			if type(CW.Settings[key]) ~= "table" then CW.Settings[key] = {} end
-			return CW.Settings[key]
-		end
-
-		-- The value of one field for one gun: its own, or the starting one.
-		local function getFor(gun, field)
-			local prefix = SPECIAL[gun]
-			if prefix then
-				local value = CW.Settings[prefix .. KEYS[field]]
-				if field == "enabled" then return value == true end
-				if field == "light" or field == "glow" then return nil end -- these two do not apply to them
-				if value == nil then return D[field] end
-				return value
-			end
-			local stored = gunMap(field)[gun]
-			if field == "enabled" or field == "light" then return stored == true end
-			if field == "color" or field == "glow" then return colorFromHex(stored) or D[field] end
-			return tonumber(stored) or D[field]
-		end
-
-		local function setFor(gun, field, value)
-			local prefix = SPECIAL[gun]
-			if prefix then
-				if field == "light" or field == "glow" then return end
-				if field == "enabled" then value = value == true end
-				CW.Settings[prefix .. KEYS[field]] = value
-				return
-			end
-			if field == "enabled" or field == "light" then
-				value = value and true or nil
-			elseif field == "color" or field == "glow" then
-				value = value:ToHex()
-			end
-			gunMap(field)[gun] = value
-		end
-
-		-- One collapsed subsection per gun (like Textures), each with that gun's own controls. The Sniper
-		-- and the Taser have no glow and no light, and a longer lifetime range (their tracer fades over seconds).
-		local perGun = {} -- gun -> its controls, so "Apply To All Guns" can update the other drawers
-
-		-- Puts a gun's saved values back into its controls without saving anything.
-		local function refreshGun(gun)
-			local c = perGun[gun]
-			if not c then return end
-			c.enabled:Set(getFor(gun, "enabled"), true)
-			if c.light then c.light:Set(getFor(gun, "light") == true, true) end
-			c.width:Set(getFor(gun, "width"), true)
-			c.life:Set(getFor(gun, "life"), true)
-			c.transparency:Set(getFor(gun, "transparency"), true)
-			c.setColor(getFor(gun, "color"))
-			if c.setGlow then c.setGlow(getFor(gun, "glow") or D.glow) end
-		end
-
-		-- Copies one gun's settings to every gun. The Sniper and the Taser only get the color.
-		local function applyToAll(sourceGun)
-			local special = SPECIAL[sourceGun] ~= nil
-			local look = {
-				enabled = getFor(sourceGun, "enabled"),
-				color = getFor(sourceGun, "color"),
-				width = getFor(sourceGun, "width"),
-				life = getFor(sourceGun, "life"),
-				transparency = getFor(sourceGun, "transparency"),
-			}
-			if not special then
-				look.glow = getFor(sourceGun, "glow")
-				look.light = getFor(sourceGun, "light")
-			end
-
-			for _, name in ipairs(gunNames) do
-				if name ~= sourceGun then
-					setFor(name, "color", look.color)
-					if not SPECIAL[name] then
-						setFor(name, "enabled", look.enabled)
-						setFor(name, "width", math.clamp(look.width, 0.01, 0.5))
-						setFor(name, "life", math.clamp(look.life, 0.01, 1))
-						setFor(name, "transparency", math.clamp(look.transparency, 0, 1))
-						if look.glow ~= nil then setFor(name, "glow", look.glow) end
-						if look.light ~= nil then setFor(name, "light", look.light) end
-					end
-					refreshGun(name)
+		for _, name in ipairs(guns) do
+			if name ~= sourceGun then
+				setFor(name, "color", look.color)
+				if not SPECIAL[name] then
+					setFor(name, "enabled", look.enabled)
+					setFor(name, "width", math.clamp(look.width, 0.01, 0.5))
+					setFor(name, "life", math.clamp(look.life, 0.01, 1))
+					setFor(name, "transparency", math.clamp(look.transparency, 0, 1))
+					if look.glow ~= nil then setFor(name, "glow", look.glow) end
+					if look.light ~= nil then setFor(name, "light", look.light) end
 				end
+				refreshGun(name)
 			end
-
-			scheduleSave()
-			CW.Log("Applied the " .. sourceGun .. " tracer to all guns (M700 and Taser: color only).")
 		end
 
-		-- Global switch first, then the drawers.
-		EffectsSection:Toggle({
-			Title = "Apply to Other Players Locally",
-			Default = CW.Settings.TRACER_APPLY_TO_OTHERS,
-			Callback = function(s) CW.Settings.TRACER_APPLY_TO_OTHERS = s end,
+		scheduleSave()
+		CW.Log("Applied the " .. sourceGun .. " tracer to all guns (M700 and Taser: color only).")
+	end
+
+	local function buildEffect(holder, gun)
+		local special = SPECIAL[gun] ~= nil
+		local drawer = holder:AddSubSection("Effect", false)
+		local c = {}
+
+		-- switches
+		c.enabled = drawer:Toggle({
+			Title = "Apply Custom Tracer",
+			Default = getFor(gun, "enabled"),
+			Callback = function(on) setFor(gun, "enabled", on) end,
+		})
+		drawer:Toggle({
+			Title = "Apply To Other Players Locally",
+			Default = gunMap("others")[gun] == true,
+			Callback = function(on) gunMap("others")[gun] = on == true or nil end,
+		})
+		if not special then
+			c.light = drawer:Toggle({
+				Title = "Tracer Light",
+				Default = getFor(gun, "light") == true,
+				Callback = function(on) setFor(gun, "light", on) end,
+			})
+		end
+
+		-- sliders
+		c.width = drawer:Slider({
+			Title = "Tracer Width",
+			Min = 0.01,
+			Max = 0.5,
+			Default = getFor(gun, "width"),
+			Decimal = 2,
+			Callback = function(v) setFor(gun, "width", v) end,
+		})
+		c.life = drawer:Slider({
+			Title = "Tracer Lifetime",
+			Min = 0.01,
+			Max = special and 5 or 1,
+			Default = getFor(gun, "life"),
+			Decimal = 2,
+			Suffix = "s",
+			Callback = function(v) setFor(gun, "life", v) end,
+		})
+		c.transparency = drawer:Slider({
+			Title = "Tracer Transparency",
+			Min = 0,
+			Max = 1,
+			Default = getFor(gun, "transparency"),
+			Decimal = 2,
+			Callback = function(v) setFor(gun, "transparency", v) end,
 		})
 
-		for _, gunName in ipairs(gunNames) do
-			local gun = gunName
-			guarded(gun .. " Effects", function()
-				local special = SPECIAL[gun] ~= nil
-				local drawer = EffectsSection:AddSubSection(gun, false)
-				local c = {}
-
-				-- switches
-				c.enabled = drawer:Toggle({
-					Title = "Apply Custom Tracer",
-					Default = getFor(gun, "enabled"),
-					Callback = function(on) setFor(gun, "enabled", on) end,
-				})
-				if not special then
-					c.light = drawer:Toggle({
-						Title = "Tracer Light",
-						Default = getFor(gun, "light") == true,
-						Callback = function(on) setFor(gun, "light", on) end,
-					})
-				end
-
-				-- sliders
-				c.width = drawer:Slider({
-					Title = "Tracer Width",
-					Min = 0.01,
-					Max = 0.5,
-					Default = getFor(gun, "width"),
-					Decimal = 2,
-					Callback = function(v) setFor(gun, "width", v) end,
-				})
-				c.life = drawer:Slider({
-					Title = "Tracer Lifetime",
-					Min = 0.01,
-					Max = special and 5 or 1,
-					Default = getFor(gun, "life"),
-					Decimal = 2,
-					Suffix = "s",
-					Callback = function(v) setFor(gun, "life", v) end,
-				})
-				c.transparency = drawer:Slider({
-					Title = "Tracer Transparency",
-					Min = 0,
-					Max = 1,
-					Default = getFor(gun, "transparency"),
-					Decimal = 2,
-					Callback = function(v) setFor(gun, "transparency", v) end,
-				})
-
-				-- colors
-				c.setColor = addColorControl(drawer, "Tracer Color",
-					getFor(gun, "color"), function(color) setFor(gun, "color", color) end)
-				if not special then
-					c.setGlow = addColorControl(drawer, "Glow Color",
-						getFor(gun, "glow") or D.glow, function(color) setFor(gun, "glow", color) end)
-				end
-
-				drawer:Button({
-					Title = "Apply to All Guns",
-					Callback = function() applyToAll(gun) end,
-				})
-
-				perGun[gun] = c
-			end)
+		-- colors
+		c.setColor = addColorControl(drawer, "Tracer Color",
+			getFor(gun, "color"), function(color) setFor(gun, "color", color) end)
+		if not special then
+			c.setGlow = addColorControl(drawer, "Glow Color",
+				getFor(gun, "glow") or D.glow, function(color) setFor(gun, "glow", color) end)
 		end
-	end)
+
+		drawer:Button({
+			Title = "Apply to All Guns",
+			Callback = function() applyToAll(gun) end,
+		})
+
+		perGun[gun] = c
+	end
+
+	for index, gun in ipairs(guns) do
+		guarded(gun .. " page", function()
+			local raw = pager and pager:Page(index) or GunsTab:AddSection({ Name = gun, Open = false })
+			local page = wrapSection(raw)
+			guarded(gun .. " Mesh", function() buildMesh(page, gun) end)
+			if texturable[gun] then guarded(gun .. " Texture", function() buildTexture(page, gun) end) end
+			local settings = pager and wrapSection(raw:AddSection({ Name = "Gun Settings", Open = false }))
+				or page:AddSubSection("Gun Settings", false)
+			guarded(gun .. " Shoot Sound", function() buildSound(settings, shootSounds, "Shoot", gun) end)
+			guarded(gun .. " Effect", function() buildEffect(settings, gun) end)
+			guarded(gun .. " Reload Sound", function() buildSound(settings, reloadSounds, "Reload", gun) end)
+		end)
+	end
+	refreshGunPreview(nil, false)
 end)
 
 ------------------------------------------------------------------------------
@@ -7750,6 +8252,8 @@ function refreshUIFromLibrary()
 	for _, entry in ipairs(textureGalleries) do
 		syncGallery(entry.gallery, "Textures", entry.weapon, CW.Library.selectedPath("Textures", entry.weapon))
 	end
+	for _, refreshMesh in ipairs(meshControls) do refreshMesh() end
+	if refreshGunPreview then refreshGunPreview(nil, true) end
 
 	for _, drawer in ipairs(hitSoundDrawers) do
 		local options, entries = hitSoundCatalog(drawer.gun)
@@ -8171,7 +8675,8 @@ for _, changer in ipairs(soundChangers) do
 	changer.schedule()
 	if changer.migrated then soundsMigrated = true end
 end
-if soundsMigrated then scheduleSave() end -- write the cleaned-up overrides so the warning shows only once
+-- Write the cleaned-up overrides (so the warning shows only once) and the per-gun switches.
+if soundsMigrated or switchesMigrated then scheduleSave() end
 print("[CW] UI loaded.")
 
 -- The asset sync runs independently (Sync module). When it finishes, rebuild the UI lists.
