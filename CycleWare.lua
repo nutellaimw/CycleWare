@@ -1261,8 +1261,9 @@ end
 -- An ID is listed next to the library files of its category (and gun), and choosing it is saved
 -- like a file choice, as "id:<number>".
 -- A mesh ID also keeps what was found behind it when it was added (see CW.resolveMeshAsset): Mesh (the mesh
--- asset shown; another ID when the ID was an accessory or a model), Texture (the texture that came with it) and
--- Facing (1 to 3, which way it is turned on the gun; none = as fitted).
+-- asset shown; another ID when the ID was an accessory or a model) and Texture (the texture that came with it),
+-- and how the player adjusted it on that gun: Adjust = { Size, Right, Up, Forward, Turn, Tilt, Roll } (only the
+-- fields away from their default; see MESH_ADJUST).
 -- Without the file functions (CAPS.files) the IDs still work, but only until the player rejoins.
 local CUSTOM_ID_CATEGORIES = { -- true = one list per gun
 	Hitmarkers = false, Cursors = false,
@@ -1346,7 +1347,10 @@ local function listOf(category, weapon, create)
 end
 
 local function copyEntry(entry)
-	return { Name = entry.Name, Id = entry.Id, File = entry.File, Mesh = entry.Mesh, Texture = entry.Texture, Facing = entry.Facing }
+	return {
+		Name = entry.Name, Id = entry.Id, File = entry.File, Mesh = entry.Mesh, Texture = entry.Texture,
+		Adjust = entry.Adjust and table.clone(entry.Adjust) or nil,
+	}
 end
 
 local function copyEntries(source)
@@ -1355,14 +1359,37 @@ local function copyEntries(source)
 	return entries
 end
 
--- The mesh fields of an entry, checked: IDs as digits, Facing 1 to 3 (0, the default, is not kept).
+-- How a custom mesh can be adjusted on its gun: { lowest, highest, default } of each field. Size multiplies the
+-- size it is fitted to; Right, Up and Forward move it (studs, along the gun); Turn, Tilt and Roll turn it (degrees,
+-- positive = to the right, nose up, rolled to the right).
+local MESH_ADJUST = {
+	Size = { 0.1, 4, 1 },
+	Right = { -2, 2, 0 }, Up = { -2, 2, 0 }, Forward = { -2, 2, 0 },
+	Turn = { -180, 180, 0 }, Tilt = { -180, 180, 0 }, Roll = { -180, 180, 0 },
+}
+CW.MeshAdjust = MESH_ADJUST
+
+-- An Adjust table checked: numbers in range, fields at their default left out (nil when nothing is left).
+local function cleanAdjust(source)
+	local adjust = {}
+	for field, limits in pairs(MESH_ADJUST) do
+		local value = type(source) == "table" and tonumber(source[field])
+		if value and value == value then
+			value = math.clamp(value, limits[1], limits[2])
+			if math.abs(value - limits[3]) > 1e-6 then adjust[field] = value end
+		end
+	end
+	return next(adjust) and adjust or nil
+end
+
+-- The mesh fields of an entry, checked: IDs as digits, the Adjust table in range. Facing, from the first
+-- version of the mesh list (1 turned around, 2 upside down, 3 both), becomes Turn and Roll.
 local function meshFields(source)
+	local adjust = type(source.Adjust) == "table" and table.clone(source.Adjust) or {}
 	local facing = tonumber(source.Facing)
-	return {
-		Mesh = parseAssetId(source.Mesh),
-		Texture = parseAssetId(source.Texture),
-		Facing = (facing and facing >= 1 and facing <= 3) and math.floor(facing) or nil,
-	}
+	if facing == 1 or facing == 3 then adjust.Turn = adjust.Turn or 180 end
+	if facing == 2 or facing == 3 then adjust.Roll = adjust.Roll or 180 end
+	return { Mesh = parseAssetId(source.Mesh), Texture = parseAssetId(source.Texture), Adjust = cleanAdjust(adjust) }
 end
 
 -- A downloaded file must stay inside its own category folder, outside the official one.
@@ -1422,7 +1449,7 @@ local function sanitizeList(source, category)
 			local clean = { Name = cleanName(entry.Name, id), Id = id, File = downloaded and entry.File or nil }
 			if category == "Meshes" then
 				local fields = meshFields(entry)
-				clean.Mesh, clean.Texture, clean.Facing = fields.Mesh, fields.Texture, fields.Facing
+				clean.Mesh, clean.Texture, clean.Adjust = fields.Mesh, fields.Texture, fields.Adjust
 			end
 			table.insert(loaded, clean)
 		end
@@ -1491,13 +1518,24 @@ function CW.CustomIds.get(category, weapon, rawId)
 	return nil
 end
 
--- Changes which way a custom mesh faces (0 to 3) and saves it. Returns true when the ID was found.
-function CW.CustomIds.setFacing(weapon, rawId, facing)
+-- Saves the file a second after the last call: a slider calls this on every step while it is dragged.
+local saveThread
+function CW.CustomIds.saveSoon()
+	if saveThread then task.cancel(saveThread) end
+	saveThread = task.delay(1, function()
+		saveThread = nil
+		CW.CustomIds.save()
+	end)
+end
+
+-- Sets how a custom mesh is adjusted on its gun (an Adjust table, or nil for none). Returns true when the ID was
+-- found.
+function CW.CustomIds.setAdjust(weapon, rawId, adjust)
 	local id = parseAssetId(rawId)
 	for _, entry in ipairs(listOf("Meshes", weapon, false) or {}) do
 		if entry.Id == id then
-			entry.Facing = meshFields({ Facing = facing }).Facing
-			CW.CustomIds.save()
+			entry.Adjust = cleanAdjust(adjust)
+			CW.CustomIds.saveSoon()
 			return true
 		end
 	end
@@ -1532,7 +1570,7 @@ end
 
 -- Adds an ID (or renames it when it is already there). Returns the entry, or nil, the reason and the
 -- kind of problem ("name" when the name is taken). extra.File: the downloaded file (Cursors); extra.Mesh,
--- Texture, Facing: what a mesh ID turned out to be (Meshes).
+-- Texture, Adjust: what a mesh ID turned out to be and how it is adjusted (Meshes).
 function CW.CustomIds.add(category, weapon, rawId, name, extra)
 	if CUSTOM_ID_CATEGORIES[category] == nil then return nil, "this category has no custom IDs" end
 	local id = parseAssetId(rawId)
@@ -1561,7 +1599,7 @@ function CW.CustomIds.add(category, weapon, rawId, name, extra)
 		if category ~= "Meshes" or type(extra) ~= "table" then return end
 		local fields = meshFields(extra)
 		entry.Mesh, entry.Texture = fields.Mesh, fields.Texture
-		if extra.Facing ~= nil then entry.Facing = fields.Facing end
+		if extra.Adjust ~= nil then entry.Adjust = fields.Adjust end
 	end
 
 	if existing then
@@ -3163,8 +3201,8 @@ end
 -- A gun whose Meshes choice is one of its custom mesh IDs shows that mesh instead of its own: a MeshPart named
 -- CW_Mesh, welded to the Handle, with the game's pieces hidden (the same bookkeeping as the FAL/M700 meshes above).
 -- It is placed in the box the gun's own pieces fill around the Handle (the grip and the Muzzle included): its
--- longest side along the barrel, the middle one upright, scaled evenly to the gun's length. A mesh made the other
--- way round is fixed by the Facing stored with its ID: 1 turned around, 2 upside down, 3 both.
+-- longest side along the barrel, the middle one upright, scaled evenly to the gun's length. Then the Adjust saved
+-- with its ID (see MESH_ADJUST) scales, moves and turns it from there, around its own center.
 -- Texture: the gun's chosen texture, otherwise the one that came with the mesh (an accessory or a model brings one).
 -- Until the mesh has loaded the gun keeps its own look, and a mesh that cannot be loaded leaves it that way.
 local AssetService = game:GetService("AssetService")
@@ -3177,11 +3215,6 @@ CW.State.meshTemplates = meshTemplates
 local meshLoading = {}
 local OWN_MESHES = { [MESH_PART] = true } -- parts we add, never measured as the gun's own pieces
 for _, cfg in pairs(CUSTOM_MESH_WEAPONS) do OWN_MESHES[cfg.meshName] = true end
-local FACING_TURNS = {
-	[1] = CFrame.Angles(0, math.pi, 0),
-	[2] = CFrame.Angles(0, 0, math.pi),
-	[3] = CFrame.Angles(0, math.pi, 0) * CFrame.Angles(0, 0, math.pi),
-}
 local BOX_CORNERS = {}
 for _, x in ipairs({ -1, 1 }) do
 	for _, y in ipairs({ -1, 1 }) do
@@ -3324,9 +3357,8 @@ local function pieceShape(part)
 end
 
 -- The box the gun's own pieces fill in the Handle's space (pieces hidden by us count as they were), together with
--- the grip (the Handle's center) and the Muzzle; with shown, also what it shows now (a mesh of ours).
--- Returns its center and size, and the files still to load.
-local function gunBox(tool, handle, shown)
+-- the grip (the Handle's center) and the Muzzle. Returns its center and size, and the files still to load.
+local function gunBox(tool, handle)
 	local low, high, pending = Vector3.zero, Vector3.zero, {}
 	local function add(point)
 		low, high = low:Min(point), high:Max(point)
@@ -3334,9 +3366,8 @@ local function gunBox(tool, handle, shown)
 	local muzzle = tool:FindFirstChild("Muzzle")
 	if muzzle and muzzle:IsA("BasePart") then add(handle.CFrame:PointToObjectSpace(muzzle.Position)) end
 	for _, part in ipairs(tool:GetDescendants()) do
-		local own = part:IsA("BasePart") and part ~= handle and part ~= muzzle and not OWN_MESHES[part.Name]
-			and (part:GetAttribute(ORIGINAL_TRANSPARENCY) or part.Transparency) < 1
-		if own or (shown and part:IsA("BasePart") and part ~= handle and part.Transparency < 1) then
+		if part:IsA("BasePart") and part ~= handle and part ~= muzzle and not OWN_MESHES[part.Name]
+			and (part:GetAttribute(ORIGINAL_TRANSPARENCY) or part.Transparency) < 1 then
 			local size, offset, missing = pieceShape(part)
 			if missing then table.insert(pending, missing) end
 			local relative = handle.CFrame:ToObjectSpace(part.CFrame) * CFrame.new(offset)
@@ -3379,8 +3410,12 @@ local function applyCustomMesh(tool, entry)
 	local handle = tool:FindFirstChild("Handle")
 	if not handle then return false end
 	local meshId = entry.Mesh or entry.Id
-	local facing = entry.Facing or 0
-	local key = meshId .. "/" .. facing
+	local adjust = {}
+	for field, limits in pairs(CW.MeshAdjust) do
+		adjust[field] = type(entry.Adjust) == "table" and tonumber(entry.Adjust[field]) or limits[3]
+	end
+	local key = string.format("%s|%.3f|%.3f|%.3f|%.3f|%.2f|%.2f|%.2f", meshId, adjust.Size, adjust.Right, adjust.Up,
+		adjust.Forward, adjust.Turn, adjust.Tilt, adjust.Roll)
 	local part = tool:FindFirstChild(MESH_PART)
 	if part and part:GetAttribute("CW_MeshKey") ~= key then
 		part:Destroy()
@@ -3397,11 +3432,14 @@ local function applyCustomMesh(tool, entry)
 		local textureMesh = cfg and tool:FindFirstChild(cfg.meshName)
 		if textureMesh then textureMesh:Destroy() end
 		local rotation, longest = meshRotation(template.MeshSize)
+		-- The Handle's -Z is forward; a positive Turn or Roll goes to the right, a positive Tilt raises the nose.
+		local moved = center + Vector3.new(adjust.Right, adjust.Up, -adjust.Forward)
+		local turned = CFrame.fromOrientation(math.rad(adjust.Tilt), math.rad(-adjust.Turn), math.rad(-adjust.Roll))
 		part = template:Clone()
 		part.Name = MESH_PART
 		part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch, part.Massless = false, false, false, false, true
-		part.Size = template.MeshSize * (box.Z / math.max(longest, 1e-3))
-		part.CFrame = handle.CFrame * CFrame.new(center) * (FACING_TURNS[facing] or CFrame.identity) * rotation
+		part.Size = template.MeshSize * (box.Z / math.max(longest, 1e-3)) * adjust.Size
+		part.CFrame = handle.CFrame * CFrame.new(moved) * turned * rotation
 		part:SetAttribute("CW_MeshKey", key)
 		part.Parent = tool
 		local weld = Instance.new("WeldConstraint")
@@ -3446,11 +3484,21 @@ CW.applyWeaponLook = function(tool)
 end
 CW.applyWeaponTexture = CW.applyWeaponLook
 
+-- Puts the current look on the guns you carry and hold, without loading the textures again: what a mesh
+-- adjustment needs on every step of a slider.
+function CW.reapplyLooks()
+	local backpack = LocalPlayer:FindFirstChild("Backpack")
+	if backpack then applyToContainer(backpack) end
+	if LocalPlayer.Character then applyToContainer(LocalPlayer.Character) end
+end
+
 -- A copy of the gun as it looks in your hand (its mesh and its texture), for the preview in the Guns tab: a Model in
--- the Handle's space (the barrel along -Z) with only what shows, anchored. An invisible part spans what it shows, so
--- the preview frames it by that: a part's size says nothing about a file mesh inside it (the Taser's), whose size
--- is known once the file has loaded (then CW.onMeshLoaded redraws the preview). nil when the game has no such gun.
-function CW.weaponPreview(gun)
+-- the Handle's space (the barrel along -Z) with only what shows, anchored. With ghost, a custom mesh is shown with the
+-- gun's own pieces faintly behind it, to line it up. Also returns the box of the gun's own pieces (center, size), which
+-- the preview frames, so a mesh made bigger or moved shows as such. A file mesh inside a piece (the Taser's) has its
+-- size known once the file has loaded; then CW.onMeshLoaded redraws the preview. nil when the game has no such gun.
+local GHOST_TRANSPARENCY = 0.8
+function CW.weaponPreview(gun, ghost)
 	local tools = ReplicatedStorage:FindFirstChild("Tools")
 	local guns = tools and tools:FindFirstChild("Guns")
 	local source = guns and guns:FindFirstChild(gun)
@@ -3461,18 +3509,28 @@ function CW.weaponPreview(gun)
 		return nil
 	end
 	pcall(applyLook, tool)
-	local center, size, pending = gunBox(tool, handle, true)
+	local center, size, pending = gunBox(tool, handle)
 	requestMeshes(pending)
+	ghost = ghost and tool:FindFirstChild(MESH_PART) ~= nil
 
 	local model = Instance.new("Model")
 	model.Name = gun
-	local shown = {}
+	local shown, faint = {}, {}
 	for _, part in ipairs(tool:GetDescendants()) do
-		if part:IsA("BasePart") and part.Transparency < 1 then
-			table.insert(shown, { part, handle.CFrame:ToObjectSpace(part.CFrame) })
+		if part:IsA("BasePart") and part ~= handle then
+			local original = part:GetAttribute(ORIGINAL_TRANSPARENCY)
+			if part.Transparency < 1 then
+				table.insert(shown, { part, handle.CFrame:ToObjectSpace(part.CFrame) })
+			elseif ghost and original and original < 1 then
+				table.insert(shown, { part, handle.CFrame:ToObjectSpace(part.CFrame) })
+				faint[part] = true
+			end
 		end
 	end
-	for _, item in ipairs(shown) do item[1].Parent = model end
+	for _, item in ipairs(shown) do
+		item[1].Parent = model
+		if faint[item[1]] then item[1].Transparency = GHOST_TRANSPARENCY end
+	end
 	for _, inner in ipairs(model:GetDescendants()) do
 		if inner:IsA("JointInstance") or inner:IsA("WeldConstraint") or inner:IsA("Constraint")
 			or inner:IsA("LuaSourceContainer") or (inner:IsA("BasePart") and inner.Transparency >= 1) then
@@ -3483,15 +3541,8 @@ function CW.weaponPreview(gun)
 		item[1].Anchored = true
 		item[1].CFrame = item[2]
 	end
-	local bounds = Instance.new("Part")
-	bounds.Name = "Bounds"
-	bounds.Transparency = 1
-	bounds.Anchored, bounds.CanCollide, bounds.CanQuery, bounds.CanTouch = true, false, false, false
-	bounds.Size = size:Max(Vector3.one * 0.05)
-	bounds.CFrame = CFrame.new(center)
-	bounds.Parent = model
 	tool:Destroy()
-	return model
+	return model, center, size:Max(Vector3.one * 0.05)
 end
 
 -- A tool arrives with its parts, so one pass is enough; if the mesh (or the Handle) is not there
@@ -3537,9 +3588,7 @@ local function reloadTexturesAndApply()
 		end)
 	end
 
-	local backpack = LocalPlayer:FindFirstChild("Backpack")
-	if backpack then applyToContainer(backpack) end
-	if LocalPlayer.Character then applyToContainer(LocalPlayer.Character) end
+	CW.reapplyLooks()
 end
 CW.reloadTextures = reloadTexturesAndApply
 reloadTexturesAndApply()
@@ -4640,7 +4689,7 @@ end
 local HitmarkerGallery, CursorGallery
 local hitSoundDrawers = {} -- { gun, entries, dropdown, volume } per gun
 local textureGalleries = {}
-local meshControls = {} -- one refresh function per gun page (its Mesh list and Mesh Facing)
+local meshControls = {} -- one refresh function per gun page (its Mesh list and Adjust Mesh)
 local refreshGunPreview -- (gun or nil, keepCamera): the Guns tab redraws the preview of the gun shown
 local refreshUIFromLibrary -- defined after the tabs; the custom ID controls call it
 
@@ -6162,9 +6211,9 @@ end)
 
 ------------------------------------------------------------------------------
 -- Guns tab: one page per gun (on an older CWUI, one section per gun). A page starts with the gun's 3D preview, then
--- its Mesh and its Texture (always open: the preview shows them), then its Gun Settings (Shoot Sound, Effect, Reload
--- Sound). Everything on a page is that gun's own and is saved on its own. The sound and tracer controls keep the
--- saved settings they always had, so nothing already saved is lost.
+-- its Mesh (with Adjust Mesh for a custom one) and its Texture (always open: the preview shows them), then its Gun
+-- Settings (Shoot Sound, Effect, Reload Sound). Everything on a page is that gun's own and is saved on its own. The
+-- sound and tracer controls keep the saved settings they always had, so nothing already saved is lost.
 ------------------------------------------------------------------------------
 guarded("Guns", function()
 	local GunsTab = Window:AddTab({ Name = "Guns", Icon = uiIcons.Guns or uiIcons.Visuals })
@@ -6173,13 +6222,14 @@ guarded("Guns", function()
 	for _, name in ipairs(CW.WeaponList or {}) do texturable[name] = true end
 
 	local pager
-	-- The preview shows the gun of the page in view, as it looks in your hand. keep: same gun, so the camera stays.
+	-- The preview shows the gun of the page in view as it looks in your hand (with "Show Original Gun", its own pieces
+	-- faintly behind a custom mesh), framed by the gun's own size. keep: same gun, so the camera stays.
 	refreshGunPreview = function(gun, keep)
 		if not pager then return end
 		local _, shown = pager:Get()
 		if not shown or (gun and gun ~= shown) then return end
-		local ok, model = pcall(CW.weaponPreview, shown)
-		pager:SetModel(ok and model or nil, keep)
+		local ok, model, center, size = pcall(CW.weaponPreview, shown, CW.Settings.MESH_SHOW_ORIGINAL == true)
+		if ok then pager:SetModel(model, keep, center, size) else pager:SetModel(nil) end
 	end
 	if type(GunsTab.AddPager) == "function" then
 		pager = GunsTab:AddPager({
@@ -6198,7 +6248,25 @@ guarded("Guns", function()
 	end
 
 	-- Mesh: the gun's own (Default) or one of its custom mesh IDs, which are added right under the list.
-	local FACINGS = { "Normal", "Backward", "Upside Down", "Backward + Upside Down" } -- Facing 0 to 3
+	-- Adjust Mesh, under them while a custom mesh is chosen: its size, place and turn on this gun, saved with its ID
+	-- (ranges and defaults in CW.MeshAdjust). Each slider's right end does what the end of its name says. While one
+	-- moves, the look is only put on again (the textures are not loaded again) and the file is saved a second later.
+	local ADJUST_SLIDERS = { -- field, title, decimals, suffix
+		{ "Size", "Size", 2, "x" },
+		{ "Right", "Left / Right", 2 }, { "Up", "Down / Up", 2 }, { "Forward", "Back / Forward", 2 },
+		{ "Turn", "Turn Left / Right", 0, "°" }, { "Tilt", "Tilt Down / Up", 0, "°" }, { "Roll", "Roll Left / Right", 0, "°" },
+	}
+	local ghostToggles = {} -- "Show Original Gun" of every page: one setting for all of them
+	local pendingLook = {}
+	local function adjustChanged(gun)
+		if pendingLook[gun] then return end
+		pendingLook[gun] = true
+		task.defer(function()
+			pendingLook[gun] = nil
+			if CW.reapplyLooks then CW.reapplyLooks() end
+			refreshGunPreview(gun, true)
+		end)
+	end
 	local function selectedMeshId(gun)
 		local selections = CW.Settings.ASSET_SELECTIONS.Meshes
 		local selected = type(selections) == "table" and selections[gun]
@@ -6223,12 +6291,20 @@ guarded("Guns", function()
 
 	local function buildMesh(page, gun)
 		local options, byLabel = meshCatalog(gun)
-		local list, facing
-		local function showFacing()
+		local list, adjust
+		local sliders = {}
+		local function chosen()
 			local id = selectedMeshId(gun)
-			local entry = id and CW.CustomIds.get("Meshes", gun, id)
-			if facing.Instance then facing.Instance.Visible = entry ~= nil end
-			if entry then facing:Set(FACINGS[(entry.Facing or 0) + 1], true) end
+			return id and CW.CustomIds.get("Meshes", gun, id), id
+		end
+		-- Adjust Mesh shows only for a custom mesh, with that mesh's values.
+		local function showAdjust()
+			local entry = chosen()
+			if adjust.Instance then adjust.Instance.Visible = entry ~= nil end
+			if not entry then return end
+			for field, slider in pairs(sliders) do
+				slider:Set(entry.Adjust and entry.Adjust[field] or CW.MeshAdjust[field][3], true)
+			end
 		end
 		list = page:Dropdown({
 			Title = "Mesh",
@@ -6239,7 +6315,7 @@ guarded("Guns", function()
 				local entry = id and CW.CustomIds.get("Meshes", gun, id)
 				if entry then CW.retryMesh(entry.Mesh or entry.Id) end -- one that failed before is tried again
 				CW.Library.setSelection("Meshes", gun, id and CW.CustomIds.selectionOf(id) or nil)
-				showFacing()
+				showAdjust()
 				lookChanged(gun)
 			end,
 		})
@@ -6253,24 +6329,48 @@ guarded("Guns", function()
 				end,
 			})
 		end)
-		-- Which way the custom mesh is turned on the gun, for a mesh made the other way round (kept with its ID).
-		facing = page:Dropdown({
-			Title = "Mesh Facing",
-			Options = FACINGS,
-			Default = FACINGS[1],
-			Callback = function(label)
-				local id = selectedMeshId(gun)
-				if not id then return end
-				CW.CustomIds.setFacing(gun, id, (table.find(FACINGS, label) or 1) - 1)
-				lookChanged(gun)
+		adjust = page:AddSubSection("Adjust Mesh", true)
+		if pager then -- the preview is the only place it shows
+			table.insert(ghostToggles, adjust:Toggle({
+				Title = "Show Original Gun",
+				Default = CW.Settings.MESH_SHOW_ORIGINAL == true,
+				Callback = function(on)
+					CW.Settings.MESH_SHOW_ORIGINAL = on == true
+					for _, toggle in ipairs(ghostToggles) do toggle:Set(on == true, true) end
+					refreshGunPreview(gun, true)
+				end,
+			}))
+		end
+		for _, spec in ipairs(ADJUST_SLIDERS) do
+			local field, limits = spec[1], CW.MeshAdjust[spec[1]]
+			sliders[field] = adjust:Slider({
+				Title = spec[2], Min = limits[1], Max = limits[2], Default = limits[3], Decimal = spec[3], Suffix = spec[4],
+				Callback = function(value)
+					local entry, id = chosen()
+					if not entry then return end
+					local values = entry.Adjust or {}
+					values[field] = value
+					CW.CustomIds.setAdjust(gun, id, values)
+					adjustChanged(gun)
+				end,
+			})
+		end
+		adjust:Button({
+			Title = "Reset Adjustments",
+			Callback = function()
+				local entry, id = chosen()
+				if not entry then return end
+				CW.CustomIds.setAdjust(gun, id, nil)
+				showAdjust()
+				adjustChanged(gun)
 			end,
 		})
-		showFacing()
+		showAdjust()
 		table.insert(meshControls, function()
 			options, byLabel = meshCatalog(gun)
 			list:Refresh(options)
 			list:Set(meshLabel(byLabel, selectedMeshId(gun)), true)
-			showFacing()
+			showAdjust()
 		end)
 	end
 
