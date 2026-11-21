@@ -191,19 +191,23 @@ function CW.attachGui(gui)
 end
 
 --// Loading screen -------------------------------------------------------------------
--- On screen from here until the UI is built (closeLoadingScreen, at the end of the UI), then it fades out.
--- Laid out at 712x500, the window's size and spot, so it fades into the window; scaled down on a small screen.
--- Colors, text, color bar, lighter band and ring follow the owner's reference image. Arimo is the closest
+-- On screen from here until the UI is built (loadingScreen.close, at the end of the UI); the window stays hidden
+-- until then. Size, text sizes, places and the opening and closing come from the owner's Intro (350x200); the
+-- look (colors, texts, color bar, lighter band, ring) from the owner's reference image. Arimo is the closest
 -- Roblox font to the reference's regular sans.
-local closeLoadingScreen
+local loadingScreen = {} -- step(label, progress) while loading; close(now, onClosed)
 do
 	local RunService = game:GetService("RunService")
 	local TweenService = game:GetService("TweenService")
-	local W, H = 712, 500
-	local MIN_SHOWN, FADE, GIVE_UP = 1.5, 0.35, 60 -- seconds: shortest time on screen, fade-out, safety close
+	local MIN_SHOWN, GIVE_UP = 2, 60 -- seconds: shortest time on screen (the opening takes 1.6), safety close
 	local FONT = Font.new("rbxasset://fonts/families/Arimo.json")
+	local DARK, BAND, WHITE = Color3.fromRGB(38, 38, 38), Color3.fromRGB(64, 64, 64), Color3.new(1, 1, 1)
 
 	if CW.closeLoadingScreen then CW.closeLoadingScreen(true) end -- a re-run replaces the last run's screen
+
+	-- With Reduced Motion on (Roblox's settings), it shows and goes at once and the ring stays still.
+	local still = false
+	pcall(function() still = GuiService.ReducedMotionEnabled end)
 
 	local function make(class, props, parent)
 		local inst = Instance.new(class)
@@ -216,50 +220,94 @@ do
 		props.Text = content
 		props.TextSize = size
 		props.FontFace = FONT
-		props.TextColor3 = Color3.new(1, 1, 1)
+		props.TextColor3 = WHITE
 		return make("TextLabel", props, parent)
+	end
+	local function after(seconds, fn) task.delay(still and 0 or seconds, fn) end
+	local function tween(inst, seconds, goal, style, direction)
+		TweenService:Create(inst, TweenInfo.new(still and 0 or seconds, style or Enum.EasingStyle.Quad,
+			direction or Enum.EasingDirection.Out), goal):Play()
+	end
+	-- Calls step(a) as a goes from 0 to 1 over the time (Quad Out), for what a tween can't move, like a gradient.
+	local function animate(seconds, step)
+		local value = make("NumberValue", {})
+		value.Changed:Connect(step)
+		local run = TweenService:Create(value, TweenInfo.new(still and 0 or seconds, Enum.EasingStyle.Quad), { Value = 1 })
+		run.Completed:Connect(function()
+			step(1)
+			value:Destroy()
+		end)
+		run:Play()
+	end
+	-- A transparency sequence from { time, value } points; a point not after the one before it is skipped.
+	local function sequence(points)
+		local keys, last = {}, -1
+		for _, point in ipairs(points) do
+			local t = math.clamp(point[1], 0, 1)
+			if t > last then
+				table.insert(keys, NumberSequenceKeypoint.new(t, point[2]))
+				last = t
+			end
+		end
+		return NumberSequence.new(keys)
 	end
 
 	local gui = make("ScreenGui", {
 		Name = "CW_Loading", IgnoreGuiInset = true, ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-		DisplayOrder = 1000000, -- over the window (999999), which is built underneath
+		DisplayOrder = 1000000, -- over the window (999999)
 	})
-	-- A CanvasGroup clips the turned band to the card and fades everything as one piece.
+	-- A CanvasGroup clips the turned dark side to the card; its gradient (mask) opens the card and sweeps it away.
 	local card = make("CanvasGroup", {
-		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(W, H),
-		BackgroundColor3 = Color3.fromRGB(38, 38, 38), BorderSizePixel = 0,
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(350, 200),
+		BackgroundColor3 = BAND, BorderSizePixel = 0,
 	}, gui)
-	local scale = make("UIScale", {}, card)
+	local mask = make("UIGradient", { Rotation = -30, Transparency = NumberSequence.new(1) }, card)
 
-	-- The lighter band: a large square turned so its top edge runs from (218, 500) to (712, 150).
-	local BAND = Color3.fromRGB(64, 64, 64)
-	make("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(638, 570), Size = UDim2.fromOffset(1200, 600),
-		Rotation = -35.3, BackgroundColor3 = BAND, BorderSizePixel = 0, ZIndex = 0,
+	-- The dark side: a large square turned 30 degrees whose lower edge runs from (107, 200) to (350, 60), leaving
+	-- the lighter band at the bottom right. It wipes in from the top left and, when closing, covers the card.
+	local DARK_IN, DARK_AT, DARK_OVER = UDim2.fromOffset(-37, -329), UDim2.fromOffset(79, -130), UDim2.fromOffset(144, -17)
+	local dark = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = DARK_IN, Size = UDim2.fromOffset(1000, 600), Rotation = -30,
+		BackgroundColor3 = DARK, BorderSizePixel = 0, ZIndex = 0,
 	}, card)
 
-	text("Cycle-Ware", 58, { Position = UDim2.fromOffset(21, 88), Size = UDim2.fromOffset(288, 58) }, card)
-	text("Developed by Nutella", 30, { Position = UDim2.fromOffset(21, 150), Size = UDim2.fromOffset(288, 30) }, card)
-	local bar = make("Frame", {
-		Position = UDim2.fromOffset(21, 187), Size = UDim2.fromOffset(288, 5), BackgroundTransparency = 1,
+	-- The texts start off the card and slide in from the left.
+	local title = text("Cycle-Ware", 25, {
+		Position = UDim2.fromOffset(-190, 15), Size = UDim2.fromOffset(100, 50), TextTransparency = 1,
 	}, card)
-	make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder }, bar)
-	for i, piece in ipairs({ { 53, "fc5dff" }, { 130, "ff3164" }, { 52, "72ff9a" }, { 53, "00b4ff" } }) do
+	local subtitle = text("Developed by Nutella", 18, {
+		Position = UDim2.fromOffset(-230, 60), Size = UDim2.fromOffset(180, 25), TextTransparency = 1,
+	}, card)
+	local version = text("V" .. SCRIPT_VERSION, 14, {
+		Position = UDim2.fromOffset(8, 173), Size = UDim2.fromOffset(105, 20), TextXAlignment = Enum.TextXAlignment.Left,
+	}, card)
+	local versionMask = make("UIGradient", { Transparency = NumberSequence.new(1) }, version)
+	-- What is loading and how far along it is, under the title. The progress bar is the reference's color line:
+	-- the filled part uncovers the colors one after another, and a full bar is the whole line.
+	local status = text("Loading modules", 14, {
+		Position = UDim2.fromOffset(20, 110), Size = UDim2.fromOffset(180, 25), TextTransparency = 1,
+	}, card)
+	local track = make("Frame", {
+		Position = UDim2.fromOffset(110, 145), Size = UDim2.fromOffset(0, 4), BackgroundColor3 = BAND, BorderSizePixel = 0,
+	}, card)
+	local fill = make("Frame", {
+		Size = UDim2.fromScale(0.1, 1), BackgroundTransparency = 1, ClipsDescendants = true,
+	}, track)
+	make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder }, fill)
+	for i, piece in ipairs({ { 18, "fc5dff" }, { 46, "ff3164" }, { 18, "72ff9a" }, { 18, "00b4ff" } }) do -- widths add up to the bar's 100
 		make("Frame", {
 			LayoutOrder = i, Size = UDim2.new(0, piece[1], 1, 0), BackgroundColor3 = Color3.fromHex(piece[2]),
 			BorderSizePixel = 0,
-		}, bar)
+		}, fill)
 	end
-	text("V" .. SCRIPT_VERSION, 21, {
-		Position = UDim2.fromOffset(8, 474), Size = UDim2.fromOffset(200, 21), TextXAlignment = Enum.TextXAlignment.Left,
-	}, card)
 
 	-- The ring: short pieces around a circle, shaded like the reference (white at the round head, then
 	-- darker around the circle), turning counterclockwise so the head leads.
 	local ring = make("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(665, 443), Size = UDim2.fromOffset(61, 61),
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(329, 179), Size = UDim2.fromOffset(26, 26),
 		BackgroundTransparency = 1,
 	}, card)
+	local ringScale = make("UIScale", { Scale = 0 }, ring)
 	local SHADES = { { 0, 255 }, { 0.13, 255 }, { 0.3, 212 }, { 0.53, 241 }, { 0.7, 209 }, { 0.8, 176 }, { 1, 113 } }
 	local function shade(t)
 		for i = 2, #SHADES do
@@ -271,7 +319,7 @@ do
 		end
 		return Color3.fromRGB(113, 113, 113)
 	end
-	local INNER, OUTER, PIECES, HEAD = 24, 30.5, 48, 80 -- radii of the ring; HEAD: degrees clockwise from 3 o'clock
+	local INNER, OUTER, PIECES, HEAD = 9.5, 13, 48, 80 -- radii of the ring; HEAD: degrees clockwise from 3 o'clock
 	local middle, width = (INNER + OUTER) / 2, OUTER - INNER
 	local function round(props)
 		local frame = make("Frame", props, ring)
@@ -291,7 +339,7 @@ do
 	round({ -- the head
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.new(0.5, middle * math.cos(math.rad(HEAD)), 0.5, middle * math.sin(math.rad(HEAD))),
-		Size = UDim2.fromOffset(width, width), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 2,
+		Size = UDim2.fromOffset(width, width), BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 2,
 	})
 	-- The pieces reach 1 px past both edges; two smooth circles in the band's color (the ring sits on the band)
 	-- trim them to a clean ring.
@@ -305,43 +353,76 @@ do
 		BackgroundColor3 = BAND, BorderSizePixel = 0, ZIndex = 3,
 	})
 
-	-- Still when the player turned on Reduced Motion in Roblox's settings.
-	local still = false
-	pcall(function() still = GuiService.ReducedMotionEnabled end)
 	local spin = not still and RunService.RenderStepped:Connect(function(dt)
 		ring.Rotation = (ring.Rotation - 330 * dt) % 360
 	end)
-
-	local function fit()
-		local screen = gui.AbsoluteSize
-		if screen.X > 0 and screen.Y > 0 then scale.Scale = math.min(1, (screen.X - 16) / W, (screen.Y - 16) / H) end
-	end
-	gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(fit)
 	CW.attachGui(gui)
-	fit()
+
+	-- Opening, as in the Intro: the card closes in from both ends; then the dark side wipes in, the title and
+	-- subtitle slide in and the version is uncovered; then the status, the progress bar and the ring come up.
+	animate(0.4, function(a)
+		local v = a / 2
+		mask.Transparency = v >= 0.49 and NumberSequence.new(0)
+			or sequence({ { 0, 0 }, { v, 0 }, { v + 0.02, 1 }, { 1 - v - 0.02, 1 }, { 1 - v, 0 }, { 1, 0 } })
+	end)
+	after(0.4, function()
+		tween(dark, 0.4, { Position = DARK_AT })
+		tween(title, 0.4, { Position = UDim2.fromOffset(60, 15), TextTransparency = 0 })
+		tween(subtitle, 0.4, { Position = UDim2.fromOffset(20, 60), TextTransparency = 0 })
+		animate(0.4, function(a) versionMask.Transparency = sequence({ { 0, 0 }, { a, 0 }, { a + 0.02, 1 }, { 1, 1 } }) end)
+	end)
+	after(1.3, function()
+		tween(status, 0.25, { Position = UDim2.fromOffset(20, 120), TextTransparency = 0.3 })
+		tween(track, 0.25, { Position = UDim2.fromOffset(60, 145), Size = UDim2.fromOffset(100, 4) })
+		tween(ringScale, 0.35, { Scale = 1 }, Enum.EasingStyle.Back)
+	end)
+
+	function loadingScreen.step(label, progress)
+		status.Text = label
+		tween(fill, 0.25, { Size = UDim2.fromScale(progress, 1) })
+	end
 
 	local shownAt, closed = os.clock(), false
-	-- now: remove it at once (a re-run); otherwise it stays at least MIN_SHOWN seconds, then fades out.
-	function closeLoadingScreen(now)
-		if closed then return end
-		closed = true
-		if CW.closeLoadingScreen == closeLoadingScreen then CW.closeLoadingScreen = nil end
-		local function remove()
-			if spin then spin:Disconnect() end
-			gui:Destroy()
+	local function remove()
+		if spin then spin:Disconnect() end
+		gui:Destroy()
+	end
+	-- now: remove it at once (a re-run). Otherwise, once it has been up MIN_SHOWN seconds, it closes as the Intro
+	-- does: the bar fills (the full color line stays a moment), the texts fade, the dark side covers the card and
+	-- a last sweep takes it away. onClosed runs as the card goes (at once when it is already gone).
+	function loadingScreen.close(now, onClosed)
+		if closed then
+			if onClosed then pcall(onClosed) end
+			return
 		end
+		closed = true
+		if CW.closeLoadingScreen == loadingScreen.close then CW.closeLoadingScreen = nil end
 		if now then
 			remove()
+			if onClosed then pcall(onClosed) end
 			return
 		end
 		task.delay(math.max(0, MIN_SHOWN - (os.clock() - shownAt)), function()
-			local fade = TweenService:Create(card, TweenInfo.new(FADE), { GroupTransparency = 1 })
-			fade.Completed:Connect(remove)
-			fade:Play()
+			loadingScreen.step("Ready", 1)
+			after(0.5, function()
+				for _, label in ipairs({ title, subtitle, status, version }) do tween(label, 0.25, { TextTransparency = 1 }) end
+				for _, piece in ipairs(fill:GetChildren()) do
+					if piece:IsA("Frame") then tween(piece, 0.25, { BackgroundTransparency = 1 }) end
+				end
+				tween(track, 0.25, { BackgroundTransparency = 1 })
+				tween(ringScale, 0.25, { Scale = 0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+				tween(dark, 0.4, { Position = DARK_OVER }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+				after(0.5, function()
+					if onClosed then pcall(onClosed) end
+					mask.Rotation = 30
+					animate(0.4, function(a) mask.Transparency = sequence({ { 0, 1 }, { a, 1 }, { a + 0.05, 0 }, { 1, 1 } }) end)
+					after(0.45, remove)
+				end)
+			end)
 		end)
 	end
-	CW.closeLoadingScreen = closeLoadingScreen
-	task.delay(GIVE_UP, closeLoadingScreen) -- never left on screen if the UI stops loading
+	CW.closeLoadingScreen = loadingScreen.close
+	task.delay(GIVE_UP, loadingScreen.close) -- never left on screen if the UI stops loading
 end
 
 --// Teams ----------------------------------------------------------------------------
@@ -3946,6 +4027,7 @@ local scheduleSave = function() end
 --// Download the UI library
 local UI_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CWUI.lua"
 CW.Log("Downloading CycleWare UI from GitHub")
+loadingScreen.step("Downloading the interface", 0.4)
 local UI_CACHE_FILE = CW.Paths.CACHE_FOLDER .. "/CWUI.lua"
 local fetchOK, uiSource = false, nil
 local localUIFile = type(_cfg.UI_FILE) == "string" and _cfg.UI_FILE ~= "" and _cfg.UI_FILE or nil
@@ -4007,6 +4089,7 @@ end
 local canTheme = type(CWUI.SetTheme) == "function"
 if canTheme then CWUI.SetTheme(savedThemeChanges()) end
 
+loadingScreen.step("Building the interface", 0.7)
 local Window = CWUI:CreateWindow({
 	Title = "CW",
 	ToggleKey = false,
@@ -4016,6 +4099,7 @@ local Window = CWUI:CreateWindow({
 	SettingsButton = true,
 })
 CW.UIWindow = Window
+if Window.SetVisible then Window:SetVisible(false) end -- shown as the loading screen goes
 Window.ToggleVisibility = Window.Toggle
 
 -- Background layers and parallax. The single background image of the previous version becomes layer 1.
@@ -8103,5 +8187,7 @@ end)
 if not uiOk then
 	warn("[CW] UI failed to load: " .. tostring(uiError))
 end
-closeLoadingScreen()
+loadingScreen.close(false, function()
+	if CW.UIWindow then pcall(CW.UIWindow.SetVisible, CW.UIWindow, true) end
+end)
 end
