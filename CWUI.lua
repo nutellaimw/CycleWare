@@ -1,5 +1,5 @@
 --[[
-    CW UI Library  v3.0
+    CW UI Library  v3.1
 
     VISUAL
       Fundo escuro de concreto com um único destaque: o laranja do uniforme de detento do Prison Life.
@@ -21,6 +21,7 @@
         Window -> Tab -> Section -> SubSection (aninhável) -> elementos
         A própria Tab também aceita elementos direto (sem seção).
         Elementos: Label, Button, Toggle, Slider, Textbox, InputRow, Dropdown, Colorpicker, Gallery, SlotBoard
+        Group: painel fixo dentro da seção que junta controles de uma mesma coisa (não abre nem fecha)
 
     PERSONALIZAÇÃO
         CW.SetTheme({ Accent, Text, Background, Sidebar, Panel = Color3, BackgroundTransparency, PanelTransparency = 0..1 })
@@ -28,7 +29,7 @@
         Window:SetParallax(ligado, força 0..0.1, só com o mouse em cima); Section:AddLayerCanvas (editor visual)
 ]]
 
-local CW = { Version = "3.0.0" }
+local CW = { Version = "3.1.0" }
 
 --// Services ---------------------------------------------------------------
 local cloneref = cloneref or function(x) return x end
@@ -568,8 +569,11 @@ end
 --   Section:AddInputRow({
 --       Fields  = { { Key = "id", Placeholder = "Asset ID", Weight = 0.45 }, { Key = "name", Placeholder = "Name" } },
 --       Buttons = { { Text = "Add ID", Callback = function(values, row) end } },  -- values = { id = "...", name = "..." }
+--       Changed = function(values, row) end,  -- opcional: a cada letra digitada
 --   })
+--   Sem Fields, é uma linha só de botões; sem Buttons, só de campos.
 --   Retorno: :Get(key)  :Set(key, texto)  :Clear()  :Flash(índiceDoBotão, texto, segundos)
+--            :SetButtonText(índice, texto)  :SetButtonVisible(índice, visível)
 function Section:AddInputRow(o)
 	o = o or {}
 	local fields, buttons = o.Fields or {}, o.Buttons or {}
@@ -582,45 +586,65 @@ function Section:AddInputRow(o)
 		VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
 	}) })
 
-	-- Largura fixa (botões + espaços) repartida entre os campos conforme o peso de cada um.
-	local fixed = #buttons * BUTTON_W + math.max(#fields + #buttons - 1, 0) * GAP
-	local totalWeight, defaultWeight = 0, 1 / math.max(#fields, 1)
-	for _, f in ipairs(fields) do totalWeight += (tonumber(f.Weight) or defaultWeight) end
-	if totalWeight <= 0 then totalWeight = 1 end
-
 	local obj = { Instance = row }
-	local boxes = {}
-	for i, f in ipairs(fields) do
-		local weight = (tonumber(f.Weight) or defaultWeight) / totalWeight
-		boxes[f.Key or i] = textInput(holder, {
-			LayoutOrder = i, Size = UDim2.new(weight, -math.ceil(fixed * weight), 0, 30),
-			Text = f.Default, Placeholder = f.Placeholder,
-		})
-	end
-
+	local boxes, faces, buttonObjs, flashIds = {}, {}, {}, {}
 	local function values()
 		local v = {}
 		for key, box in pairs(boxes) do v[key] = box.Text end
 		return v
 	end
 
-	local buttonObjs, flashIds = {}, {}
+	-- Os campos repartem, conforme o peso de cada um, a largura que os botões visíveis deixam.
+	local totalWeight, defaultWeight = 0, 1 / math.max(#fields, 1)
+	for _, f in ipairs(fields) do totalWeight += (tonumber(f.Weight) or defaultWeight) end
+	if totalWeight <= 0 then totalWeight = 1 end
+	local function layoutFields()
+		local shown = 0
+		for _, entry in ipairs(buttonObjs) do
+			if entry.hit.Visible then shown += 1 end
+		end
+		local fixed = shown * BUTTON_W + math.max(#fields + shown - 1, 0) * GAP
+		for _, field in ipairs(faces) do
+			field.face.Size = UDim2.new(field.weight, -math.ceil(fixed * field.weight), 0, 30)
+		end
+	end
+
+	for i, f in ipairs(fields) do
+		local box, face = textInput(holder, {
+			LayoutOrder = i, Size = UDim2.fromOffset(0, 30), Text = f.Default, Placeholder = f.Placeholder,
+		})
+		boxes[f.Key or i] = box
+		table.insert(faces, { face = face, weight = (tonumber(f.Weight) or defaultWeight) / totalWeight })
+		if o.Changed then
+			box:GetPropertyChangedSignal("Text"):Connect(function() safeCall(o.Changed, values(), obj) end)
+		end
+	end
+
 	for i, b in ipairs(buttons) do
 		local hit, face = smallButton(holder, b.Text or "OK", BUTTON_W)
 		hit.LayoutOrder = #fields + i
 		hit.MouseButton1Click:Connect(function() safeCall(b.Callback, values(), obj) end)
-		buttonObjs[i] = { button = face, text = face.Text }
+		buttonObjs[i] = { hit = hit, button = face, text = face.Text }
 	end
+	layoutFields()
 
 	function obj:Get(key) local box = boxes[key] return box and box.Text or nil end
 	function obj:Set(key, text) local box = boxes[key] if box then box.Text = text or "" end end
 	function obj:Clear() for _, box in pairs(boxes) do box.Text = "" end end
-	-- Troca o texto normal de um botão ("Add ID" <-> "Save").
+	-- Troca o texto normal de um botão ("Add" <-> "Save").
 	function obj:SetButtonText(index, text)
 		local entry = buttonObjs[index or 1]
 		if not entry then return end
 		entry.text = tostring(text)
 		entry.button.Text = entry.text
+	end
+	-- Só fica à vista o que se pode fazer agora; os campos ocupam o espaço de um botão escondido.
+	function obj:SetButtonVisible(index, visible)
+		local entry = buttonObjs[index]
+		visible = visible ~= false
+		if not entry or entry.hit.Visible == visible then return end
+		entry.hit.Visible = visible
+		layoutFields()
 	end
 	-- Troca o texto de um botão por alguns segundos (retorno rápido: "Added", "Invalid"...).
 	function obj:Flash(index, text, seconds)
@@ -2050,6 +2074,44 @@ local function createSection(window, parentContainer, order, o, nested)
 	if o.Open then task.defer(function() sec:SetOpen(true) end) end
 
 	return sec
+end
+
+-- Grupo fixo dentro de uma seção: um painel recuado, com legenda opcional, que junta controles de uma mesma
+-- coisa (um editor e o que pertence a ele) e os separa do resto. Não abre nem fecha. Aceita os mesmos
+-- elementos de uma seção.   Retorno: a seção do grupo, com :SetName(texto) para trocar a legenda.
+function Section:AddGroup(o)
+	o = type(o) == "string" and { Name = o } or o or {}
+	local group = setmetatable({ _window = self._window, Name = o.Name or "", _n = 0 }, Section)
+	-- Espaço só acima: o grupo se afasta da linha anterior e fica colado na seguinte, que é o ajuste ligado a ele.
+	local holder = new("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = self:_next(), Parent = self._body,
+	}, { new("UIPadding", { PaddingTop = UDim.new(0, 6) }) })
+	local panel = new("Frame", {
+		Surface = "Panel", BackgroundColor3 = "Track", BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = holder,
+	}, {
+		corner(RADIUS),
+		new("UIPadding", {
+			PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6),
+		}),
+		new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+	local caption = new("TextLabel", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 0, Text = group.Name, TextColor3 = "SubText", TextSize = 14, FontFace = Fonts.Bold,
+		TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, Visible = group.Name ~= "", Parent = panel,
+	}, { new("UIPadding", {
+		PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 2),
+	}) })
+	group._body = panel
+	group.Instance = holder
+	function group:SetName(text)
+		group.Name = tostring(text or "")
+		caption.Text = group.Name
+		caption.Visible = group.Name ~= ""
+	end
+	return group
 end
 
 -- Subseção dentro de uma seção (pode aninhar quantas quiser)
