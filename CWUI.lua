@@ -2136,8 +2136,9 @@ end
 -- o = { Pages = { nomes }, Height = altura da prévia (210), Hint = texto de ajuda no alto da prévia,
 --       Changed = function(i, nome) }
 -- Retorno: pager:Page(i) (recebe seções e elementos como uma aba), pager:Select(i), pager:Get() -> i, nome,
---          pager:SetModel(model, manterCâmera): mostra um Model (ou nada, com nil) e destrói o anterior.
---          O Model chega com o comprimento no eixo Z; ele é centralizado aqui. A caixa dele enquadra a peça.
+--          pager:SetModel(model, manterCâmera, centro, tamanho): mostra um Model (ou nada, com nil) e destrói o
+--          anterior. O Model chega com o comprimento no eixo Z. A prévia centraliza e enquadra a caixa dada (centro e
+--          tamanho, no espaço do Model) ou, sem ela, a do próprio Model.
 local PAGER_YAW, PAGER_PITCH = math.rad(70), math.rad(-12) -- de lado, um pouco de cima
 local PAGER_SPIN = math.rad(30)                            -- graus por segundo
 local PAGER_FOV = 28                                       -- pouca perspectiva: a ponta que vem não incha
@@ -2366,17 +2367,18 @@ function Tab:AddPager(o)
 	function pager:Get() return current, names[current] end
 	function pager:Select(index) select(index) end
 	-- manterCâmera: a mesma vista (o giro e o zoom, na proporção do tamanho novo).
-	function pager:SetModel(newModel, keepCamera)
+	function pager:SetModel(newModel, keepCamera, frameCenter, frameSize)
 		local zoomed = model and distance / fitDistance() or 1
 		if model then model:Destroy() end
 		model = newModel
 		empty.Visible = newModel == nil
 		if not newModel then return end
-		local ok, cf, bounds = pcall(newModel.GetBoundingBox, newModel)
-		if ok then
-			pcall(newModel.TranslateBy, newModel, -cf.Position)
-			size = bounds
+		if not (frameCenter and frameSize) then
+			local ok, cf, bounds = pcall(newModel.GetBoundingBox, newModel)
+			if ok then frameCenter, frameSize = cf.Position, bounds end
 		end
+		if frameCenter then pcall(newModel.TranslateBy, newModel, -frameCenter) end
+		size = frameSize or size
 		newModel.Parent = view
 		if keepCamera then
 			distance = fitDistance() * zoomed
