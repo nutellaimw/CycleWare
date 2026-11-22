@@ -2139,10 +2139,11 @@ end
 --          pager:SetModel(model, manterCâmera, centro, tamanho): mostra um Model (ou nada, com nil) e destrói o
 --          anterior. O Model chega com o comprimento no eixo Z. A prévia centraliza e enquadra a caixa dada (centro e
 --          tamanho, no espaço do Model) ou, sem ela, a do próprio Model.
---          pager:SetHandle(peça, aoMover): uma peça do Model que se arrasta com o mouse (o ponto de tiro, na aba
---          Guns). Arrastar começando nela a move no plano da tela; arrastar fora dela gira, como sempre. A cada passo,
---          aoMover(posição no espaço do Model, terminou); no fim, terminou = true. Enquanto houver uma, a prévia não
---          gira sozinha. Some com o próximo SetModel ou com SetHandle(nil).
+--          pager:SetHandle(peça, aoMover): uma peça do Model que se move com setas (o ponto de tiro, na aba Guns):
+--          duas por eixo do Model, como as do Move do Studio (X vermelho, Y verde, Z azul), sempre do mesmo tamanho
+--          na tela. Arrastar uma seta move a peça só ao longo do eixo dela; arrastar fora das setas gira, como sempre.
+--          A cada passo, aoMover(posição no espaço do Model, terminou); no fim, terminou = true. Enquanto houver uma,
+--          a prévia não gira sozinha. Some com o próximo SetModel ou com SetHandle(nil).
 --          pager:SetHint(texto): troca o texto de ajuda (nil volta ao de o.Hint).
 local PAGER_YAW, PAGER_PITCH = math.rad(70), math.rad(-12) -- de lado, um pouco de cima
 local PAGER_SPIN = math.rad(30)                            -- graus por segundo
@@ -2205,13 +2206,17 @@ function Tab:AddPager(o)
 	local shift = Vector3.zero -- quanto o Model foi deslocado para ficar centralizado
 	local yaw, pitch, distance = PAGER_YAW, PAGER_PITCH, 10
 	local autoRotate = true
-	local handlePart, handleMoved, handleDrag = nil, nil, nil -- a peça que se arrasta e o arraste dela
+	-- A peça que se move com as setas, quem ouve, a seta sendo arrastada (o índice dela) e o eixo realçado.
+	local handlePart, handleMoved, handleDrag, hotAxis = nil, nil, nil, nil
+	local arrows = {} -- { dir, color, shaft, tip, from, to }: from e to, onde a seta começa e acaba (espaço da prévia)
+	local layoutArrows -- (definida com as setas, mais abaixo)
 
 	local function place()
 		local rotation = CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0)
 		camera.CFrame = CFrame.lookAt(rotation * Vector3.new(0, 0, distance), Vector3.zero)
 		local cf = camera.CFrame
 		view.LightDirection = (cf.LookVector - cf.UpVector * 0.35 + cf.RightVector * 0.35).Unit
+		if layoutArrows then layoutArrows() end -- do mesmo tamanho na tela, com a câmera onde estiver
 	end
 	-- Distância em que a peça inteira cabe na prévia em qualquer ponto do giro: os cantos da caixa dela, a cada 15
 	-- graus, vistos da câmera inclinada. Cada canto pede uma distância (a profundidade dele mais o quanto ele sai
@@ -2261,30 +2266,116 @@ function Tab:AddPager(o)
 		local ok, inset = pcall(GuiService.GetGuiInset, GuiService)
 		return ok and pos + inset or pos
 	end
-	-- O clique começa em cima da peça que se arrasta (até 16 px dela, ou o tamanho dela na tela)?
-	local function onHandle(i)
-		if not (handlePart and handlePart.Parent) then return false end
-		local screen, depth = toScreen(handlePart.Position)
-		if not screen then return false end
-		local px = view.AbsoluteSize.Y
-		local radius = handlePart.Size.X / 2 / (2 * depth * math.tan(math.rad(camera.FieldOfView) / 2)) * px
-		return (clickPoint(i) - screen).Magnitude <= math.max(16, radius + 6)
+	-- As setas: duas por eixo, nas cores do Move do Studio, para quem já conhece o Studio reconhecer de cara qual eixo
+	-- cada uma move. Comprimento, espessura e ponta em pixels da tela, na distância em que a peça está.
+	local ARROW_AXES = {
+		{ Vector3.xAxis, Color3.fromRGB(235, 80, 80) }, { -Vector3.xAxis, Color3.fromRGB(235, 80, 80) },
+		{ Vector3.yAxis, Color3.fromRGB(90, 205, 110) }, { -Vector3.yAxis, Color3.fromRGB(90, 205, 110) },
+		{ Vector3.zAxis, Color3.fromRGB(80, 145, 245) }, { -Vector3.zAxis, Color3.fromRGB(80, 145, 245) },
+	}
+	local ARROW_LENGTH, ARROW_WIDTH, ARROW_TIP, ARROW_REACH = 30, 3, 10, 10 -- px; REACH: até onde um clique pega
+	local WHITE = Color3.new(1, 1, 1)
+	-- Um CFrame com o eixo X ao longo de dir (o comprimento de um Cylinder fica no X dele).
+	local function alongX(at, dir)
+		local up = math.abs(dir.Y) > 0.9 and Vector3.xAxis or Vector3.yAxis
+		local z = dir:Cross(up).Unit
+		return CFrame.fromMatrix(at, dir, z:Cross(dir).Unit, z)
+	end
+	-- Quantos studs um pixel da tela cobre na distância de um ponto da prévia.
+	local function studsPerPixel(point)
+		local depth = math.max(-camera.CFrame:PointToObjectSpace(point).Z, 1e-3)
+		return 2 * depth * math.tan(math.rad(camera.FieldOfView) / 2) / math.max(view.AbsoluteSize.Y, 1)
+	end
+	layoutArrows = function()
+		if not (handlePart and handlePart.Parent and #arrows > 0) then return end
+		local origin = handlePart.Position
+		local unit = studsPerPixel(origin)
+		local gap = handlePart.Size.X / 2 + 2 * unit
+		for index, arrow in ipairs(arrows) do
+			local from = origin + arrow.dir * gap
+			local to = from + arrow.dir * ARROW_LENGTH * unit
+			arrow.from, arrow.to = from, to
+			arrow.shaft.Size = Vector3.new(ARROW_LENGTH * unit, ARROW_WIDTH * unit, ARROW_WIDTH * unit)
+			arrow.shaft.CFrame = alongX((from + to) / 2, arrow.dir)
+			arrow.tip.Size = Vector3.one * ARROW_TIP * unit
+			arrow.tip.CFrame = CFrame.new(to)
+			-- o eixo sob o mouse (ou sendo arrastado) clareia: as duas setas dele, sem perder a cor do eixo
+			local color = math.ceil(index / 2) == hotAxis and arrow.color:Lerp(WHITE, 0.35) or arrow.color
+			arrow.shaft.Color, arrow.tip.Color = color, color
+		end
+	end
+	local function setHot(index)
+		local axis = index and math.ceil(index / 2) or nil
+		if axis == hotAxis then return end
+		hotAxis = axis
+		layoutArrows()
+	end
+	local function clearArrows()
+		for _, arrow in ipairs(arrows) do
+			arrow.shaft:Destroy()
+			arrow.tip:Destroy()
+		end
+		table.clear(arrows)
+		hotAxis = nil
+	end
+	local function buildArrows()
+		clearArrows()
+		if not handlePart then return end
+		for _, spec in ipairs(ARROW_AXES) do
+			local arrow = { dir = spec[1], color = spec[2] }
+			for _, key in ipairs({ "shaft", "tip" }) do
+				local part = Instance.new("Part")
+				part.Name = "Arrow"
+				part.Shape = key == "shaft" and Enum.PartType.Cylinder or Enum.PartType.Ball
+				part.Material = Enum.Material.SmoothPlastic -- Neon, numa prévia, estoura a cor (o verde sai branco)
+				part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch, part.CastShadow = true, false, false, false, false
+				part.Parent = model
+				arrow[key] = part
+			end
+			table.insert(arrows, arrow)
+		end
+		layoutArrows()
+	end
+	-- A seta mais perto de um ponto da tela, até ARROW_REACH px dela (do corpo à ponta), ou nil. Em cima da própria
+	-- peça, nenhuma: ali as seis se encontram e o clique gira a prévia.
+	local function arrowAt(point)
+		if not (handlePart and handlePart.Parent) then return nil end
+		local center = toScreen(handlePart.Position)
+		if center and (point - center).Magnitude <= handlePart.Size.X / 2 / studsPerPixel(handlePart.Position) + 2 then
+			return nil
+		end
+		local best, bestDistance
+		for index, arrow in ipairs(arrows) do
+			local a, b = arrow.from and toScreen(arrow.from), arrow.to and toScreen(arrow.to)
+			if a and b then
+				local ab = b - a
+				local t = ab.Magnitude > 1e-3 and math.clamp((point - a):Dot(ab) / ab:Dot(ab), 0, 1) or 0
+				local away = (point - (a + ab * t)).Magnitude
+				if away <= ARROW_REACH + ARROW_TIP / 2 and (bestDistance == nil or away < bestDistance) then
+					best, bestDistance = index, away
+				end
+			end
+		end
+		return best
 	end
 	local function finishHandle()
 		local drag = handleDrag
 		handleDrag = nil
+		setHot(nil)
 		if drag and handlePart and handlePart.Parent and handleMoved then
 			safeCall(handleMoved, handlePart.Position + shift, true)
 		end
 	end
 
-	-- Arrastar gira (ou move a peça que se arrasta, começando nela); a página não rola enquanto isso (no toque,
-	-- arrastar rolaria).
+	-- Arrastar gira (ou move a peça, começando numa seta); a página não rola enquanto isso (no toque, arrastar
+	-- rolaria).
 	local dragging, lastPos, lastClick = false, nil, 0
 	surface.InputBegan:Connect(function(i)
 		if not isClick(i) or dragging then return end
-		if onHandle(i) then
-			handleDrag = true
+		local index = handlePart and handlePart.Parent and arrowAt(clickPoint(i)) or nil
+		if index then
+			handleDrag = index
+			setHot(index)
 			lastClick = 0
 		else
 			local now = os.clock()
@@ -2330,17 +2421,23 @@ function Tab:AddPager(o)
 			if hovered then
 				zoom(i.Position.Z * (UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and 3 or 1))
 			end
+		elseif not dragging and hovered and handlePart and i.UserInputType == Enum.UserInputType.MouseMovement then
+			setHot(arrowAt(clickPoint(i))) -- a seta sob o mouse clareia
 		elseif dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
 			local delta = i.Position - lastPos
 			lastPos = i.Position
 			if handleDrag then
-				-- A peça anda com o mouse, no plano da tela, na distância em que está.
-				if not (handlePart and handlePart.Parent) then return end
-				local _, depth = toScreen(handlePart.Position)
-				if not depth then return end
-				local perPixel = 2 * depth * math.tan(math.rad(camera.FieldOfView) / 2) / math.max(view.AbsoluteSize.Y, 1)
-				local cf = camera.CFrame
-				handlePart.Position += (cf.RightVector * delta.X - cf.UpVector * delta.Y) * perPixel
+				-- A peça anda ao longo da seta: o quanto o mouse andou na direção em que a seta aparece na tela.
+				local arrow = arrows[handleDrag]
+				if not (arrow and handlePart and handlePart.Parent) then return end
+				local a, b = toScreen(arrow.from), toScreen(arrow.to)
+				if not (a and b) then return end
+				local perStud = (b - a) / math.max((arrow.to - arrow.from).Magnitude, 1e-6) -- px por stud, na tela
+				-- um eixo que aponta para a câmera quase não aparece: andar nele pularia longe
+				if perStud.Magnitude < 0.2 / studsPerPixel(handlePart.Position) then return end
+				local moved = Vector2.new(delta.X, delta.Y):Dot(perStud) / perStud:Dot(perStud)
+				handlePart.Position += arrow.dir * moved
+				layoutArrows()
 				if handleMoved then safeCall(handleMoved, handlePart.Position + shift, false) end
 				return
 			end
@@ -2428,10 +2525,14 @@ function Tab:AddPager(o)
 	function pager:Select(index) select(index) end
 	-- manterCâmera: a mesma vista (o giro e o zoom, na proporção do tamanho novo).
 	function pager:SetModel(newModel, keepCamera, frameCenter, frameSize)
+		-- Um arraste de seta em curso termina aqui (quem ouve recebe o fim), antes que a peça suma com o Model.
+		if dragging and handleDrag then stopDragging() end
 		local zoomed = model and distance / fitDistance() or 1
 		if model then model:Destroy() end
 		model = newModel
 		handlePart, handleMoved, handleDrag = nil, nil, nil
+		table.clear(arrows) -- foram embora com o Model antigo
+		hotAxis = nil
 		shift = Vector3.zero
 		empty.Visible = newModel == nil
 		if not newModel then return end
@@ -2455,6 +2556,7 @@ function Tab:AddPager(o)
 		handlePart = valid and part or nil
 		handleMoved = valid and onMove or nil
 		handleDrag = nil
+		buildArrows()
 	end
 	function pager:SetHint(text)
 		hint.Text = text or o.Hint or ""
