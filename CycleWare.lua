@@ -533,6 +533,9 @@ CW.Settings.ASSET_PROFILES = {}
 -- each gun's sounds: { ["<gun>|<path>"] = volume }.
 CW.Settings.HIT_SOUND_GUNS = {}
 CW.Settings.HIT_SOUND_GUN_VOLUMES = {}
+-- What each mesh of a gun keeps for itself (CW.MeshProfiles, Texture module): { [gun] = { [mesh] = profile } },
+-- mesh = "Default" or "id:123". A profile: Texture, Shoot, Reload, Effect (of a mesh not in use) and Fire.
+CW.Settings.MESH_PROFILES = {}
 
 -- Snapshot of the defaults, taken before any saved value is applied. The save routine
 -- writes only the settings whose value differs from these.
@@ -3351,6 +3354,86 @@ local function chosenMesh(gun)
 	return id and CW.CustomIds.get("Meshes", gun, id) or nil
 end
 
+--// Per-mesh profiles ---------------------------------------------------------------------------------------
+-- Each mesh of a gun (its own, "Default", or one of its custom mesh IDs, "id:123") keeps its texture, shoot sound,
+-- reload sound, effect and fire point. The settings those already had (ASSET_SELECTIONS.Textures, the sound
+-- changers, the TRACER_* maps) always hold the values of the mesh in use, so everything that reads them works as
+-- before; choosing another mesh stores them in the profile of the one left and loads the profile of the new one
+-- (CW.MeshProfiles.switch, set up after the sound changers). A mesh never chosen before starts from the game's own.
+-- The fire point is the one value read from the profile itself (the mesh in use included): Fire = { x, y, z }, how
+-- far the start of the tracers moves from where the gun's Muzzle would be, in the gun's space before Adjust Mesh
+-- (so it stays on the same spot of the mesh when the mesh is resized, moved or turned).
+local MeshProfiles = {}
+CW.MeshProfiles = MeshProfiles
+local FIRE_LIMIT = 3 -- studs, on each axis
+local DEFAULT_MESH = "Default"
+MeshProfiles.DEFAULT = DEFAULT_MESH
+
+-- The mesh in use on a gun: "Default" or "id:123".
+function MeshProfiles.keyOf(gun)
+	local selections = CW.Settings.ASSET_SELECTIONS.Meshes
+	local selected = type(selections) == "table" and selections[gun]
+	return type(selected) == "string" and selected:match("^id:%d+$") and selected or DEFAULT_MESH
+end
+
+-- The profiles of one gun ({ [mesh] = profile }); with create, made when missing.
+function MeshProfiles.ofGun(gun, create)
+	if type(CW.Settings.MESH_PROFILES) ~= "table" then CW.Settings.MESH_PROFILES = {} end
+	local all = CW.Settings.MESH_PROFILES
+	local byMesh = all[gun]
+	if type(byMesh) ~= "table" then
+		if not create then return nil end
+		byMesh = {}
+		all[gun] = byMesh
+	end
+	return byMesh
+end
+
+function MeshProfiles.get(gun, key, create)
+	local byMesh = MeshProfiles.ofGun(gun, create)
+	if not byMesh then return nil end
+	local profile = byMesh[key]
+	if type(profile) ~= "table" then
+		if not create then return nil end
+		profile = {}
+		byMesh[key] = profile
+	end
+	return profile
+end
+
+-- Drops a profile that has nothing left in it (and the gun's table when it is empty).
+function MeshProfiles.tidy(gun, key)
+	local byMesh = MeshProfiles.ofGun(gun, false)
+	if not byMesh then return end
+	if type(byMesh[key]) == "table" and next(byMesh[key]) == nil then byMesh[key] = nil end
+	if next(byMesh) == nil then CW.Settings.MESH_PROFILES[gun] = nil end
+end
+
+-- The fire point offset of one mesh of a gun (Vector3.zero when it has none).
+function MeshProfiles.fireOffset(gun, key)
+	local profile = MeshProfiles.get(gun, key or MeshProfiles.keyOf(gun), false)
+	local fire = profile and profile.Fire
+	if type(fire) ~= "table" then return Vector3.zero end
+	local x, y, z = tonumber(fire[1]), tonumber(fire[2]), tonumber(fire[3])
+	if not (x and y and z) or x ~= x or y ~= y or z ~= z then return Vector3.zero end
+	return Vector3.new(math.clamp(x, -FIRE_LIMIT, FIRE_LIMIT), math.clamp(y, -FIRE_LIMIT, FIRE_LIMIT),
+		math.clamp(z, -FIRE_LIMIT, FIRE_LIMIT))
+end
+
+-- offset: a Vector3, or nil to put the fire point back where the game has it.
+function MeshProfiles.setFireOffset(gun, key, offset)
+	key = key or MeshProfiles.keyOf(gun)
+	if typeof(offset) == "Vector3" and offset.Magnitude > 1e-4 then
+		-- 4 decimals: Adjust Mesh scales the offset up to 4x, and the dot has to land where it was let go.
+		local function round(n) return math.floor(math.clamp(n, -FIRE_LIMIT, FIRE_LIMIT) * 10000 + 0.5) / 10000 end
+		MeshProfiles.get(gun, key, true).Fire = { round(offset.X), round(offset.Y), round(offset.Z) }
+	else
+		local profile = MeshProfiles.get(gun, key, false)
+		if profile then profile.Fire = nil end
+		MeshProfiles.tidy(gun, key)
+	end
+end
+
 -- What a piece shows, in its own space: size and center. A mesh inside it (the FAL's blocks and wedges, the
 -- Taser's and the M700's files) is scaled and moved by it, and a file mesh has a size of its own, whatever the
 -- Part's: that one is known once the file is loaded. Returns the size, the center and the file still to load.
@@ -3482,18 +3565,69 @@ local function removeCustomMesh(tool)
 	restoreMuzzle(tool, tool:FindFirstChild("Handle"))
 end
 
+-- A custom mesh's Adjust values, every field filled in.
+local function adjustOf(entry)
+	local adjust = {}
+	for field, limits in pairs(CW.MeshAdjust) do
+		adjust[field] = entry and type(entry.Adjust) == "table" and tonumber(entry.Adjust[field]) or limits[3]
+	end
+	return adjust
+end
+
+-- Where a custom mesh goes in the Handle's space: the point its center is moved to, and its turn. The Handle's -Z
+-- is forward; a positive Turn or Roll goes to the right, a positive Tilt raises the nose.
+local function adjustPlacement(center, adjust)
+	return center + Vector3.new(adjust.Right, adjust.Up, -adjust.Forward),
+		CFrame.fromOrientation(math.rad(adjust.Tilt), math.rad(-adjust.Turn), math.rad(-adjust.Roll))
+end
+
+-- The fire point of a mesh in the Handle's space, from the gun's own Muzzle (origin), the box the mesh is fitted to
+-- (center) and the mesh's offset (MeshProfiles): the same size, move and turn as the mesh. entry nil: the gun's own.
+local function firePoint(origin, center, entry, offset)
+	if not entry then return origin + offset end
+	local adjust = adjustOf(entry)
+	local moved, turned = adjustPlacement(center, adjust)
+	return moved + turned:VectorToWorldSpace((origin - center + offset) * adjust.Size)
+end
+
+-- The game's copy of a gun (ReplicatedStorage.Tools.Guns), or nil.
+local function gameGun(gun)
+	local tools = ReplicatedStorage:FindFirstChild("Tools")
+	local guns = tools and tools:FindFirstChild("Guns")
+	local copy = guns and guns:FindFirstChild(gun)
+	return copy and copy:IsA("Tool") and copy or nil
+end
+
+-- For the fire point editor: the offset that puts the fire point of the gun's mesh in use at a point of the Handle's
+-- space, saved in that mesh's profile. Returns false when the gun has no Muzzle to start from.
+function CW.setFirePointAt(gun, point)
+	local copy = gameGun(gun)
+	local handle = copy and copy:FindFirstChild("Handle")
+	if not (handle and typeof(point) == "Vector3") then return false end
+	local center, _, _, origin = gunShape(copy, handle)
+	if typeof(origin) ~= "Vector3" then return false end
+	local key = MeshProfiles.keyOf(gun)
+	local entry = key ~= DEFAULT_MESH and chosenMesh(gun) or nil
+	local offset = point - origin
+	if entry then
+		local adjust = adjustOf(entry)
+		local moved, turned = adjustPlacement(center, adjust)
+		offset = turned:VectorToObjectSpace(point - moved) / math.max(adjust.Size, 1e-3) - (origin - center)
+	end
+	MeshProfiles.setFireOffset(gun, entry and key or DEFAULT_MESH, offset)
+	return true
+end
+
 -- Returns false while the mesh cannot be shown: no Handle yet, the mesh (or a file the gun's size depends on) is
 -- loading, or it could not be loaded.
 local function applyCustomMesh(tool, entry)
 	local handle = tool:FindFirstChild("Handle")
 	if not handle then return false end
 	local meshId = entry.Mesh or entry.Id
-	local adjust = {}
-	for field, limits in pairs(CW.MeshAdjust) do
-		adjust[field] = type(entry.Adjust) == "table" and tonumber(entry.Adjust[field]) or limits[3]
-	end
-	local key = string.format("%s|%.3f|%.3f|%.3f|%.3f|%.2f|%.2f|%.2f", meshId, adjust.Size, adjust.Right, adjust.Up,
-		adjust.Forward, adjust.Turn, adjust.Tilt, adjust.Roll)
+	local adjust = adjustOf(entry)
+	local offset = MeshProfiles.fireOffset(tool.Name, CW.CustomIds.selectionOf(entry.Id))
+	local key = string.format("%s|%.3f|%.3f|%.3f|%.3f|%.2f|%.2f|%.2f|%.4f|%.4f|%.4f", meshId, adjust.Size, adjust.Right,
+		adjust.Up, adjust.Forward, adjust.Turn, adjust.Tilt, adjust.Roll, offset.X, offset.Y, offset.Z)
 	local part = tool:FindFirstChild(MESH_PART)
 	if part and part:GetAttribute("CW_MeshKey") ~= key then
 		part:Destroy()
@@ -3510,20 +3644,19 @@ local function applyCustomMesh(tool, entry)
 		local textureMesh = cfg and tool:FindFirstChild(cfg.meshName)
 		if textureMesh then textureMesh:Destroy() end
 		local rotation, longest = meshRotation(template.MeshSize)
-		-- The Handle's -Z is forward; a positive Turn or Roll goes to the right, a positive Tilt raises the nose.
-		local moved = center + Vector3.new(adjust.Right, adjust.Up, -adjust.Forward)
-		local turned = CFrame.fromOrientation(math.rad(adjust.Tilt), math.rad(-adjust.Turn), math.rad(-adjust.Roll))
+		local moved, turned = adjustPlacement(center, adjust)
 		part = template:Clone()
 		part.Name = MESH_PART
 		part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch, part.Massless = false, false, false, false, true
 		part.Size = template.MeshSize * (box.Z / math.max(longest, 1e-3)) * adjust.Size
 		part.CFrame = handle.CFrame * CFrame.new(moved) * turned * rotation
 		part:SetAttribute("CW_MeshKey", key)
-		-- The Muzzle goes where the same size, move and turn take it (from the gun's own place for it).
+		-- The Muzzle goes where the same size, move and turn take it (from the gun's own place for it, plus the
+		-- mesh's fire point offset).
 		local muzzle = tool:FindFirstChild("Muzzle")
 		local origin = muzzle and muzzle:GetAttribute(MUZZLE_ORIGIN) or muzzleAt
 		if typeof(origin) == "Vector3" then
-			part:SetAttribute("CW_MuzzleAt", moved + turned:VectorToWorldSpace((origin - center) * adjust.Size))
+			part:SetAttribute("CW_MuzzleAt", firePoint(origin, center, entry, offset))
 		end
 		part.Parent = tool
 		local weld = Instance.new("WeldConstraint")
@@ -3547,6 +3680,17 @@ local function applyLook(tool)
 	if TEXTURABLE[tool.Name] then
 		local cfg = CUSTOM_MESH_WEAPONS[tool.Name]
 		if cfg then textured = applyCustomTexture(tool, cfg) else textured = applyRegularTexture(tool) end
+	end
+	-- The gun's own mesh: its fire point offset, if it has one (a custom mesh still loading keeps the game's).
+	local handle = tool:FindFirstChild("Handle")
+	local offset = entry == nil and MeshProfiles.fireOffset(tool.Name, DEFAULT_MESH) or Vector3.zero
+	if handle and offset.Magnitude > 1e-4 then
+		local muzzle = tool:FindFirstChild("Muzzle")
+		local _, _, _, muzzleAt = gunShape(tool, handle)
+		local origin = muzzle and muzzle:GetAttribute(MUZZLE_ORIGIN) or muzzleAt
+		if typeof(origin) == "Vector3" then placeMuzzle(tool, handle, firePoint(origin, nil, nil, offset)) end
+	elseif handle then
+		restoreMuzzle(tool, handle)
 	end
 	return textured and (entry == nil or tool:FindFirstChild("Handle") ~= nil)
 end
@@ -5365,6 +5509,50 @@ local function createSoundChanger(spec)
 		changer.schedule()
 	end
 
+	-- One gun's whole setup, for the mesh profiles: { Choice, Enabled, Others, Volumes = { [sound] = volume } }, only
+	-- what differs from the game's own. importGun puts one back (nil or {}: the game's own sound, off).
+	function changer.exportGun(weapon)
+		local prefix = weapon .. "|"
+		local gunVolumes = {}
+		for key, value in pairs(volumes) do
+			if key:sub(1, #prefix) == prefix then gunVolumes[key:sub(#prefix + 1)] = value end
+		end
+		return {
+			Choice = overrides[weapon], Enabled = settings[spec.EnabledKey][weapon], Others = settings[spec.OthersKey][weapon],
+			Volumes = next(gunVolumes) and gunVolumes or nil,
+		}
+	end
+	function changer.importGun(weapon, data)
+		data = type(data) == "table" and data or {}
+		local choice = data.Choice
+		overrides[weapon] = type(choice) == "string" and (tailOf(weapon, choice) or isCustomId(choice)) and choice or nil
+		settings[spec.EnabledKey][weapon] = data.Enabled == true or nil
+		settings[spec.OthersKey][weapon] = data.Others == true or nil
+		local prefix = weapon .. "|"
+		for key in pairs(volumes) do
+			if key:sub(1, #prefix) == prefix then volumes[key] = nil end
+		end
+		for sound, value in pairs(type(data.Volumes) == "table" and data.Volumes or {}) do
+			local number = tonumber(value)
+			if type(sound) == "string" and number and math.abs(math.clamp(number, 0, 2) - 1) > 1e-6 then
+				volumes[prefix .. sound] = math.clamp(number, 0, 2)
+			end
+		end
+		changer.schedule()
+	end
+	-- The same as replaceChoice, on a stored setup (a mesh that is not in use).
+	function changer.replaceInExport(data, oldRelative, newRelative)
+		if type(data) ~= "table" or data.Choice ~= oldRelative then return end
+		data.Choice = newRelative
+		local stored = type(data.Volumes) == "table" and data.Volumes or nil
+		if stored then
+			local volume = stored[oldRelative]
+			stored[oldRelative] = nil
+			if newRelative then stored[newRelative] = volume end
+			if next(stored) == nil then data.Volumes = nil end
+		end
+	end
+
 	-- value is what the weapon's dropdown shows: "Default" (the game's own sound) or a file label.
 	function changer.set(weapon, value)
 		if value == WEAPON_SOUND_DEFAULT then
@@ -5415,6 +5603,157 @@ local reloadSounds = createSoundChanger({
 local soundChangers = { shootSounds, reloadSounds }
 CW.State.stopWeaponShootSoundOverrides = function()
 	for _, changer in ipairs(soundChangers) do changer.stop() end
+end
+
+--// Per-mesh profiles: switching (storage and the fire point are in the Texture module) ------------------------
+-- What a mesh keeps: Texture (ASSET_SELECTIONS.Textures), Shoot and Reload (the sound changers' setup of the gun)
+-- and Effect (the gun's tracer: TRACER_GUN_<FIELD>[gun], or TRACER_SNIPER_* / TRACER_TASER_* for the M700 and the
+-- Taser, plus TRACER_GUN_OTHERS[gun]). Only what differs from the game's own is kept.
+local MeshProfiles = CW.MeshProfiles
+local TRACER_FIELDS = { "ENABLED", "COLOR", "GLOW", "WIDTH", "LIFETIME", "TRANSPARENCY", "LIGHT" }
+local TRACER_SPECIAL = { M700 = "TRACER_SNIPER_", Taser = "TRACER_TASER_" }
+local SPECIAL_FIELDS = { ENABLED = true, COLOR = true, WIDTH = true, LIFETIME = true, TRANSPARENCY = true }
+
+local function tracerMap(field)
+	local key = "TRACER_GUN_" .. field
+	if type(CW.Settings[key]) ~= "table" then CW.Settings[key] = {} end
+	return CW.Settings[key]
+end
+
+local function exportEffect(gun)
+	local out = {}
+	local prefix = TRACER_SPECIAL[gun]
+	for _, field in ipairs(TRACER_FIELDS) do
+		local value
+		if prefix then
+			if SPECIAL_FIELDS[field] then
+				value = CW.Settings[prefix .. field]
+				local default = CW.Defaults[prefix .. field]
+				if typeof(value) == "Color3" then value = value:ToHex() end
+				if typeof(default) == "Color3" then default = default:ToHex() end
+				if value == default or (type(value) == "number" and type(default) == "number"
+					and math.abs(value - default) < 1e-6) then value = nil end
+			end
+		else
+			value = tracerMap(field)[gun]
+		end
+		out[field] = value
+	end
+	out.OTHERS = tracerMap("OTHERS")[gun]
+	return out
+end
+
+local function importEffect(gun, data)
+	data = type(data) == "table" and data or {}
+	local prefix = TRACER_SPECIAL[gun]
+	for _, field in ipairs(TRACER_FIELDS) do
+		local value = data[field]
+		if prefix then
+			if SPECIAL_FIELDS[field] then
+				local default = CW.Defaults[prefix .. field]
+				if typeof(default) == "Color3" then
+					local ok, color = pcall(Color3.fromHex, type(value) == "string" and value or "")
+					value = ok and typeof(color) == "Color3" and color or default
+				elseif type(value) ~= type(default) then
+					value = default
+				end
+				CW.Settings[prefix .. field] = value
+			end
+		else
+			if field == "ENABLED" or field == "LIGHT" then
+				value = value == true or nil
+			elseif field == "COLOR" or field == "GLOW" then
+				value = type(value) == "string" and value or nil
+			else
+				value = tonumber(value)
+			end
+			tracerMap(field)[gun] = value
+		end
+	end
+	tracerMap("OTHERS")[gun] = data.OTHERS == true or nil
+end
+
+local function textureMap()
+	local selections = CW.Settings.ASSET_SELECTIONS
+	if type(selections.Textures) ~= "table" then selections.Textures = {} end
+	return selections.Textures
+end
+
+-- Called with the gun after its mesh changed (or a removed mesh gave way to the gun's own): the Guns tab shows the
+-- new values in that gun's controls.
+MeshProfiles.listeners = {}
+local function notifyProfile(gun)
+	for _, listener in ipairs(MeshProfiles.listeners) do pcall(listener, gun) end
+end
+
+-- Puts a profile's values in place (nil: the game's own). The fire point stays in the profile.
+local function loadProfile(gun, profile)
+	profile = type(profile) == "table" and profile or {}
+	textureMap()[gun] = type(profile.Texture) == "string" and profile.Texture or nil
+	shootSounds.importGun(gun, profile.Shoot)
+	reloadSounds.importGun(gun, profile.Reload)
+	importEffect(gun, profile.Effect)
+end
+
+-- The values in place become the profile of the mesh (its fire point kept).
+local function storeProfile(gun, key)
+	local profile = MeshProfiles.get(gun, key, true)
+	profile.Texture = textureMap()[gun]
+	profile.Shoot = shootSounds.exportGun(gun)
+	profile.Reload = reloadSounds.exportGun(gun)
+	profile.Effect = exportEffect(gun)
+end
+
+-- The profile of the mesh in use keeps only its fire point: its other values are the ones in place.
+local function clearInUse(gun, key)
+	local profile = MeshProfiles.get(gun, key, false)
+	if profile then
+		profile.Texture, profile.Shoot, profile.Reload, profile.Effect = nil, nil, nil, nil
+	end
+	MeshProfiles.tidy(gun, key)
+end
+
+-- Makes a mesh the one in use on a gun (selection: "id:123", or nil for the gun's own). Returns true when it changed.
+function MeshProfiles.switch(gun, selection)
+	local new = type(selection) == "string" and selection:match("^id:%d+$") and selection or MeshProfiles.DEFAULT
+	local old = MeshProfiles.keyOf(gun)
+	CW.Library.setSelection("Meshes", gun, new ~= MeshProfiles.DEFAULT and new or nil)
+	if new == old then return false end
+	storeProfile(gun, old)
+	loadProfile(gun, MeshProfiles.get(gun, new, false))
+	clearInUse(gun, new)
+	notifyProfile(gun)
+	return true
+end
+
+-- A custom ID of a gun was edited (old -> new) or removed (new nil): the profiles that use it follow. Called before
+-- the selections change. Meshes: the mesh's own profile goes with it; when the mesh in use is removed, the gun's own
+-- mesh comes back with its values.
+function MeshProfiles.replaceChoice(category, gun, oldRelative, newRelative)
+	if type(gun) ~= "string" or type(oldRelative) ~= "string" then return end
+	local byMesh = MeshProfiles.ofGun(gun, false)
+	if category == "Meshes" then
+		local inUse = MeshProfiles.keyOf(gun) == oldRelative
+		local profile = byMesh and byMesh[oldRelative]
+		if byMesh then byMesh[oldRelative] = nil end
+		if newRelative and profile then MeshProfiles.ofGun(gun, true)[newRelative] = profile end
+		if inUse and not newRelative then
+			CW.Library.setSelection("Meshes", gun, nil)
+			loadProfile(gun, MeshProfiles.get(gun, MeshProfiles.DEFAULT, false))
+			clearInUse(gun, MeshProfiles.DEFAULT)
+			notifyProfile(gun)
+		end
+		MeshProfiles.tidy(gun, oldRelative)
+		return
+	end
+	for key, profile in pairs(byMesh or {}) do
+		if type(profile) == "table" then
+			if category == "Textures" and profile.Texture == oldRelative then profile.Texture = newRelative end
+			if category == shootSounds.spec.Category then shootSounds.replaceInExport(profile.Shoot, oldRelative, newRelative) end
+			if category == reloadSounds.spec.Category then reloadSounds.replaceInExport(profile.Reload, oldRelative, newRelative) end
+			MeshProfiles.tidy(gun, key)
+		end
+	end
 end
 
 ------------------------------------------------------------------------------
@@ -5608,6 +5947,8 @@ local function customIdEditor(opts, view)
 			CW.HitSounds.replaceChoice(weapon, oldRelative, newRelative)
 			return
 		end
+		-- The meshes that keep this ID in their profiles (and a removed mesh in use gives way to the gun's own).
+		CW.MeshProfiles.replaceChoice(category, weapon, oldRelative, newRelative)
 		if newRelative then
 			CW.Library.replaceSelectionOf(category, weapon, oldRelative, newRelative)
 		else
@@ -6335,21 +6676,26 @@ guarded("Guns", function()
 	for _, name in ipairs(CW.WeaponList or {}) do texturable[name] = true end
 
 	local pager
-	-- The preview shows the gun of the page in view as it looks in your hand, framed by the gun's own size. With
-	-- "Show Original Gun and Fire Point": its own pieces faintly behind a custom mesh, and a dot where the shots start
-	-- (the Muzzle, which moves with the mesh). keep: the camera stays as it is (also from one gun to the next).
+	local fireMoved -- (gun, point, done): the fire point dot was dragged in the preview (set by the Mesh controls)
+	local PREVIEW_HINT = "Drag to rotate, scroll to zoom"
+	local EDIT_HINT = "Drag the dot to move where shots start"
+	-- The preview shows the gun of the page in view as it looks in your hand, framed by the gun's own size. While
+	-- Edit is on (CW.State.meshEdit, one switch for every page): its own pieces faintly behind a custom mesh, and a
+	-- dot where the shots start (the Muzzle, which moves with the mesh), which can be dragged. keep: the camera stays
+	-- as it is (also from one gun to the next).
 	refreshGunPreview = function(gun, keep)
 		if not pager then return end
 		local _, shown = pager:Get()
 		if not shown or (gun and gun ~= shown) then return end
-		local guide = CW.Settings.MESH_SHOW_ORIGINAL == true
-		local ok, model, center, size, fireAt = pcall(CW.weaponPreview, shown, guide)
+		local editing = CW.State.meshEdit == true
+		local ok, model, center, size, fireAt = pcall(CW.weaponPreview, shown, editing)
 		if not ok then
 			pager:SetModel(nil)
 			return
 		end
-		if model and guide and fireAt then
-			local dot = Instance.new("Part")
+		local dot
+		if model and editing and fireAt then
+			dot = Instance.new("Part")
 			dot.Name = "FirePoint"
 			dot.Shape = Enum.PartType.Ball
 			dot.Material = Enum.Material.Neon
@@ -6360,11 +6706,17 @@ guarded("Guns", function()
 			dot.Parent = model
 		end
 		pager:SetModel(model, keep, center, size)
+		if type(pager.SetHandle) == "function" then
+			pager:SetHandle(dot, dot and function(point, done)
+				if fireMoved then fireMoved(shown, point, done) end
+			end or nil)
+			pager:SetHint(dot and EDIT_HINT or PREVIEW_HINT)
+		end
 	end
 	if type(GunsTab.AddPager) == "function" then
 		pager = GunsTab:AddPager({
 			Pages = guns,
-			Hint = "Drag to rotate, scroll to zoom",
+			Hint = PREVIEW_HINT,
 			Changed = function() refreshGunPreview(nil, true) end,
 		})
 	end
@@ -6386,7 +6738,18 @@ guarded("Guns", function()
 		{ "Right", "Left / Right", 2 }, { "Up", "Down / Up", 2 }, { "Forward", "Back / Forward", 2 },
 		{ "Turn", "Turn Left / Right", 0, "°" }, { "Tilt", "Tilt Down / Up", 0, "°" }, { "Roll", "Roll Left / Right", 0, "°" },
 	}
-	local ghostToggles = {} -- "Show Original Gun and Fire Point" of every page: one setting for all of them
+	local editToggles = {} -- "Edit" of every page: one switch for all of them (CW.State.meshEdit, not saved)
+	local editControls = {} -- what shows only while Edit is on, on every page
+	local pageRefreshers = {} -- gun -> functions that show the gun's values again (after its mesh changed)
+	local function onPageRefresh(gun, fn)
+		pageRefreshers[gun] = pageRefreshers[gun] or {}
+		table.insert(pageRefreshers[gun], fn)
+	end
+	-- Another mesh brings its own texture, sounds and effect (CW.MeshProfiles): the page shows them.
+	table.insert(CW.MeshProfiles.listeners, function(gun)
+		for _, fn in ipairs(pageRefreshers[gun] or {}) do pcall(fn) end
+		scheduleSave()
+	end)
 	local pendingLook = {}
 	local function adjustChanged(gun)
 		if pendingLook[gun] then return end
@@ -6396,6 +6759,23 @@ guarded("Guns", function()
 			if CW.reapplyLooks then CW.reapplyLooks() end
 			refreshGunPreview(gun, true)
 		end)
+	end
+	-- The dot moves with the mouse in the preview; its place is saved for the mesh in use as it goes, and the guns
+	-- you carry (and the preview) take it once it is let go.
+	fireMoved = function(gun, point, done)
+		if not CW.setFirePointAt(gun, point) then return end
+		if done then
+			adjustChanged(gun)
+			scheduleSave()
+		end
+	end
+	local function setEditing(on, gun)
+		CW.State.meshEdit = on == true
+		for _, toggle in ipairs(editToggles) do toggle:Set(on == true, true) end
+		for _, control in ipairs(editControls) do
+			if control.Instance then control.Instance.Visible = on == true end
+		end
+		refreshGunPreview(gun, true)
 	end
 	local function selectedMeshId(gun)
 		local selections = CW.Settings.ASSET_SELECTIONS.Meshes
@@ -6444,7 +6824,8 @@ guarded("Guns", function()
 				local id = byLabel[label]
 				local entry = id and CW.CustomIds.get("Meshes", gun, id)
 				if entry then CW.retryMesh(entry.Mesh or entry.Id) end -- one that failed before is tried again
-				CW.Library.setSelection("Meshes", gun, id and CW.CustomIds.selectionOf(id) or nil)
+				-- The mesh left keeps its texture, sounds and effect; the new one brings its own.
+				CW.MeshProfiles.switch(gun, id and CW.CustomIds.selectionOf(id) or nil)
 				showAdjust()
 				lookChanged(gun)
 			end,
@@ -6459,18 +6840,28 @@ guarded("Guns", function()
 				end,
 			})
 		end)
-		adjust = page:AddSubSection("Adjust Mesh", true)
-		if pager then -- the preview is the only place it shows
-			table.insert(ghostToggles, adjust:Toggle({
-				Title = "Show Original Gun and Fire Point",
-				Default = CW.Settings.MESH_SHOW_ORIGINAL == true,
-				Callback = function(on)
-					CW.Settings.MESH_SHOW_ORIGINAL = on == true
-					for _, toggle in ipairs(ghostToggles) do toggle:Set(on == true, true) end
-					refreshGunPreview(gun, true)
-				end,
+		-- Edit: the gun's own pieces faintly behind a custom mesh and the fire point in the preview, where the dot can
+		-- be dragged to move where the shots start (saved for the mesh in use). The preview is the only place it shows.
+		if pager then
+			table.insert(editToggles, page:Toggle({
+				Title = "Edit",
+				Default = CW.State.meshEdit == true,
+				Callback = function(on) setEditing(on, gun) end,
 			}))
+			local resetFire = page:Button({
+				Title = "Reset Fire Point",
+				Callback = function()
+					CW.MeshProfiles.setFireOffset(gun, nil, nil)
+					adjustChanged(gun)
+					scheduleSave()
+				end,
+			})
+			if resetFire then
+				table.insert(editControls, resetFire)
+				if resetFire.Instance then resetFire.Instance.Visible = CW.State.meshEdit == true end
+			end
 		end
+		adjust = page:AddSubSection("Adjust Mesh", true)
 		for _, spec in ipairs(ADJUST_SLIDERS) do
 			local field, limits = spec[1], CW.MeshAdjust[spec[1]]
 			sliders[field] = adjust:Slider({
@@ -6519,6 +6910,17 @@ guarded("Guns", function()
 			end,
 		})
 		table.insert(textureGalleries, { weapon = gun, gallery = gallery })
+		-- The texture of the mesh now in use (as refreshUIFromLibrary does it: Set only when it has to change, since
+		-- setting the entry already selected would deselect it).
+		onPageRefresh(gun, function()
+			local selectedFile = CW.Library.selectedPath("Textures", gun)
+			local current = gallery:Get()
+			if selectedFile then
+				if not (current and current.Path == selectedFile) then gallery:Set(selectedFile, true) end
+			elseif current then
+				gallery:Clear()
+			end
+		end)
 		-- Custom IDs for this gun only, right under its gallery.
 		guarded(gun .. " Texture Custom IDs", function()
 			addCustomIdRow(page, {
@@ -6543,7 +6945,7 @@ guarded("Guns", function()
 			Default = changer.enabledFor(gun),
 			Callback = function(on) changer.setEnabled(gun, on) end,
 		})
-		drawer:Toggle({
+		local others = drawer:Toggle({
 			Title = "Apply To Other Players Locally",
 			Default = changer.othersFor(gun),
 			Callback = function(on) changer.setOthers(gun, on) end,
@@ -6578,6 +6980,13 @@ guarded("Guns", function()
 			},
 		})
 		table.insert(changer.dropdowns, { weapon = gun, control = controls.dropdown, volume = controls.volume })
+		-- The sound of the mesh now in use, with its switches and its volume.
+		onPageRefresh(gun, function()
+			if enabled and enabled.Set then enabled:Set(changer.enabledFor(gun), true) end
+			if others and others.Set then others:Set(changer.othersFor(gun), true) end
+			if controls.dropdown then controls.dropdown:Set(changer.label(gun, changer.overrides[gun]), true) end
+			if controls.volume then controls.volume:Set(changer.volumeOf(gun), true) end
+		end)
 		task.defer(function() building = false end)
 	end
 
@@ -6751,7 +7160,7 @@ guarded("Guns", function()
 			Default = getFor(gun, "enabled"),
 			Callback = function(on) setFor(gun, "enabled", on) end,
 		})
-		drawer:Toggle({
+		c.others = drawer:Toggle({
 			Title = "Apply To Other Players Locally",
 			Default = gunMap("others")[gun] == true,
 			Callback = function(on) gunMap("others")[gun] = on == true or nil end,
@@ -6805,6 +7214,11 @@ guarded("Guns", function()
 		})
 
 		perGun[gun] = c
+		-- The effect of the mesh now in use.
+		onPageRefresh(gun, function()
+			refreshGun(gun)
+			if c.others then c.others:Set(gunMap("others")[gun] == true, true) end
+		end)
 	end
 
 	for index, gun in ipairs(guns) do
