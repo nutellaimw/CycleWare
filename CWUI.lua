@@ -670,20 +670,24 @@ end
 --       Extra = { Key = "hidden", Text = "Hidden", Placeholder = "Drop here to ..." }, -- área extra opcional
 --       Callback = function(value) end,                       -- cópia do valor a cada mudança
 --   })
---   Com Extra, value[Extra.Key] = { chaves } é mais um destino (uma área larga abaixo dos slots).
---   Arrastar um item para um slot coloca ele no fim da lista daquele slot (e tira de qualquer outro).
---   Arrastar um slot: leva o último item dele; soltar fora dos slots tira o item. Botão direito limpa o slot.
+--   Com Extra, value[Extra.Key] = { chaves } é mais um destino (uma faixa larga acima dos slots).
+--   Cada item é um bloco só, que mora num lugar: na lista de baixo (sem lugar), num slot ou na faixa Extra.
+--   Arrastar leva o próprio bloco (ele sai do lugar e segue o cursor); solto num slot, ele fica por cima da pilha
+--   daquele slot (passa a ser o primeiro); solto fora dos slots, volta para a lista. Num slot com vários, aparece
+--   o de cima, com "+N" pelos de baixo. Botão direito num slot (ou na faixa) esvazia ele.
 --   Retorno: :Get()  :Set(value, silent)
 function Section:AddSlotBoard(o)
 	o = o or {}
 	local labels = o.Slots or { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" }
 	local items = o.Items or {}
-	local GAP = 4
-	local value = {}
-	local itemText = {}
-	for _, item in ipairs(items) do itemText[item.Key] = item.Text or item.Key end
-
 	local extra = o.Extra
+	local GAP = 4
+	local itemText, poolOrder = {}, {}
+	for index, item in ipairs(items) do
+		itemText[item.Key] = item.Text or item.Key
+		poolOrder[item.Key] = index
+	end
+
 	local function copyValue(source)
 		local result = {}
 		for slot, keys in pairs(source or {}) do
@@ -694,14 +698,14 @@ function Section:AddSlotBoard(o)
 		end
 		return result
 	end
-	value = copyValue(o.Value)
+	local value = copyValue(o.Value)
 
 	local container = new("Frame", {
 		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 		LayoutOrder = self:_next(), Parent = self._body,
 	}, { new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }) })
 
-	--// slots (the Extra area, when there is one, sits above them like the old backpack's inventory)
+	--// slots (a faixa Extra, quando existe, fica acima deles, como o inventário da mochila antiga)
 	local slotArea = new("Frame", {
 		LayoutOrder = 3, Surface = "Panel", BackgroundColor3 = "Item", BorderSizePixel = 0,
 		Size = UDim2.new(1, 0, 0, 60), Parent = container,
@@ -713,7 +717,8 @@ function Section:AddSlotBoard(o)
 		SortOrder = Enum.SortOrder.LayoutOrder, HorizontalAlignment = Enum.HorizontalAlignment.Center, Parent = slotArea,
 	})
 
-	-- Números dos slots em Oswald, como numeração pintada; laranja quando o slot tem item.
+	-- Números dos slots em Oswald, como numeração pintada; laranja quando o slot tem item. O número e o "+N" ficam
+	-- por cima do bloco que o slot segura.
 	local slotCells = {}
 	for index, label in ipairs(labels) do
 		local cell = new("TextButton", {
@@ -723,30 +728,22 @@ function Section:AddSlotBoard(o)
 		local stroke = new("UIStroke", { Color = "Accent", Thickness = 1, Transparency = 1, Parent = cell })
 		local number = new("TextLabel", {
 			BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 1), Size = UDim2.fromOffset(14, 14),
-			Text = label, TextColor3 = "SubText", TextSize = 13, FontFace = Fonts.Title,
+			Text = label, TextColor3 = "SubText", TextSize = 13, FontFace = Fonts.Title, ZIndex = 2,
 			TextXAlignment = Enum.TextXAlignment.Left, Parent = cell,
 		})
-		local name = new("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 12), Size = UDim2.new(1, -6, 1, -24), TextYAlignment = Enum.TextYAlignment.Center,
-			Text = "", TextColor3 = "Text", TextScaled = true, TextWrapped = true, FontFace = Fonts.Medium,
-			Parent = cell,
-		}, { new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6 }) })
-		local extra = new("TextLabel", {
+		local more = new("TextLabel", {
 			BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -4, 0, 2),
-			Size = UDim2.fromOffset(20, 12), Text = "", TextColor3 = "Accent", TextSize = 11,
+			Size = UDim2.fromOffset(20, 12), Text = "", TextColor3 = "Accent", TextSize = 11, ZIndex = 2,
 			FontFace = Fonts.Bold, TextXAlignment = Enum.TextXAlignment.Right, Parent = cell,
 		})
-		slotCells[index] = { cell = cell, stroke = stroke, number = number, name = name, extra = extra }
+		slotCells[index] = { cell = cell, stroke = stroke, number = number, more = more }
 	end
 
-
-	-- Extra area: a lower strip above the slots holding its items as smaller squares; empty, it shows its
-	-- placeholder text.
+	-- Faixa Extra: uma faixa cinza acima dos slots com os blocos dela em quadrados menores; vazia, mostra o texto
+	-- de espera.
 	local extraCell, extraLabel, extraStroke, extraHolder, extraGrid
-	local extraTiles = {}
 	local EXTRA_EMPTY_H, EXTRA_PAD = 36, 6
 	if extra then
-		-- Its own grey rounded rectangle, a little above the slot bar (like the old backpack's inventory panel).
 		extraCell = new("TextButton", {
 			LayoutOrder = 1, Surface = "Panel", BackgroundColor3 = "Item", BorderSizePixel = 0, AutoButtonColor = false, Text = "",
 			Size = UDim2.new(1, 0, 0, EXTRA_EMPTY_H), Parent = container,
@@ -755,7 +752,7 @@ function Section:AddSlotBoard(o)
 		extraStroke = new("UIStroke", { Color = "Accent", Thickness = 1, Transparency = 1, Parent = extraCell })
 		extraLabel = new("TextLabel", {
 			BackgroundTransparency = 1, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -20, 0, EXTRA_EMPTY_H),
-			Text = "", TextColor3 = "SubText", TextSize = 14, FontFace = Fonts.Medium,
+			Text = extra.Placeholder or (extra.Text or "Extra"), TextColor3 = "SubText", TextSize = 14, FontFace = Fonts.Medium,
 			TextXAlignment = Enum.TextXAlignment.Center, TextTruncate = Enum.TextTruncate.AtEnd, Parent = extraCell,
 		})
 		extraHolder = new("Frame", {
@@ -776,74 +773,113 @@ function Section:AddSlotBoard(o)
 		}, { new("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14) }) })
 	end
 
-	--// itens
+	--// lista: os blocos que não estão em lugar nenhum (mesmo recuo e tamanho dos slots, para alinhar com eles)
 	local itemArea = new("Frame", {
 		LayoutOrder = 5, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
 		Parent = container,
 	})
-	-- Same padding and cell size as the slot row, so the item squares line up with the slots.
 	new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = itemArea })
 	local itemGrid = new("UIGridLayout", {
 		CellPadding = UDim2.fromOffset(GAP, GAP), CellSize = UDim2.fromOffset(44, 44),
 		SortOrder = Enum.SortOrder.LayoutOrder, Parent = itemArea,
 	})
-	local itemCells = {}
-	for index, item in ipairs(items) do
-		local tile = new("TextButton", {
-			LayoutOrder = index, Surface = "Panel", BackgroundColor3 = "Item", BorderSizePixel = 0, AutoButtonColor = false,
-			Text = "", Parent = itemArea,
-		}, { corner(RADIUS - 1) })
-		local stroke = new("UIStroke", {
-			Color = "Accent", Thickness = 1, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = tile,
-		})
-		local name = new("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 12), Size = UDim2.new(1, -6, 1, -24), TextYAlignment = Enum.TextYAlignment.Center,
-			Text = itemText[item.Key], TextColor3 = "SubText", TextScaled = true, TextWrapped = true,
-			FontFace = Fonts.Medium, Parent = tile,
-		}, { new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6 }) })
-		-- The slot the item is in (top-left, like the slot numbers).
-		local badge = new("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.fromOffset(4, 1), Size = UDim2.fromOffset(14, 14),
-			Text = "", TextColor3 = "Accent", TextSize = 13, FontFace = Fonts.Title,
-			TextXAlignment = Enum.TextXAlignment.Left, Parent = tile,
-		})
-		itemCells[item.Key] = { tile = tile, stroke = stroke, name = name, badge = badge }
+
+	--// blocos: um por item, criado na primeira vez que aparece (uma chave salva que não está em Items também ganha
+	-- o seu, para poder sair do slot)
+	local blocks = {} -- chave -> { button, label, size, stroke, where }
+	-- Como o bloco fica em cada lugar: cor, cor do nome, recuo do nome (o slot tem o número em cima) e letra máxima.
+	local LOOKS = {
+		pool  = { color = "Item", text = "SubText", inset = 12, max = 12, panel = true },
+		slot  = { color = "ItemSelected", text = "Text", inset = 12, max = 12 },
+		extra = { color = "ItemSelected", text = "Text", inset = 2, max = 10 },
+	}
+	local function dress(block, where)
+		local look = LOOKS[where]
+		block.where = where
+		paint(block.button, "BackgroundColor3", look.color)
+		surfaces[block.button] = look.panel and "Panel" or nil
+		block.button.BackgroundTransparency = look.panel and Palette.PanelTransparency or 0
+		block.button.Size = UDim2.fromScale(1, 1) -- dentro de um slot ele o preenche; numa grade, a grade manda
+		block.button.Position = UDim2.new()
+		block.label.Position = UDim2.new(0, 3, 0, look.inset)
+		block.label.Size = UDim2.new(1, -6, 1, -2 * look.inset)
+		paint(block.label, "TextColor3", look.text)
+		block.size.MaxTextSize = look.max
 	end
 
-	-- Slots: 10 por linha quando cabem com pelo menos 44 px (toque); senão 5 por linha. Os itens usam o mesmo tamanho.
-	local relayoutExtra -- sizeExtra, once it exists
+	local startDrag, clearAt -- (definidas com o arraste, mais abaixo)
+	local lifted -- o bloco sendo arrastado: { key, block, from, holder, offset, lastPoint }
+	local function blockOf(key)
+		local block = blocks[key]
+		if block then return block end
+		local button = new("TextButton", {
+			BorderSizePixel = 0, AutoButtonColor = false, Text = "", ZIndex = 1,
+		}, { corner(RADIUS - 1) })
+		local size = new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 5 })
+		local label = new("TextLabel", {
+			BackgroundTransparency = 1, Text = itemText[key] or key, TextScaled = true, TextWrapped = true,
+			TextYAlignment = Enum.TextYAlignment.Center, FontFace = Fonts.Medium, Parent = button,
+		}, { size })
+		local stroke = new("UIStroke", {
+			Color = "Accent", Thickness = 1, Transparency = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = button,
+		})
+		block = { key = key, button = button, label = label, size = size, stroke = stroke }
+		blocks[key] = block
+		button.InputBegan:Connect(function(input)
+			if isClick(input) then
+				startDrag(key, input)
+			elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+				clearAt(key)
+			end
+		end)
+		button.MouseEnter:Connect(function()
+			if not lifted and block.where == "pool" then tween(button, { BackgroundColor3 = "ItemHover" }) end
+		end)
+		button.MouseLeave:Connect(function()
+			if block.where == "pool" then tween(button, { BackgroundColor3 = "Item" }) end
+		end)
+		return block
+	end
+
+	-- Slots: 10 por linha quando cabem com pelo menos 44 px (toque); senão 5 por linha. A lista usa o mesmo tamanho.
+	local sizeExtra -- (definida com a faixa, mais abaixo)
 	local function relayout()
 		local width = slotArea.AbsoluteSize.X - 16
-		if width > 0 then
-			local columns = (width - 9 * GAP) / 10 >= 44 and 10 or 5
-			local cell = math.min(math.floor((width - (columns - 1) * GAP) / columns), 64)
-			slotGrid.CellSize = UDim2.fromOffset(cell, cell)
-			slotGrid.FillDirectionMaxCells = columns -- 5 + 5, não 6 + 4 quando sobra espaço
-			itemGrid.CellSize = UDim2.fromOffset(cell, cell)
-			if extraGrid then
-				local small = math.max(math.floor(cell * 0.75), 24)
-				extraGrid.CellSize = UDim2.fromOffset(small, small)
-				if relayoutExtra then relayoutExtra() end
-			end
-			local rows = math.ceil(#labels / columns)
-			slotArea.Size = UDim2.new(1, 0, 0, rows * cell + (rows - 1) * GAP + 16)
+		if width <= 0 then return end
+		local columns = (width - 9 * GAP) / 10 >= 44 and 10 or 5
+		local cell = math.min(math.floor((width - (columns - 1) * GAP) / columns), 64)
+		slotGrid.CellSize = UDim2.fromOffset(cell, cell)
+		slotGrid.FillDirectionMaxCells = columns -- 5 + 5, não 6 + 4 quando sobra espaço
+		itemGrid.CellSize = UDim2.fromOffset(cell, cell)
+		if extraGrid then
+			local small = math.max(math.floor(cell * 0.75), 24)
+			extraGrid.CellSize = UDim2.fromOffset(small, small)
+			sizeExtra()
 		end
+		local rows = math.ceil(#labels / columns)
+		slotArea.Size = UDim2.new(1, 0, 0, rows * cell + (rows - 1) * GAP + 16)
 	end
 	slotArea:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayout)
 
+	-- Onde uma chave está agora (o número do slot, Extra.Key ou nil).
 	local function slotOf(key)
 		for slot, keys in pairs(value) do
-			for _, k in ipairs(keys) do
-				if k == key then return slot end
-			end
+			if table.find(keys, key) then return slot end
 		end
 		return nil
 	end
+	-- As chaves de um lugar, sem a que está no ar.
+	local function shownKeys(slot)
+		local keys = {}
+		for _, key in ipairs(value[slot] or {}) do
+			if not (lifted and lifted.key == key) then table.insert(keys, key) end
+		end
+		return keys
+	end
 
-	local startDrag -- defined with the dragging code below
-	-- Height of the strip: as many rows of small squares as its items need (a thin strip when empty).
-	local function sizeExtra()
-		local count = #(value[extra.Key] or {})
+	-- Altura da faixa: quantas fileiras de quadradinhos os blocos dela pedem (fina quando vazia).
+	function sizeExtra()
+		local count = #shownKeys(extra.Key)
 		if count == 0 then
 			extraCell.Size = UDim2.new(1, 0, 0, EXTRA_EMPTY_H)
 			return
@@ -854,53 +890,47 @@ function Section:AddSlotBoard(o)
 		local rows = math.ceil(count / columns)
 		extraCell.Size = UDim2.new(1, 0, 0, rows * small + (rows - 1) * GAP + 2 * EXTRA_PAD)
 	end
-	relayoutExtra = extra and sizeExtra or nil
-	local function renderExtra()
-		for _, tile in ipairs(extraTiles) do tile:Destroy() end
-		table.clear(extraTiles)
-		local keys = value[extra.Key] or {}
-		extraLabel.Visible = #keys == 0
-		extraLabel.Text = extra.Placeholder or (extra.Text or "Extra")
-		for index, key in ipairs(keys) do
-			local tile = new("TextButton", {
-				LayoutOrder = index, BackgroundColor3 = "ItemSelected", BorderSizePixel = 0, AutoButtonColor = false,
-				Text = "", Parent = extraHolder,
-			}, { corner(RADIUS - 1), new("TextLabel", {
-				BackgroundTransparency = 1, Position = UDim2.fromOffset(2, 2), Size = UDim2.new(1, -4, 1, -4),
-				Text = itemText[key] or key, TextColor3 = "Text", TextScaled = true, TextWrapped = true,
-				TextYAlignment = Enum.TextYAlignment.Center, FontFace = Fonts.Medium,
-			}, { new("UITextSizeConstraint", { MaxTextSize = 10, MinTextSize = 5 }) }) })
-			tile.InputBegan:Connect(function(input)
-				if isClick(input) and startDrag then startDrag(key, extra.Key, input) end
-			end)
-			table.insert(extraTiles, tile)
-		end
-		sizeExtra()
-	end
 
+	-- Põe cada bloco no seu lugar. O que está no ar fica onde está (com o cursor).
 	local function render()
+		local placed = {}
 		for index, s in ipairs(slotCells) do
-			local keys = value[index]
-			local filled = keys and #keys > 0
-			s.name.Text = filled and (itemText[keys[1]] or keys[1]) or ""
-			s.extra.Text = (filled and #keys > 1) and ("+" .. (#keys - 1)) or ""
-			paint(s.cell, "BackgroundColor3", filled and "ItemSelected" or "Track")
-			paint(s.number, "TextColor3", filled and "Accent" or "SubText")
+			local keys = shownKeys(index)
+			for position, key in ipairs(keys) do
+				local block = blockOf(key)
+				placed[key] = true
+				dress(block, "slot")
+				block.button.Parent = s.cell
+				block.button.Visible = position == 1 -- os de baixo da pilha ficam guardados no slot
+			end
+			s.more.Text = #keys > 1 and ("+" .. (#keys - 1)) or ""
+			paint(s.number, "TextColor3", #keys > 0 and "Accent" or "SubText")
 		end
 		if extraCell then
-			renderExtra()
-		end
-		for key, c in pairs(itemCells) do
-			local slot = slotOf(key)
-			local badgeText = ""
-			if extra and slot == extra.Key then
-				badgeText = extra.Badge or "H"
-			elseif slot then
-				badgeText = tostring(labels[slot] or slot)
+			local keys = shownKeys(extra.Key)
+			for position, key in ipairs(keys) do
+				local block = blockOf(key)
+				placed[key] = true
+				dress(block, "extra")
+				block.button.LayoutOrder = position
+				block.button.Visible = true
+				block.button.Parent = extraHolder
 			end
-			c.badge.Text = badgeText
-			paint(c.name, "TextColor3", slot and "Text" or "SubText")
-			c.stroke.Transparency = slot and 0.2 or 1
+			extraLabel.Visible = #keys == 0
+			sizeExtra()
+		end
+		for _, item in ipairs(items) do blockOf(item.Key) end
+		for key, block in pairs(blocks) do
+			if not placed[key] and not (lifted and lifted.key == key) then
+				if poolOrder[key] then
+					dress(block, "pool")
+					block.button.LayoutOrder = poolOrder[key]
+					block.button.Visible = true
+					block.button.Parent = itemArea
+				else
+					block.button.Parent = nil -- uma chave que não está em Items só aparece enquanto tem lugar
+				end
+			end
 		end
 	end
 
@@ -912,18 +942,18 @@ function Section:AddSlotBoard(o)
 
 	local function removeKey(key)
 		for slot, keys in pairs(value) do
-			for i = #keys, 1, -1 do
-				if keys[i] == key then table.remove(keys, i) end
-			end
+			local at = table.find(keys, key)
+			if at then table.remove(keys, at) end
 			if #keys == 0 then value[slot] = nil end
 		end
 	end
 
-	--// arrastar
+	--// arrastar: o próprio bloco sai do lugar e vai para o ScreenGui da janela, por cima de tudo, seguindo o cursor
+	-- do ponto em que foi pego.
 	local gui = self._window._gui
-	local dragging -- { key, ghost, fromSlot }
-	-- input.Position is in the same space as AbsolutePosition (see insideGui); GetMouseLocation is not
-	-- (it counts the top bar inset), which put the drop point below the cursor and missed the slots.
+	local LIFTED_Z = 50
+	-- input.Position está no mesmo espaço de AbsolutePosition (ver insideGui); GetMouseLocation não (conta a faixa
+	-- de cima do Roblox), o que punha o ponto de soltar abaixo do cursor.
 	local function pointOf(input)
 		return Vector2.new(input.Position.X, input.Position.Y)
 	end
@@ -934,97 +964,111 @@ function Section:AddSlotBoard(o)
 		if extraCell and insideGui(extraCell, point) then return extra.Key end
 		return nil
 	end
-	-- The ghost lives in the window's ScreenGui: its offset is relative to the gui's own top-left corner.
-	local function placeGhost(ghost, point)
-		local origin = gui.AbsolutePosition
-		ghost.Position = UDim2.fromOffset(point.X - origin.X, point.Y - origin.Y)
+	local function highlight(target)
+		for index, s in ipairs(slotCells) do
+			s.stroke.Transparency = index == target and 0 or 1
+		end
+		if extraStroke then extraStroke.Transparency = (extra and target == extra.Key) and 0 or 1 end
 	end
-	local function highlight(index)
-		for i, s in ipairs(slotCells) do
-			s.stroke.Transparency = (i == index) and 0 or 1
-		end
-		if extraStroke then
-			local on = extra and index == extra.Key
-			extraStroke.Transparency = on and 0 or 1
-		end
+	local function follow(point)
+		local origin = gui.AbsolutePosition
+		lifted.block.button.Position = UDim2.fromOffset(point.X - lifted.offset.X - origin.X, point.Y - lifted.offset.Y - origin.Y)
 	end
 
-	function startDrag(key, fromSlot, input)
-		if dragging or not key then return end
-		local cell = slotGrid.CellSize -- the ghost is a square of the same size as the slots and the items
-		local ghost = new("Frame", {
-			AnchorPoint = Vector2.new(0.5, 0.5), Size = cell, BackgroundColor3 = "Accent",
-			BackgroundTransparency = 0.1, BorderSizePixel = 0, ZIndex = 50, Parent = gui,
-		}, { corner(RADIUS), new("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.new(0, 3, 0, 12), Size = UDim2.new(1, -6, 1, -24),
-			Text = itemText[key] or key, TextColor3 = "OnAccent", TextScaled = true, TextWrapped = true,
-			TextYAlignment = Enum.TextYAlignment.Center, FontFace = Fonts.Bold, ZIndex = 51,
-		}, { new("UITextSizeConstraint", { MaxTextSize = 12, MinTextSize = 6 }) }) })
-		placeGhost(ghost, pointOf(input))
-		dragging = { key = key, ghost = ghost, fromSlot = fromSlot }
+	function startDrag(key, input)
+		if lifted then return end
+		local block = blocks[key]
+		local button = block.button
+		local point = pointOf(input)
+		local at, size = button.AbsolutePosition, button.AbsoluteSize
+		lifted = { key = key, block = block, from = slotOf(key), offset = point - at }
+		-- Tirado da lista, ele deixa o espaço vazio até ser solto, para a lista não correr enquanto isso.
+		if block.where == "pool" then
+			lifted.holder = new("Frame", { BackgroundTransparency = 1, LayoutOrder = button.LayoutOrder, Parent = itemArea })
+		end
+		button.Parent = gui
+		button.Size = UDim2.fromOffset(size.X, size.Y) -- o tamanho que tinha na tela (a janela pode estar em escala)
+		button.ZIndex = LIFTED_Z
+		button.Visible = true
+		block.stroke.Transparency = 0
+		follow(point)
+		render() -- o slot de onde saiu mostra o que estava embaixo dele (ou fica vazio)
 		self._window:_lockScroll(true)
 	end
 
-	local function endDrag(input)
-		local d = dragging
+	-- Solta o bloco onde o cursor está (input) ou esteve por último; cancel: volta para onde estava.
+	local function endDrag(input, cancel)
+		local d = lifted
 		if not d then return end
-		dragging = nil
+		lifted = nil
 		self._window:_lockScroll(false)
-		pcall(function() d.ghost:Destroy() end)
 		highlight(nil)
-		local target = slotAt(pointOf(input)) or (d.lastPoint and slotAt(d.lastPoint))
-		if target then
-			if target == d.fromSlot then return end
+		if d.holder then d.holder:Destroy() end
+		d.block.button.ZIndex = 1
+		d.block.stroke.Transparency = 1
+		local target = nil
+		if not cancel then
+			target = (input and slotAt(pointOf(input))) or (d.lastPoint and slotAt(d.lastPoint))
+		end
+		if cancel then
+			render()
+		elseif target and target ~= d.from then
 			removeKey(d.key)
 			value[target] = value[target] or {}
-			table.insert(value[target], d.key)
+			table.insert(value[target], 1, d.key) -- por cima da pilha: o que se vê no slot é o que vale
 			changed()
-		elseif d.fromSlot then
-			removeKey(d.key) -- arrastado de um slot e solto fora: tira do slot
+		elseif not target and d.from then
+			removeKey(d.key) -- tirado de um lugar e solto fora dos slots: volta para a lista
 			changed()
+		else
+			render() -- solto onde estava: volta para o mesmo lugar
 		end
 	end
 
-	for key, c in pairs(itemCells) do
-		c.tile.InputBegan:Connect(function(input)
-			if isClick(input) then startDrag(key, nil, input) end
-		end)
-		c.tile.MouseEnter:Connect(function() if not dragging then tween(c.tile, { BackgroundColor3 = "ItemHover" }) end end)
-		c.tile.MouseLeave:Connect(function() tween(c.tile, { BackgroundColor3 = "Item" }) end)
+	-- Botão direito: esvazia o lugar do bloco (um slot ou a faixa); na lista não faz nada.
+	function clearAt(key)
+		local slot = slotOf(key)
+		if lifted or slot == nil then return end
+		value[slot] = nil
+		changed()
 	end
 	for index, s in ipairs(slotCells) do
 		s.cell.InputBegan:Connect(function(input)
-			local keys = value[index]
-			if isClick(input) and keys and #keys > 0 then
-				startDrag(keys[#keys], index, input)
-			elseif input.UserInputType == Enum.UserInputType.MouseButton2 and keys then
+			if input.UserInputType == Enum.UserInputType.MouseButton2 and value[index] and not lifted then
 				value[index] = nil
 				changed()
 			end
 		end)
 	end
-
 	if extraCell then
 		extraCell.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton2 and value[extra.Key] then
+			if input.UserInputType == Enum.UserInputType.MouseButton2 and value[extra.Key] and not lifted then
 				value[extra.Key] = nil
 				changed()
 			end
 		end)
-		-- The squares wrap when the strip changes width.
+		-- Os quadradinhos mudam de fileira quando a faixa muda de largura.
 		extraHolder:GetPropertyChangedSignal("AbsoluteSize"):Connect(sizeExtra)
 	end
 
 	self._window:_connect(UserInputService.InputChanged, function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		if lifted and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 			local point = pointOf(input)
-			dragging.lastPoint = point
-			placeGhost(dragging.ghost, point)
+			lifted.lastPoint = point
+			follow(point)
 			highlight(slotAt(point))
 		end
 	end)
 	self._window:_connect(UserInputService.InputEnded, function(input)
-		if dragging and isClick(input) then endDrag(input) end
+		if lifted and isClick(input) then endDrag(input) end
+	end)
+	-- O botão solto fora da janela do Roblox não chega aqui: o bloco cai onde o cursor esteve por último.
+	self._window:_connect(UserInputService.WindowFocusReleased, function()
+		if lifted then endDrag(nil) end
+	end)
+	-- A janela escondida no meio do arraste (o bloco no ar fica fora dela): ele volta para o lugar.
+	self._window:_connect(self._window._shell:GetPropertyChangedSignal("Visible"), function()
+		if lifted and not self._window._shell.Visible then endDrag(nil, true) end
 	end)
 
 	function obj:Get() return copyValue(value) end
@@ -2145,6 +2189,7 @@ end
 --          A cada passo, aoMover(posição no espaço do Model, terminou); no fim, terminou = true. Enquanto houver uma,
 --          a prévia não gira sozinha. Some com o próximo SetModel ou com SetHandle(nil).
 --          pager:SetHint(texto): troca o texto de ajuda (nil volta ao de o.Hint).
+--          pager:SetMessage(texto): o que a prévia diz quando não tem Model ("Loading..."); nil volta a "No preview".
 local PAGER_YAW, PAGER_PITCH = math.rad(70), math.rad(-12) -- de lado, um pouco de cima
 local PAGER_SPIN = math.rad(30)                            -- graus por segundo
 local PAGER_FOV = 28                                       -- pouca perspectiva: a ponta que vem não incha
@@ -2560,6 +2605,9 @@ function Tab:AddPager(o)
 	end
 	function pager:SetHint(text)
 		hint.Text = text or o.Hint or ""
+	end
+	function pager:SetMessage(text)
+		empty.Text = text or "No preview"
 	end
 
 	-- A primeira página aparece já; a prévia ajusta a distância quando a página ganha tamanho.
