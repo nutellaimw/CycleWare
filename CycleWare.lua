@@ -3492,36 +3492,62 @@ local function gunShape(tool, handle)
 	return center, size, pending, muzzleAt
 end
 
--- Puts the Muzzle at a point of the Handle's space, through whatever holds it there: a weld's offset, a
--- WeldConstraint (off while it moves) or nothing (anchored, as in the Backpack). Its first place is kept on it.
+-- Puts the Muzzle at a point of the Handle's space, through whatever holds it there: a weld's offset (Weld, Motor6D)
+-- or nothing (anchored, as in a copy of the gun). A WeldConstraint is not used: one that came from the server keeps
+-- the server's offset the first time the gun is equipped, whatever it was switched to in the Backpack (measured in
+-- Studio: a new gun, the one you get after dying, went back to the game's place on the first equip). So it is
+-- switched off on this client and our own Weld (CW_MuzzleWeld, an offset given outright) holds the Muzzle instead,
+-- in the Backpack and in the hand alike. The Muzzle's first place is kept on it.
 local MUZZLE_ORIGIN = "CW_MuzzleOrigin"
+local MUZZLE_WELD = "CW_MuzzleWeld"
 local function placeMuzzle(tool, handle, position)
 	local muzzle = tool:FindFirstChild("Muzzle")
 	if not (muzzle and muzzle:IsA("BasePart") and position) then return end
-	local holder
+	local own = muzzle:FindFirstChild(MUZZLE_WELD)
+	local holder = own and own:IsA("Weld") and own.Part0 == handle and own.Part1 == muzzle and own or nil
+	local constraints = {}
 	for _, joint in ipairs(tool:GetDescendants()) do
-		if (joint:IsA("JointInstance") or (joint:IsA("WeldConstraint") and joint.Enabled))
-			and joint.Part0 and joint.Part1 and (joint.Part0 == muzzle or joint.Part1 == muzzle) then
-			holder = joint
-			break
+		local isConstraint, isJoint = joint:IsA("WeldConstraint"), joint:IsA("JointInstance")
+		if (isConstraint or isJoint) and joint ~= holder and joint.Part0 and joint.Part1
+			and (joint.Part0 == muzzle or joint.Part1 == muzzle) then
+			if isConstraint then
+				if joint.Enabled then table.insert(constraints, joint) end
+			elseif not holder then
+				holder = joint
+			end
 		end
 	end
 	-- A weld's offsets say where the Muzzle is before its CFrame catches up
 	local current = muzzle.CFrame
-	if holder and holder:IsA("JointInstance") then
+	if holder then
 		current = holder.Part1 == muzzle and holder.Part0.CFrame * holder.C0 * holder.C1:Inverse()
 			or holder.Part1.CFrame * holder.C1 * holder.C0:Inverse()
 	end
 	local relative = handle.CFrame:ToObjectSpace(current)
 	if muzzle:GetAttribute(MUZZLE_ORIGIN) == nil then muzzle:SetAttribute(MUZZLE_ORIGIN, relative.Position) end
+	for _, constraint in ipairs(constraints) do
+		constraint.Enabled = false
+		-- the server switching it back on would have it pull against the weld that holds the Muzzle now: it goes
+		-- off again (one watch each)
+		if not constraint:GetAttribute(MUZZLE_WELD) then
+			constraint:SetAttribute(MUZZLE_WELD, true)
+			constraint:GetPropertyChangedSignal("Enabled"):Connect(function()
+				if constraint.Enabled then constraint.Enabled = false end
+			end)
+		end
+	end
+	if #constraints > 0 and not holder then
+		local weld = Instance.new("Weld")
+		weld.Name = MUZZLE_WELD
+		weld.Part0, weld.Part1 = handle, muzzle
+		weld.C0 = relative
+		weld.Parent = muzzle
+		holder = weld
+	end
 	if (relative.Position - position).Magnitude < 1e-3 then return end
 	local target = handle.CFrame * CFrame.new(position) * relative.Rotation
 	if not holder then
 		muzzle.CFrame = target
-	elseif holder:IsA("WeldConstraint") then
-		holder.Enabled = false
-		muzzle.CFrame = target
-		holder.Enabled = true
 	elseif holder.Part1 == muzzle then
 		holder.C0 = holder.Part0.CFrame:ToObjectSpace(target) * holder.C1
 	else
@@ -3745,13 +3771,12 @@ function CW.reapplyLooks()
 end
 
 -- A copy of the gun as it looks in your hand (its mesh and its texture), for the preview in the Guns tab: a Model in
--- the Handle's space (the barrel along -Z) with only what shows, anchored. With ghost, a custom mesh is shown with the
--- gun's own pieces faintly behind it, to line it up. Also returns the box of the gun's own pieces (center, size), which
--- the preview frames, so a mesh made bigger or moved shows as such, and where the Muzzle is (it moves with the mesh).
--- A file mesh inside a piece (the Taser's) has its size known once the file has loaded; then CW.onMeshLoaded redraws
--- the preview. nil when the game has no such gun.
-local GHOST_TRANSPARENCY = 0.8
-function CW.weaponPreview(gun, ghost)
+-- the Handle's space (the barrel along -Z) with only what shows, anchored. Also returns the box of the gun's own pieces
+-- (center, size), which the preview frames, so a mesh made bigger or moved shows as such, and where the Muzzle is (it
+-- moves with the mesh); no Muzzle point while a chosen mesh is still loading, since the point shown then would be the
+-- gun's own and not the mesh's. A file mesh inside a piece (the Taser's) has its size known once the file has loaded;
+-- then CW.onMeshLoaded redraws the preview. nil when the game has no such gun.
+function CW.weaponPreview(gun)
 	local tools = ReplicatedStorage:FindFirstChild("Tools")
 	local guns = tools and tools:FindFirstChild("Guns")
 	local source = guns and guns:FindFirstChild(gun)
@@ -3764,28 +3789,19 @@ function CW.weaponPreview(gun, ghost)
 	pcall(applyLook, tool)
 	local center, size, pending = gunShape(tool, handle)
 	requestMeshes(pending)
-	ghost = ghost and tool:FindFirstChild(MESH_PART) ~= nil
+	local meshShown = chosenMesh(gun) == nil or tool:FindFirstChild(MESH_PART) ~= nil
 	local muzzle = tool:FindFirstChild("Muzzle")
-	local fireAt = muzzle and muzzle:IsA("BasePart") and handle.CFrame:PointToObjectSpace(muzzle.Position) or nil
+	local fireAt = meshShown and muzzle and muzzle:IsA("BasePart") and handle.CFrame:PointToObjectSpace(muzzle.Position) or nil
 
 	local model = Instance.new("Model")
 	model.Name = gun
-	local shown, faint = {}, {}
+	local shown = {}
 	for _, part in ipairs(tool:GetDescendants()) do
-		if part:IsA("BasePart") and part ~= handle then
-			local original = part:GetAttribute(ORIGINAL_TRANSPARENCY)
-			if part.Transparency < 1 then
-				table.insert(shown, { part, handle.CFrame:ToObjectSpace(part.CFrame) })
-			elseif ghost and original and original < 1 then
-				table.insert(shown, { part, handle.CFrame:ToObjectSpace(part.CFrame) })
-				faint[part] = true
-			end
+		if part:IsA("BasePart") and part ~= handle and part.Transparency < 1 then
+			table.insert(shown, { part, handle.CFrame:ToObjectSpace(part.CFrame) })
 		end
 	end
-	for _, item in ipairs(shown) do
-		item[1].Parent = model
-		if faint[item[1]] then item[1].Transparency = GHOST_TRANSPARENCY end
-	end
+	for _, item in ipairs(shown) do item[1].Parent = model end
 	for _, inner in ipairs(model:GetDescendants()) do
 		if inner:IsA("JointInstance") or inner:IsA("WeldConstraint") or inner:IsA("Constraint")
 			or inner:IsA("LuaSourceContainer") or (inner:IsA("BasePart") and inner.Transparency >= 1) then
@@ -6676,19 +6692,19 @@ guarded("Guns", function()
 	for _, name in ipairs(CW.WeaponList or {}) do texturable[name] = true end
 
 	local pager
-	local fireMoved -- (gun, point, done): the fire point dot was dragged in the preview (set by the Mesh controls)
+	local fireMoved -- (gun, point, done): the fire point was moved in the preview (set by the Mesh controls)
 	local PREVIEW_HINT = "Drag to rotate, scroll to zoom"
-	local EDIT_HINT = "Drag the dot to move where shots start"
+	local EDIT_HINT = "Drag an arrow to move where shots start"
 	-- The preview shows the gun of the page in view as it looks in your hand, framed by the gun's own size. While
-	-- Edit is on (CW.State.meshEdit, one switch for every page): its own pieces faintly behind a custom mesh, and a
-	-- dot where the shots start (the Muzzle, which moves with the mesh), which can be dragged. keep: the camera stays
-	-- as it is (also from one gun to the next).
+	-- Edit Gun Fire Point is on (CW.State.meshEdit, one switch for every page): a dot where the shots start (the
+	-- Muzzle, which moves with the mesh), with the preview's arrows on it to move it along the gun's left/right,
+	-- down/up and back/forward. keep: the camera stays as it is (also from one gun to the next).
 	refreshGunPreview = function(gun, keep)
 		if not pager then return end
 		local _, shown = pager:Get()
 		if not shown or (gun and gun ~= shown) then return end
 		local editing = CW.State.meshEdit == true
-		local ok, model, center, size, fireAt = pcall(CW.weaponPreview, shown, editing)
+		local ok, model, center, size, fireAt = pcall(CW.weaponPreview, shown)
 		if not ok then
 			pager:SetModel(nil)
 			return
@@ -6698,7 +6714,7 @@ guarded("Guns", function()
 			dot = Instance.new("Part")
 			dot.Name = "FirePoint"
 			dot.Shape = Enum.PartType.Ball
-			dot.Material = Enum.Material.Neon
+			dot.Material = Enum.Material.SmoothPlastic -- Neon blows the color out in a preview (the orange shows as yellow)
 			dot.Color = CWUI.Theme and CWUI.Theme.Accent or Color3.fromRGB(255, 128, 32)
 			dot.Size = Vector3.one * math.clamp(size.Z * 0.03, 0.06, 0.15)
 			dot.Anchored, dot.CanCollide, dot.CanQuery, dot.CanTouch = true, false, false, false
@@ -6738,8 +6754,8 @@ guarded("Guns", function()
 		{ "Right", "Left / Right", 2 }, { "Up", "Down / Up", 2 }, { "Forward", "Back / Forward", 2 },
 		{ "Turn", "Turn Left / Right", 0, "°" }, { "Tilt", "Tilt Down / Up", 0, "°" }, { "Roll", "Roll Left / Right", 0, "°" },
 	}
-	local editToggles = {} -- "Edit" of every page: one switch for all of them (CW.State.meshEdit, not saved)
-	local editControls = {} -- what shows only while Edit is on, on every page
+	local editToggles = {} -- "Edit Gun Fire Point" of every page: one switch for all of them (CW.State.meshEdit, not saved)
+	local editControls = {} -- what shows only while it is on, on every page
 	local pageRefreshers = {} -- gun -> functions that show the gun's values again (after its mesh changed)
 	local function onPageRefresh(gun, fn)
 		pageRefreshers[gun] = pageRefreshers[gun] or {}
@@ -6760,8 +6776,8 @@ guarded("Guns", function()
 			refreshGunPreview(gun, true)
 		end)
 	end
-	-- The dot moves with the mouse in the preview; its place is saved for the mesh in use as it goes, and the guns
-	-- you carry (and the preview) take it once it is let go.
+	-- The dot moves along the arrow being dragged in the preview; its place is saved for the mesh in use as it goes,
+	-- and the guns you carry (and the preview) take it once the arrow is let go.
 	fireMoved = function(gun, point, done)
 		if not CW.setFirePointAt(gun, point) then return end
 		if done then
@@ -6840,11 +6856,11 @@ guarded("Guns", function()
 				end,
 			})
 		end)
-		-- Edit: the gun's own pieces faintly behind a custom mesh and the fire point in the preview, where the dot can
-		-- be dragged to move where the shots start (saved for the mesh in use). The preview is the only place it shows.
+		-- Edit Gun Fire Point: the fire point in the preview, with arrows to move where the shots start (saved for the
+		-- mesh in use). The preview is the only place it shows.
 		if pager then
 			table.insert(editToggles, page:Toggle({
-				Title = "Edit",
+				Title = "Edit Gun Fire Point",
 				Default = CW.State.meshEdit == true,
 				Callback = function(on) setEditing(on, gun) end,
 			}))
