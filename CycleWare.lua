@@ -3013,22 +3013,26 @@ CW.Library.ensureFolder(CW.Paths.TEXTURES_FOLDER)
 --    MeshPart (the whole gun as one model with proper UVs) is built and welded to the Handle, and
 --    the original pieces are hidden while a texture is selected. Deselecting the texture removes
 --    the custom mesh and shows the original pieces again.
+-- The size, offset and rotation were measured in Studio on the pieces each mesh replaces: size is the box those
+-- pieces fill (the size the mesh is shown at), offset its center from the Handle, rotation the turn that lays the
+-- mesh along the barrel. Laid over the pieces, the outlines match (1:1, in the hand too: it is welded to the Handle).
+-- The FAL mesh was made with other proportions, so its size is not its own size times one number.
 local CUSTOM_MESH_WEAPONS = {
 	["FAL"] = {
-		meshId   = "rbxassetid://90772329772088",
+		meshId   = "90772329772088",
 		meshName = "FAL/Meshes",
 		hide     = { ["Smooth Block Model"] = true, ["Black"] = true },
-		offset   = Vector3.new(0.05, 0.2, -0.55),
+		offset   = Vector3.new(0.0081, 0.3238, -0.5333),
 		rotation = Vector3.new(0, 90, 0),
-		size     = Vector3.new(0.4, 0.4, 0.4),
+		size     = Vector3.new(4.7413, 1.1476, 0.4912),
 	},
 	["M700"] = {
-		meshId   = "rbxassetid://109235772617313",
+		meshId   = "109235772617313",
 		meshName = "M700/Meshes",
 		hide     = { ["Smooth Block Model"] = true },
-		offset   = Vector3.new(0, 0.43, -0.8),
+		offset   = Vector3.new(0.0411, 0.4626, -0.8174),
 		rotation = Vector3.new(0, 90, 0),
-		size     = Vector3.new(1, 1, 1),
+		size     = Vector3.new(5.3007, 1.2828, 0.3613),
 	},
 }
 
@@ -3122,13 +3126,71 @@ local function applyRegularTexture(tool)
 	return true
 end
 
+--// Meshes, loaded once ---------------------------------------------------------------------------------------
+-- Every mesh shown on a gun (the FAL/M700 ones and the custom ones) is a copy of a MeshPart made once per mesh with
+-- the mesh already loaded, so its Size is final when it is set (no later load can change it).
+local AssetService = game:GetService("AssetService")
+-- mesh ID -> a loaded MeshPart to clone (false: it could not be loaded). Kept across re-runs: it is a download.
+local meshTemplates = CW.State.meshTemplates or {}
+CW.State.meshTemplates = meshTemplates
+local meshLoading = {}
+
+-- Yields. A MeshPart with this mesh loaded, or nil and why.
+local function loadMeshPart(meshId)
+	local uri = "rbxassetid://" .. meshId
+	local created, part = pcall(function() return AssetService:CreateMeshPartAsync(uri) end)
+	if created and typeof(part) == "Instance" and part:IsA("MeshPart") then return part end
+	local fresh = Instance.new("MeshPart")
+	local assigned, err = pcall(function() fresh.MeshId = uri end)
+	if not assigned then
+		fresh:Destroy()
+		return nil, tostring(created and "no mesh" or part) .. "; " .. tostring(err)
+	end
+	local deadline = os.clock() + 6
+	while fresh.MeshSize == Vector3.zero and os.clock() < deadline do task.wait(0.1) end
+	if fresh.MeshSize == Vector3.zero then
+		fresh:Destroy()
+		return nil, "it did not load in 6 s"
+	end
+	return fresh
+end
+
+-- Loads meshes in the background, then puts them on the guns (CW.reloadTextures) and tells the preview.
+local function requestMeshes(ids)
+	local missing = {}
+	for _, id in ipairs(ids) do
+		if meshTemplates[id] == nil and not meshLoading[id] then
+			meshLoading[id] = true
+			table.insert(missing, id)
+		end
+	end
+	if #missing == 0 then return end
+	task.spawn(function()
+		for _, id in ipairs(missing) do
+			local part, why = loadMeshPart(id)
+			meshLoading[id] = nil
+			meshTemplates[id] = part or false
+			if not part then CW.Warn("Mesh " .. id .. " could not be loaded: " .. tostring(why)) end
+		end
+		if CW.reloadTextures then pcall(CW.reloadTextures) end
+		if CW.onMeshLoaded then pcall(CW.onMeshLoaded) end
+	end)
+end
+
+-- A mesh that failed to load is tried again when the player picks it again.
+function CW.retryMesh(meshId)
+	if meshTemplates[meshId] == false then meshTemplates[meshId] = nil end
+end
+
+-- nil while the mesh loads (the gun keeps its pieces; it is built when the mesh is there) or without a Handle yet.
 local function buildCustomMesh(tool, cfg)
 	local handle = tool:FindFirstChild("Handle")
-	if not handle then return nil end
+	local template = meshTemplates[cfg.meshId]
+	if template == nil then requestMeshes({ cfg.meshId }) end
+	if not (handle and template) then return nil end
 
-	local mesh = Instance.new("MeshPart")
+	local mesh = template:Clone()
 	mesh.Name       = cfg.meshName
-	mesh.MeshId     = cfg.meshId
 	mesh.Material   = Enum.Material.SmoothPlastic
 	mesh.Size       = cfg.size
 	mesh.Anchored   = false
@@ -3187,7 +3249,7 @@ local function applyCustomTexture(tool, cfg)
 	local custom = tool:FindFirstChild(cfg.meshName)
 	if textureId then
 		if not custom then custom = buildCustomMesh(tool, cfg) end
-		if not custom then return false end -- no Handle yet
+		if not custom then return false end -- no Handle yet, or the mesh is loading
 		hideOriginalPieces(tool, cfg, custom)
 		if custom.TextureID ~= textureId then custom.TextureID = textureId end
 	else
@@ -3205,14 +3267,10 @@ end
 -- with its ID (see MESH_ADJUST) scales, moves and turns it from there, around its own center.
 -- Texture: the gun's chosen texture, otherwise the one that came with the mesh (an accessory or a model brings one).
 -- Until the mesh has loaded the gun keeps its own look, and a mesh that cannot be loaded leaves it that way.
-local AssetService = game:GetService("AssetService")
+-- The Muzzle (where the game starts a shot's tracer) goes along with the adjustment, and back when the mesh goes.
 local MarketplaceService = game:GetService("MarketplaceService")
 local MESH_PART = "CW_Mesh"
 local MESH_ASSET_TYPE = 4
--- mesh ID -> a loaded MeshPart to clone (false: it could not be loaded). Kept across re-runs: it is a download.
-local meshTemplates = CW.State.meshTemplates or {}
-CW.State.meshTemplates = meshTemplates
-local meshLoading = {}
 local OWN_MESHES = { [MESH_PART] = true } -- parts we add, never measured as the gun's own pieces
 for _, cfg in pairs(CUSTOM_MESH_WEAPONS) do OWN_MESHES[cfg.meshName] = true end
 local BOX_CORNERS = {}
@@ -3220,26 +3278,6 @@ for _, x in ipairs({ -1, 1 }) do
 	for _, y in ipairs({ -1, 1 }) do
 		for _, z in ipairs({ -1, 1 }) do table.insert(BOX_CORNERS, Vector3.new(x, y, z)) end
 	end
-end
-
--- Yields. A MeshPart with this mesh loaded, or nil and why.
-local function loadMeshPart(meshId)
-	local uri = "rbxassetid://" .. meshId
-	local created, part = pcall(function() return AssetService:CreateMeshPartAsync(uri) end)
-	if created and typeof(part) == "Instance" and part:IsA("MeshPart") then return part end
-	local fresh = Instance.new("MeshPart")
-	local assigned, err = pcall(function() fresh.MeshId = uri end)
-	if not assigned then
-		fresh:Destroy()
-		return nil, tostring(created and "no mesh" or part) .. "; " .. tostring(err)
-	end
-	local deadline = os.clock() + 6
-	while fresh.MeshSize == Vector3.zero and os.clock() < deadline do task.wait(0.1) end
-	if fresh.MeshSize == Vector3.zero then
-		fresh:Destroy()
-		return nil, "it did not load in 6 s"
-	end
-	return fresh
 end
 
 local function digitsOf(value)
@@ -3305,33 +3343,6 @@ function CW.resolveMeshAsset(id)
 	return result
 end
 
--- Loads meshes in the background, then puts them on the guns (CW.reloadTextures) and tells the preview.
-local function requestMeshes(ids)
-	local missing = {}
-	for _, id in ipairs(ids) do
-		if meshTemplates[id] == nil and not meshLoading[id] then
-			meshLoading[id] = true
-			table.insert(missing, id)
-		end
-	end
-	if #missing == 0 then return end
-	task.spawn(function()
-		for _, id in ipairs(missing) do
-			local part, why = loadMeshPart(id)
-			meshLoading[id] = nil
-			meshTemplates[id] = part or false
-			if not part then CW.Warn("Mesh " .. id .. " could not be loaded: " .. tostring(why)) end
-		end
-		if CW.reloadTextures then pcall(CW.reloadTextures) end
-		if CW.onMeshLoaded then pcall(CW.onMeshLoaded) end
-	end)
-end
-
--- A mesh that failed to load is tried again when the player picks it again.
-function CW.retryMesh(meshId)
-	if meshTemplates[meshId] == false then meshTemplates[meshId] = nil end
-end
-
 -- The mesh chosen for this gun (one of its custom mesh IDs), or nil for its own.
 local function chosenMesh(gun)
 	local selections = CW.Settings.ASSET_SELECTIONS.Meshes
@@ -3377,6 +3388,72 @@ local function gunBox(tool, handle)
 	return (low + high) / 2, high - low, pending
 end
 
+-- The same box and where the Muzzle is (the Handle's space), measured on the game's copy of the gun
+-- (ReplicatedStorage.Tools.Guns, what the game hands out). On the client a given tool lands empty and its parts come
+-- after it (seen in Studio: 0 parts when it lands in the Backpack), so the tool itself can be measured half there;
+-- that was a mesh sometimes coming back small after a respawn. Kept per gun once complete.
+local gunShapes = {}
+local function gunShape(tool, handle)
+	local known = gunShapes[tool.Name]
+	if known then return known.center, known.size, {}, known.muzzle end
+	local tools = ReplicatedStorage:FindFirstChild("Tools")
+	local guns = tools and tools:FindFirstChild("Guns")
+	local copy = guns and guns:FindFirstChild(tool.Name)
+	local copyHandle = copy and copy:FindFirstChild("Handle")
+	local source, sourceHandle = tool, handle
+	if copyHandle then source, sourceHandle = copy, copyHandle end
+	local center, size, pending = gunBox(source, sourceHandle)
+	local muzzle = source:FindFirstChild("Muzzle")
+	local muzzleAt = muzzle and muzzle:IsA("BasePart") and sourceHandle.CFrame:PointToObjectSpace(muzzle.Position) or nil
+	if source == copy and #pending == 0 then gunShapes[tool.Name] = { center = center, size = size, muzzle = muzzleAt } end
+	return center, size, pending, muzzleAt
+end
+
+-- Puts the Muzzle at a point of the Handle's space, through whatever holds it there: a weld's offset, a
+-- WeldConstraint (off while it moves) or nothing (anchored, as in the Backpack). Its first place is kept on it.
+local MUZZLE_ORIGIN = "CW_MuzzleOrigin"
+local function placeMuzzle(tool, handle, position)
+	local muzzle = tool:FindFirstChild("Muzzle")
+	if not (muzzle and muzzle:IsA("BasePart") and position) then return end
+	local holder
+	for _, joint in ipairs(tool:GetDescendants()) do
+		if (joint:IsA("JointInstance") or (joint:IsA("WeldConstraint") and joint.Enabled))
+			and joint.Part0 and joint.Part1 and (joint.Part0 == muzzle or joint.Part1 == muzzle) then
+			holder = joint
+			break
+		end
+	end
+	-- A weld's offsets say where the Muzzle is before its CFrame catches up
+	local current = muzzle.CFrame
+	if holder and holder:IsA("JointInstance") then
+		current = holder.Part1 == muzzle and holder.Part0.CFrame * holder.C0 * holder.C1:Inverse()
+			or holder.Part1.CFrame * holder.C1 * holder.C0:Inverse()
+	end
+	local relative = handle.CFrame:ToObjectSpace(current)
+	if muzzle:GetAttribute(MUZZLE_ORIGIN) == nil then muzzle:SetAttribute(MUZZLE_ORIGIN, relative.Position) end
+	if (relative.Position - position).Magnitude < 1e-3 then return end
+	local target = handle.CFrame * CFrame.new(position) * relative.Rotation
+	if not holder then
+		muzzle.CFrame = target
+	elseif holder:IsA("WeldConstraint") then
+		holder.Enabled = false
+		muzzle.CFrame = target
+		holder.Enabled = true
+	elseif holder.Part1 == muzzle then
+		holder.C0 = holder.Part0.CFrame:ToObjectSpace(target) * holder.C1
+	else
+		holder.C1 = holder.Part1.CFrame:ToObjectSpace(target) * holder.C0
+	end
+end
+
+local function restoreMuzzle(tool, handle)
+	local muzzle = tool:FindFirstChild("Muzzle")
+	local origin = muzzle and muzzle:GetAttribute(MUZZLE_ORIGIN)
+	if typeof(origin) ~= "Vector3" or not handle then return end
+	placeMuzzle(tool, handle, origin)
+	muzzle:SetAttribute(MUZZLE_ORIGIN, nil)
+end
+
 -- The turn that lays the mesh's longest side along the barrel (the Handle's -Z, toward the Muzzle), the middle one
 -- upright and the shortest across, as the game's own gun meshes sit. Returns it and the longest side.
 local function meshRotation(meshSize)
@@ -3402,6 +3479,7 @@ local function removeCustomMesh(tool)
 	if not part then return end
 	part:Destroy()
 	showOriginalPieces(tool)
+	restoreMuzzle(tool, tool:FindFirstChild("Handle"))
 end
 
 -- Returns false while the mesh cannot be shown: no Handle yet, the mesh (or a file the gun's size depends on) is
@@ -3423,7 +3501,7 @@ local function applyCustomMesh(tool, entry)
 	end
 	if not part then
 		local template = meshTemplates[meshId]
-		local center, box, pending = gunBox(tool, handle)
+		local center, box, pending, muzzleAt = gunShape(tool, handle)
 		if template == nil then table.insert(pending, meshId) end
 		requestMeshes(pending)
 		if not template or #pending > 0 then return false end
@@ -3441,6 +3519,12 @@ local function applyCustomMesh(tool, entry)
 		part.Size = template.MeshSize * (box.Z / math.max(longest, 1e-3)) * adjust.Size
 		part.CFrame = handle.CFrame * CFrame.new(moved) * turned * rotation
 		part:SetAttribute("CW_MeshKey", key)
+		-- The Muzzle goes where the same size, move and turn take it (from the gun's own place for it).
+		local muzzle = tool:FindFirstChild("Muzzle")
+		local origin = muzzle and muzzle:GetAttribute(MUZZLE_ORIGIN) or muzzleAt
+		if typeof(origin) == "Vector3" then
+			part:SetAttribute("CW_MuzzleAt", moved + turned:VectorToWorldSpace((origin - center) * adjust.Size))
+		end
 		part.Parent = tool
 		local weld = Instance.new("WeldConstraint")
 		weld.Part0, weld.Part1 = handle, part
@@ -3449,11 +3533,12 @@ local function applyCustomMesh(tool, entry)
 	local texture = CW.Assets.weaponTextures[tool.Name] or (entry.Texture and "rbxassetid://" .. entry.Texture) or ""
 	if part.TextureID ~= texture then pcall(function() part.TextureID = texture end) end
 	hideAllPieces(tool, part)
+	placeMuzzle(tool, handle, part:GetAttribute("CW_MuzzleAt"))
 	return true
 end
 
 -- Mesh first (when one is chosen and ready), otherwise the gun's own pieces with its texture. Returns false when
--- the tool is not complete yet (no Handle, or no MeshPart for its texture), so it is tried again shortly.
+-- the tool is not complete yet (no Handle, or no MeshPart for its texture); watchTool puts it on as the parts come.
 local function applyLook(tool)
 	local entry = chosenMesh(tool.Name)
 	if entry and applyCustomMesh(tool, entry) then return true end
@@ -3470,9 +3555,32 @@ end
 local LOOK_WEAPONS = table.clone(TEXTURABLE)
 for _, name in ipairs(SOUND_WEAPONS) do LOOK_WEAPONS[name] = true end
 
+-- On the client a given tool lands empty and its parts come after it, so a tool we look after puts its look on
+-- again whenever a part (or a weld) arrives in it, once per frame: late pieces get hidden or textured too.
+-- Kept across re-runs (the handler looks the code up through CW), so a tool is never watched twice.
+local watchedTools = CW.State.watchedTools or setmetatable({}, { __mode = "k" })
+CW.State.watchedTools = watchedTools
+local function watchTool(tool)
+	if watchedTools[tool] then return end
+	watchedTools[tool] = true
+	local queued = false
+	tool.DescendantAdded:Connect(function(added)
+		if queued or not (added:IsA("BasePart") or added:IsA("JointInstance") or added:IsA("WeldConstraint")) then return end
+		queued = true
+		task.defer(function()
+			queued = false
+			local apply = CW.applyWeaponLook
+			if apply and tool.Parent then apply(tool) end
+		end)
+	end)
+end
+
 local function applyToContainer(container)
 	for _, child in ipairs(container:GetChildren()) do
-		if child:IsA("Tool") and LOOK_WEAPONS[child.Name] then applyLook(child) end
+		if child:IsA("Tool") and LOOK_WEAPONS[child.Name] then
+			watchTool(child)
+			applyLook(child)
+		end
 	end
 end
 
@@ -3495,8 +3603,9 @@ end
 -- A copy of the gun as it looks in your hand (its mesh and its texture), for the preview in the Guns tab: a Model in
 -- the Handle's space (the barrel along -Z) with only what shows, anchored. With ghost, a custom mesh is shown with the
 -- gun's own pieces faintly behind it, to line it up. Also returns the box of the gun's own pieces (center, size), which
--- the preview frames, so a mesh made bigger or moved shows as such. A file mesh inside a piece (the Taser's) has its
--- size known once the file has loaded; then CW.onMeshLoaded redraws the preview. nil when the game has no such gun.
+-- the preview frames, so a mesh made bigger or moved shows as such, and where the Muzzle is (it moves with the mesh).
+-- A file mesh inside a piece (the Taser's) has its size known once the file has loaded; then CW.onMeshLoaded redraws
+-- the preview. nil when the game has no such gun.
 local GHOST_TRANSPARENCY = 0.8
 function CW.weaponPreview(gun, ghost)
 	local tools = ReplicatedStorage:FindFirstChild("Tools")
@@ -3509,9 +3618,11 @@ function CW.weaponPreview(gun, ghost)
 		return nil
 	end
 	pcall(applyLook, tool)
-	local center, size, pending = gunBox(tool, handle)
+	local center, size, pending = gunShape(tool, handle)
 	requestMeshes(pending)
 	ghost = ghost and tool:FindFirstChild(MESH_PART) ~= nil
+	local muzzle = tool:FindFirstChild("Muzzle")
+	local fireAt = muzzle and muzzle:IsA("BasePart") and handle.CFrame:PointToObjectSpace(muzzle.Position) or nil
 
 	local model = Instance.new("Model")
 	model.Name = gun
@@ -3542,20 +3653,16 @@ function CW.weaponPreview(gun, ghost)
 		item[1].CFrame = item[2]
 	end
 	tool:Destroy()
-	return model, center, size:Max(Vector3.one * 0.05)
+	return model, center, size:Max(Vector3.one * 0.05), fireAt
 end
 
--- A tool arrives with its parts, so one pass is enough; if the mesh (or the Handle) is not there
--- yet, it is retried once shortly after.
+-- A tool may land before its parts: watchTool puts the look on again as they come.
 local function monitor(container, key)
 	CW.track(key, container.ChildAdded:Connect(function(child)
+		if not (child:IsA("Tool") and LOOK_WEAPONS[child.Name]) then return end
+		watchTool(child)
 		local apply = CW.applyWeaponLook
-		if apply and not apply(child) then
-			task.wait(0.1)
-			apply = CW.applyWeaponLook
-			-- The tool may have been dropped or destroyed while waiting: do not rebuild pieces on it.
-			if apply and child.Parent == container then apply(child) end
-		end
+		if apply then apply(child) end
 	end))
 	applyToContainer(container)
 end
@@ -6222,20 +6329,37 @@ guarded("Guns", function()
 	for _, name in ipairs(CW.WeaponList or {}) do texturable[name] = true end
 
 	local pager
-	-- The preview shows the gun of the page in view as it looks in your hand (with "Show Original Gun", its own pieces
-	-- faintly behind a custom mesh), framed by the gun's own size. keep: same gun, so the camera stays.
+	-- The preview shows the gun of the page in view as it looks in your hand, framed by the gun's own size. With
+	-- "Show Original Gun and Fire Point": its own pieces faintly behind a custom mesh, and a dot where the shots start
+	-- (the Muzzle, which moves with the mesh). keep: the camera stays as it is (also from one gun to the next).
 	refreshGunPreview = function(gun, keep)
 		if not pager then return end
 		local _, shown = pager:Get()
 		if not shown or (gun and gun ~= shown) then return end
-		local ok, model, center, size = pcall(CW.weaponPreview, shown, CW.Settings.MESH_SHOW_ORIGINAL == true)
-		if ok then pager:SetModel(model, keep, center, size) else pager:SetModel(nil) end
+		local guide = CW.Settings.MESH_SHOW_ORIGINAL == true
+		local ok, model, center, size, fireAt = pcall(CW.weaponPreview, shown, guide)
+		if not ok then
+			pager:SetModel(nil)
+			return
+		end
+		if model and guide and fireAt then
+			local dot = Instance.new("Part")
+			dot.Name = "FirePoint"
+			dot.Shape = Enum.PartType.Ball
+			dot.Material = Enum.Material.Neon
+			dot.Color = CWUI.Theme and CWUI.Theme.Accent or Color3.fromRGB(255, 128, 32)
+			dot.Size = Vector3.one * math.clamp(size.Z * 0.03, 0.06, 0.15)
+			dot.Anchored, dot.CanCollide, dot.CanQuery, dot.CanTouch = true, false, false, false
+			dot.CFrame = CFrame.new(fireAt)
+			dot.Parent = model
+		end
+		pager:SetModel(model, keep, center, size)
 	end
 	if type(GunsTab.AddPager) == "function" then
 		pager = GunsTab:AddPager({
 			Pages = guns,
 			Hint = "Drag to rotate, scroll to zoom",
-			Changed = function() refreshGunPreview(nil, false) end,
+			Changed = function() refreshGunPreview(nil, true) end,
 		})
 	end
 	-- A mesh that finished loading shows on the guns already (Texture module); the preview follows.
@@ -6256,7 +6380,7 @@ guarded("Guns", function()
 		{ "Right", "Left / Right", 2 }, { "Up", "Down / Up", 2 }, { "Forward", "Back / Forward", 2 },
 		{ "Turn", "Turn Left / Right", 0, "°" }, { "Tilt", "Tilt Down / Up", 0, "°" }, { "Roll", "Roll Left / Right", 0, "°" },
 	}
-	local ghostToggles = {} -- "Show Original Gun" of every page: one setting for all of them
+	local ghostToggles = {} -- "Show Original Gun and Fire Point" of every page: one setting for all of them
 	local pendingLook = {}
 	local function adjustChanged(gun)
 		if pendingLook[gun] then return end
@@ -6332,7 +6456,7 @@ guarded("Guns", function()
 		adjust = page:AddSubSection("Adjust Mesh", true)
 		if pager then -- the preview is the only place it shows
 			table.insert(ghostToggles, adjust:Toggle({
-				Title = "Show Original Gun",
+				Title = "Show Original Gun and Fire Point",
 				Default = CW.Settings.MESH_SHOW_ORIGINAL == true,
 				Callback = function(on)
 					CW.Settings.MESH_SHOW_ORIGINAL = on == true
