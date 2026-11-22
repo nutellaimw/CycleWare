@@ -4378,8 +4378,9 @@ local function installShootHook(shootEvent)
 	local wrap = type(newcclosure) == "function" and newcclosure or function(fn) return fn end
 
 	local OldNameCall
+	-- (__namecall runs for every method call in the game: the cheap check first)
 	OldNameCall = hookmetamethod(shootEvent, "__namecall", wrap(function(self, ...)
-		if getnamecallmethod() == "FireServer" and not isExecutorCall() and self == CW.ShootEvent then
+		if self == CW.ShootEvent and getnamecallmethod() == "FireServer" and not isExecutorCall() then
 			local enqueue = CW.onShot
 			if enqueue then pcall(enqueue, (...)) end
 		end
@@ -5177,7 +5178,8 @@ local function createSoundChanger(spec)
 		return assetId
 	end
 
-	local function applyToTool(tool, player, container)
+	-- onlySound: a sound that just arrived in the tool (each shot clones one); the others are set up already.
+	local function applyToTool(tool, player, container, onlySound)
 		if not tool:IsA("Tool") then return end
 		-- The gun's switch is on, and the gun is yours (or its "apply to others" is on too).
 		local applies = enabledFor(tool.Name) and (player == LocalPlayer or othersFor(tool.Name))
@@ -5189,6 +5191,10 @@ local function createSoundChanger(spec)
 			for sound, data in pairs(active) do
 				if data.tool == tool then restoreSound(sound) end
 			end
+			return
+		end
+		if onlySound then
+			applySound(onlySound, targetId, tool, player, container)
 			return
 		end
 		for _, descendant in ipairs(tool:GetDescendants()) do
@@ -5246,7 +5252,7 @@ local function createSoundChanger(spec)
 				task.defer(applyToTool, descendant, player, container)
 			elseif descendant:IsA("Sound") and descendant.Name == spec.SoundName then
 				local tool = findSoundTool(descendant)
-				if tool then applyToTool(tool, player, container) end
+				if tool then applyToTool(tool, player, container, descendant) end
 			end
 		end))
 
@@ -7032,6 +7038,10 @@ guarded("Utilities", function()
 	CW.State.chatToggleConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if gameProcessed or not CW.Settings.CHAT_TOGGLE_ENABLED then return end
 		if input.KeyCode ~= Enum.KeyCode.Z then return end
+		-- Z is also the sniper's zoom (GunController): with one in hand it is left to the game.
+		local character = LocalPlayer.Character
+		local held = character and character:FindFirstChildOfClass("Tool")
+		if held and held:GetAttribute("Behavior") == "Sniper" then return end
 
 		chatHidden = not chatHidden
 		CW.State.chatHidden = chatHidden
@@ -7178,6 +7188,47 @@ guarded("Utilities", function()
 		return node
 	end
 
+	-- The count after a quick re-equip. The equip handler copies the server's CurrentAmmo into
+	-- Local_CurrentAmmo and the label, so a shot the server has not answered yet when the gun is taken out
+	-- again counts twice: the label shows a bullet more, and a last bullet shows 1/6, so the gun never reloads.
+	-- The server's count comes a moment later and the game does not read it again: while the gun is in hand
+	-- and no reload has begun since it was taken out, a server count below the gun's own is taken, label
+	-- included. Always on: it only corrects what the game shows.
+	local function syncAmmo(tool)
+		local character = LocalPlayer.Character
+		if not (character and tool.Parent == character) or tool:GetAttribute("Local_ReloadSession") ~= 0 then return end
+		local server, own = tool:GetAttribute("CurrentAmmo"), tool:GetAttribute("Local_CurrentAmmo")
+		if type(server) ~= "number" or type(own) ~= "number" or server >= own then return end
+		tool:SetAttribute("Local_CurrentAmmo", server)
+		local label = gunHud("BulletsLabel")
+		if label then
+			label.Text = tool:GetAttribute("Behavior") == "Sniper"
+				and server .. " | " .. tostring(tool:GetAttribute("StoredAmmo") or 0)
+				or server .. "/" .. tostring(tool:GetAttribute("MaxAmmo") or "")
+		end
+	end
+
+	local function watchGunAmmo(tool)
+		if not (tool:IsA("Tool") and tool:GetAttribute("ToolType") == "Gun") then return end
+		-- A reload (one still counting down from before counts too) refills the gun after its own count
+		-- was sent: a server count that arrives after it may be from before it.
+		local reloaded = tool:GetAttribute("Local_ReloadSession") ~= 0
+		CW.track("ammoSyncReload", tool:GetAttributeChangedSignal("Local_ReloadSession"):Connect(function()
+			if tool:GetAttribute("Local_ReloadSession") ~= 0 then reloaded = true end
+		end))
+		CW.track("ammoSyncServer", tool:GetAttributeChangedSignal("CurrentAmmo"):Connect(function()
+			if not reloaded then syncAmmo(tool) end
+		end))
+	end
+
+	local function watchCharacterAmmo(character)
+		CW.track("ammoSyncEquip", character.ChildAdded:Connect(watchGunAmmo))
+		local held = character:FindFirstChildOfClass("Tool")
+		if held then watchGunAmmo(held) end
+	end
+	if LocalPlayer.Character then watchCharacterAmmo(LocalPlayer.Character) end
+	CW.track("ammoSyncCharacter", LocalPlayer.CharacterAdded:Connect(watchCharacterAmmo))
+
 	-- Runs the handlers connected to a signal of the game, each in its own thread (a handler such as
 	-- reload() waits for the cooldown, so it must not run in ours).
 	local function fireGameSignal(signal)
@@ -7227,6 +7278,10 @@ guarded("Utilities", function()
 						directFailures = 0
 						return true
 					end
+					-- Put away (or dead) before the game could start it: not the button's fault.
+					local character = LocalPlayer.Character
+					local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+					if tool.Parent ~= character or not humanoid or humanoid.Health <= 0 then return false end
 				else
 					directError = tostring(err)
 				end
@@ -7475,6 +7530,7 @@ guarded("Utilities", function()
 	end
 
 	local internals -- { list, update, equip }
+	local barGuarded = false -- the game's updateToolbar closes its own gaps (guardBar, below)
 	local function findInternals()
 		if internals then
 			local list = internals.list
@@ -7500,7 +7556,9 @@ guarded("Utilities", function()
 					elseif type(v) == "table" then
 						list = list == nil and v or false -- more than one table: not the game's onToolAdded
 					elseif type(v) == "function" then
-						table.insert(functions, v)
+						-- (after a re-run the game's updateToolbar is behind the guard put in front of it, below)
+						local guard = CW.State.barGuard
+						table.insert(functions, (guard and v == guard.fn) and guard.update or v)
 					elseif typeof(v) == "Instance" and v:IsA("GuiObject") and v.Parent ~= nil then
 						toolbar = v
 					end
@@ -7775,14 +7833,23 @@ guarded("Utilities", function()
 	-- the lowest empty hotbar slot, and the inventory area once the hotbar is full; so a slot that must stay
 	-- empty is held for that moment by a local placeholder tool (never replicated), removed right after.
 	-- fixedTool (a tool in hand) keeps its slot and is not touched. Yields for three frames.
+	-- The game's own bar, hidden meanwhile, follows the Backpack too: a primary or secondary gun that comes back
+	-- within a second gets the slot the last one left, past the end of its list here, and its updateToolbar
+	-- fails. Unless that bar is guarded (guardBar), the guns go out and come back without their SlotType (a
+	-- local change, undone right after), so that bar just appends them.
 	local function rebuildOldBackpack(backpack, desired, inventory, fixedTool)
 		rebuildingOld = true
 		-- Only tools still in the Backpack are taken out, and only those are put back: one the server moves or
 		-- removes meanwhile is left where the server put it, and its slot is held by a placeholder instead.
-		local taken = {}
+		local taken, slotTypes = {}, {}
 		local function takeOut(tool)
-			if tool ~= fixedTool and tool.Parent == backpack and pcall(function() tool.Parent = nil end) then
-				taken[tool] = true
+			if tool ~= fixedTool and tool.Parent == backpack then
+				local slotType = not barGuarded and tool:GetAttribute("SlotType")
+				if slotType then
+					slotTypes[tool] = slotType
+					tool:SetAttribute("SlotType", nil)
+				end
+				if pcall(function() tool.Parent = nil end) then taken[tool] = true end
 			end
 		end
 		local function putBack(tool)
@@ -7823,6 +7890,11 @@ guarded("Utilities", function()
 			if putBack(tool) then oldInventory[tool] = true end
 		end
 		task.wait() -- every tool now has its place
+		for tool, slotType in pairs(slotTypes) do
+			pcall(function()
+				if tool:GetAttribute("SlotType") == nil then tool:SetAttribute("SlotType", slotType) end
+			end)
+		end
 		for _, placeholder in ipairs(placeholders) do placeholder:Destroy() end
 		task.wait() -- the placeholders' slots are empty again; these events are not taken as real tools
 		oldKnown = true
@@ -7937,6 +8009,68 @@ guarded("Utilities", function()
 		return true
 	end
 
+	-- closeGaps runs after the game's handlers, but updateToolbar fails INSIDE them: onToolAdded and
+	-- onToolRemoved stop there, the error shows in the console, and onToolRemoved leaves the tool's button on
+	-- the bar. Laying out Roblox's backpack (below) takes the tools out and puts them back at once, and the
+	-- game's bar, hidden meanwhile, follows all of it: a returning gun gets the slot the previous one left,
+	-- past the end. Where the executor can write upvalues, the game's functions that call updateToolbar
+	-- (onToolAdded, onToolRemoved, createDragger) get one that closes the gaps first. Kept in CW.State: a
+	-- re-run finds the game's function behind it (findInternals).
+	local function guardBar(found)
+		local getUpvalue, setUpvalue = debug.getupvalue, debug.setupvalue
+		if type(getUpvalue) ~= "function" or type(setUpvalue) ~= "function" then return false end
+		local guard = CW.State.barGuard
+		if not (guard and guard.list == found.list and guard.update == found.update) then
+			local list, update = found.list, found.update
+			guard = { list = list, update = update }
+			guard.fn = function(...)
+				closeGaps(list)
+				return update(...)
+			end
+			CW.State.barGuard = guard
+		end
+		if guard.installed then return (guard.patched or 0) > 0 end
+		local callers = { found.add }
+		for _, value in pairs(upvaluesOf(found.add)) do
+			if type(value) == "function" and value ~= guard.update and value ~= guard.fn then table.insert(callers, value) end
+		end
+		local patched = 0
+		for _, fn in ipairs(callers) do
+			for index, value in pairs(upvaluesOf(fn)) do
+				-- (the index is read back first: some executors' getupvalues skip the nil upvalues)
+				if value == guard.update and type(index) == "number" then
+					local ok, current = pcall(getUpvalue, fn, index)
+					if ok and current == guard.update and pcall(setUpvalue, fn, index, guard.fn) then
+						patched += 1
+					end
+				end
+			end
+		end
+		guard.installed, guard.patched = true, patched
+		CW.Log("Auto Slot: the game's inventory bar closes its own gaps (" .. patched .. " functions)")
+		return patched > 0
+	end
+
+	-- The gaps closed, and the buttons left on the game's bar without an entry (an onToolRemoved that
+	-- stopped at updateToolbar). Returns true when it changed something.
+	local function repairBar(found)
+		local changed = closeGaps(found.list)
+		local toolbar = found.toolbar
+		if toolbar and toolbar.Parent then
+			local onBar = {}
+			for _, entry in ipairs(found.list) do
+				if isEntry(entry) then onBar[entry.Button] = true end
+			end
+			for _, child in ipairs(toolbar:GetChildren()) do
+				if child:IsA("TextButton") and not onBar[child] then
+					child:Destroy()
+					changed = true
+				end
+			end
+		end
+		return changed
+	end
+
 	-- The game's bar: a hidden tool loses its button (it stays in the Backpack); when it is un-hidden, or Auto
 	-- Slot is turned off, it gets the button back through the game's own onToolAdded. ONLY those tools: giving
 	-- buttons to new tools is the game's job, and doing it for it raced with its own state (during a team
@@ -7952,7 +8086,7 @@ guarded("Utilities", function()
 	local leftoverCheckQueued = false
 	local function syncBar(found, backpack, keepHidden)
 		local list = found.list
-		local changed = closeGaps(list)
+		local changed = repairBar(found)
 		local character = aliveCharacter()
 		local now = os.clock()
 		local pending = false
@@ -8027,12 +8161,15 @@ guarded("Utilities", function()
 		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
 		if not backpack then return end
 
+		local found = autoSlotCaps and findInternals() or nil
+		barGuarded = found ~= nil and guardBar(found)
 		if usingOldBackpack() then
 			arrangeOldBackpack(backpack) -- needs no executor function
+			-- The game's bar (hidden while Roblox's is in use) saw those tools go and come back.
+			if found and repairBar(found) then pcall(found.update) end
 			return
 		end
 		if not autoSlotCaps then return end
-		local found = findInternals()
 		if not found then
 			if not warnedMissing then
 				warnedMissing = true
