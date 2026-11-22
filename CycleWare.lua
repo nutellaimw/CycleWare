@@ -457,6 +457,33 @@ function CW.httpGet(url)
 	error(tostring(lastError or result or "no HTTP function available"), 0)
 end
 
+--// Running again ----------------------------------------------------------------------
+-- Runs CycleWare again; the new run replaces this one (its window, its connections), as when the player runs it
+-- twice. Used to load a settings slot. The code comes from CW_CONFIG.SCRIPT_FILE (a file in the executor's
+-- workspace, for local tests, like UI_FILE) or else from CW_CONFIG.SCRIPT_URL (the repository's copy by default).
+-- Returns false and the reason when the code could not be had.
+local SCRIPT_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CycleWare.lua"
+function CW.restart()
+	local source
+	local file = type(_cfg.SCRIPT_FILE) == "string" and _cfg.SCRIPT_FILE ~= "" and _cfg.SCRIPT_FILE or nil
+	if file then
+		local ok, data = pcall(readfile, file)
+		if ok and type(data) == "string" and data ~= "" then source = data end
+	end
+	if not source then
+		local url = type(_cfg.SCRIPT_URL) == "string" and _cfg.SCRIPT_URL ~= "" and _cfg.SCRIPT_URL or SCRIPT_URL
+		local ok, data = pcall(CW.httpGet, url)
+		if not (ok and type(data) == "string" and data:find("__CW_CORE_STATE", 1, true)) then
+			return false, "could not download CycleWare (" .. tostring(data) .. ")"
+		end
+		source = data
+	end
+	local run, compileError = loadstring(source)
+	if type(run) ~= "function" then return false, tostring(compileError) end
+	task.spawn(run)
+	return true
+end
+
 --// Startup report -------------------------------------------------------------------
 do
 	local missing = {}
@@ -496,6 +523,8 @@ CW.Paths.MANIFEST_FILE = CW.Paths.LIBRARY_ROOT .. "/manifest.json"
 CW.Paths.CUSTOM_IDS_FILE = CW.Paths.CURSOR_ROOT .. "/custom_ids.json"
 CW.Paths.LIBRARY_REVISION_FILE = CW.Paths.LIBRARY_ROOT .. "/.revision"
 CW.Paths.SETTINGS_FILE = CW.Paths.CACHE_FOLDER .. "/ui_settings.json"
+-- Settings slots (Settings tab): one file per slot, written like SETTINGS_FILE. Outside the cache, which can be cleared.
+CW.Paths.SETTINGS_SLOTS_FOLDER = CW.Paths.CURSOR_ROOT .. "/Settings Slots"
 CW.Paths.AUDIO_COPIES_FOLDER = CW.Paths.CACHE_FOLDER .. "/Audio"
 CW.Paths.AUDIO_PROBE_FILE = CW.Paths.CACHE_FOLDER .. "/audio_probe.json"
 
@@ -536,6 +565,8 @@ CW.Settings.HIT_SOUND_GUN_VOLUMES = {}
 -- What each mesh of a gun keeps for itself (CW.MeshProfiles, Texture module): { [gun] = { [mesh] = profile } },
 -- mesh = "Default" or "id:123". A profile: Texture, Shoot, Reload, Effect (of a mesh not in use) and Fire.
 CW.Settings.MESH_PROFILES = {}
+-- The settings slot the settings in use were last loaded from or saved to ("" when none; Settings tab).
+CW.Settings.SETTINGS_SLOT = ""
 
 -- Snapshot of the defaults, taken before any saved value is applied. The save routine
 -- writes only the settings whose value differs from these.
@@ -3133,10 +3164,15 @@ end
 -- Every mesh shown on a gun (the FAL/M700 ones and the custom ones) is a copy of a MeshPart made once per mesh with
 -- the mesh already loaded, so its Size is final when it is set (no later load can change it).
 local AssetService = game:GetService("AssetService")
--- mesh ID -> a loaded MeshPart to clone (false: it could not be loaded). Kept across re-runs: it is a download.
+-- mesh ID -> a loaded MeshPart to clone (false: it could not be loaded, not even after the tries again). Kept across
+-- re-runs: it is a download.
 local meshTemplates = CW.State.meshTemplates or {}
 CW.State.meshTemplates = meshTemplates
-local meshLoading = {}
+local meshLoading = {} -- mesh ID -> true while it loads, or waits to be tried again
+local meshTries = {}   -- mesh ID -> how many tries failed (cleared once it loads or the player picks it again)
+-- A first join can be slow or throttled: a mesh that fails is tried again by itself after these many seconds, and
+-- only after the last one is it given up (until the player picks it again).
+local MESH_RETRY_DELAYS = { 2, 5, 12 }
 
 -- Yields. A MeshPart with this mesh loaded, or nil and why.
 local function loadMeshPart(meshId)
@@ -3158,7 +3194,8 @@ local function loadMeshPart(meshId)
 	return fresh
 end
 
--- Loads meshes in the background, then puts them on the guns (CW.reloadTextures) and tells the preview.
+-- Loads meshes in the background, then puts them on the guns (CW.reloadTextures) and tells the preview. A mesh that
+-- fails stays "loading" while it waits to be tried again (MESH_RETRY_DELAYS); only then is it marked false.
 local function requestMeshes(ids)
 	local missing = {}
 	for _, id in ipairs(ids) do
@@ -3169,20 +3206,40 @@ local function requestMeshes(ids)
 	end
 	if #missing == 0 then return end
 	task.spawn(function()
+		local settled = false -- a mesh loaded, or was given up: the guns and the preview change
 		for _, id in ipairs(missing) do
-			local part, why = loadMeshPart(id)
-			meshLoading[id] = nil
-			meshTemplates[id] = part or false
-			if not part then CW.Warn("Mesh " .. id .. " could not be loaded: " .. tostring(why)) end
+			local loaded, part, why = pcall(loadMeshPart, id)
+			if not loaded then part, why = nil, part end -- an error while loading is a failed try too
+			if part then
+				meshTemplates[id], meshTries[id], meshLoading[id] = part, nil, nil
+				settled = true
+			else
+				local tries = (meshTries[id] or 0) + 1
+				local retryIn = MESH_RETRY_DELAYS[tries]
+				if retryIn then
+					meshTries[id] = tries
+					task.delay(retryIn, function()
+						meshLoading[id] = nil
+						requestMeshes({ id })
+					end)
+				else
+					meshTemplates[id], meshTries[id], meshLoading[id] = false, nil, nil
+					settled = true
+					CW.Warn("Mesh " .. id .. " could not be loaded after " .. tries .. " tries: " .. tostring(why))
+				end
+			end
 		end
+		if not settled then return end
 		if CW.reloadTextures then pcall(CW.reloadTextures) end
 		if CW.onMeshLoaded then pcall(CW.onMeshLoaded) end
 	end)
 end
 
--- A mesh that failed to load is tried again when the player picks it again.
+-- A mesh that was given up is tried again when the player picks it again.
 function CW.retryMesh(meshId)
-	if meshTemplates[meshId] == false then meshTemplates[meshId] = nil end
+	if meshTemplates[meshId] == false then
+		meshTemplates[meshId], meshTries[meshId] = nil, nil
+	end
 end
 
 -- nil while the mesh loads (the gun keeps its pieces; it is built when the mesh is there) or without a Handle yet.
@@ -3773,9 +3830,11 @@ end
 -- A copy of the gun as it looks in your hand (its mesh and its texture), for the preview in the Guns tab: a Model in
 -- the Handle's space (the barrel along -Z) with only what shows, anchored. Also returns the box of the gun's own pieces
 -- (center, size), which the preview frames, so a mesh made bigger or moved shows as such, and where the Muzzle is (it
--- moves with the mesh); no Muzzle point while a chosen mesh is still loading, since the point shown then would be the
--- gun's own and not the mesh's. A file mesh inside a piece (the Taser's) has its size known once the file has loaded;
--- then CW.onMeshLoaded redraws the preview. nil when the game has no such gun.
+-- moves with the mesh). A file mesh inside a piece (the Taser's) has its size known once the file has loaded; then
+-- CW.onMeshLoaded redraws the preview. nil when the game has no such gun.
+-- With a chosen mesh that is not on the copy, the last value says why: "loading" (no Model then: the gun's own pieces
+-- would show for a moment and then change) or "failed" (the gun's own pieces, as on the guns, and no Muzzle point,
+-- which would be the gun's and not the mesh's).
 function CW.weaponPreview(gun)
 	local tools = ReplicatedStorage:FindFirstChild("Tools")
 	local guns = tools and tools:FindFirstChild("Guns")
@@ -3789,9 +3848,17 @@ function CW.weaponPreview(gun)
 	pcall(applyLook, tool)
 	local center, size, pending = gunShape(tool, handle)
 	requestMeshes(pending)
-	local meshShown = chosenMesh(gun) == nil or tool:FindFirstChild(MESH_PART) ~= nil
+	local entry = chosenMesh(gun)
+	local meshState = nil
+	if entry and not tool:FindFirstChild(MESH_PART) then
+		meshState = meshTemplates[entry.Mesh or entry.Id] == false and "failed" or "loading"
+	end
+	if meshState == "loading" then
+		tool:Destroy()
+		return nil, nil, nil, nil, meshState
+	end
 	local muzzle = tool:FindFirstChild("Muzzle")
-	local fireAt = meshShown and muzzle and muzzle:IsA("BasePart") and handle.CFrame:PointToObjectSpace(muzzle.Position) or nil
+	local fireAt = meshState == nil and muzzle and muzzle:IsA("BasePart") and handle.CFrame:PointToObjectSpace(muzzle.Position) or nil
 
 	local model = Instance.new("Model")
 	model.Name = gun
@@ -3813,7 +3880,44 @@ function CW.weaponPreview(gun)
 		item[1].CFrame = item[2]
 	end
 	tool:Destroy()
-	return model, center, size:Max(Vector3.one * 0.05), fireAt
+	return model, center, size:Max(Vector3.one * 0.05), fireAt, meshState
+end
+
+-- The chosen meshes of every gun (and the FAL/M700 texture meshes in use) start loading at once, while the loading
+-- screen is up, so the guns and the Guns tab have them from the start. CW.waitForMeshes(seconds) yields until they
+-- have loaded or been given up, or the time is out (one still being tried again then keeps loading after it).
+local preloading = {}
+function CW.preloadMeshes()
+	local ids = {}
+	for gun in pairs(LOOK_WEAPONS) do
+		local entry = chosenMesh(gun)
+		if entry then table.insert(ids, entry.Mesh or entry.Id) end
+		local copy = entry and gameGun(gun)
+		local handle = copy and copy:FindFirstChild("Handle")
+		if handle then
+			local _, _, pending = gunShape(copy, handle) -- the file meshes of its pieces size the custom mesh
+			for _, id in ipairs(pending) do table.insert(ids, id) end
+		end
+		local cfg = CUSTOM_MESH_WEAPONS[gun]
+		if cfg and CW.Assets.weaponTextures and CW.Assets.weaponTextures[gun] then table.insert(ids, cfg.meshId) end
+	end
+	for _, id in ipairs(ids) do preloading[id] = true end
+	requestMeshes(ids)
+end
+function CW.waitForMeshes(seconds)
+	local deadline = os.clock() + (seconds or 8)
+	while os.clock() < deadline do
+		local waiting = false
+		for id in pairs(preloading) do
+			if meshTemplates[id] == nil then
+				waiting = true
+				break
+			end
+		end
+		if not waiting then break end
+		task.wait(0.1)
+	end
+	table.clear(preloading)
 end
 
 -- A tool may land before its parts: watchTool puts the look on again as they come.
@@ -3859,6 +3963,7 @@ local function reloadTexturesAndApply()
 end
 CW.reloadTextures = reloadTexturesAndApply
 reloadTexturesAndApply()
+CW.preloadMeshes()
 
 -- Monitors are (re)created on every run, so a re-run replaces the old ones. The Backpack is
 -- recreated on every respawn, so the player is always watched for a new one.
@@ -4804,7 +4909,12 @@ local Window = CWUI:CreateWindow({
 })
 CW.UIWindow = Window
 if Window.SetVisible then Window:SetVisible(false) end -- shown as the loading screen goes
-Window.ToggleVisibility = Window.Toggle
+-- RightShift opens and closes the window only once the loading screen is gone (Ready, set at the end of this file):
+-- before that the UI is still being built, and opening it would show it half made over the loading screen.
+Window.Ready = false
+function Window:ToggleVisibility()
+	if self.Ready then self:Toggle() end
+end
 
 -- Background layers and parallax. The single background image of the previous version becomes layer 1.
 local canLayers = type(Window.SetBackgroundLayers) == "function"
@@ -6695,6 +6805,7 @@ guarded("Guns", function()
 	local fireMoved -- (gun, point, done): the fire point was moved in the preview (set by the Mesh controls)
 	local PREVIEW_HINT = "Drag to rotate, scroll to zoom"
 	local EDIT_HINT = "Drag an arrow to move where shots start"
+	local FAILED_HINT = "This mesh could not be loaded. Pick it again to try again"
 	-- The preview shows the gun of the page in view as it looks in your hand, framed by the gun's own size. While
 	-- Edit Gun Fire Point is on (CW.State.meshEdit, one switch for every page): a dot where the shots start (the
 	-- Muzzle, which moves with the mesh), with the preview's arrows on it to move it along the gun's left/right,
@@ -6704,7 +6815,10 @@ guarded("Guns", function()
 		local _, shown = pager:Get()
 		if not shown or (gun and gun ~= shown) then return end
 		local editing = CW.State.meshEdit == true
-		local ok, model, center, size, fireAt = pcall(CW.weaponPreview, shown)
+		local ok, model, center, size, fireAt, meshState = pcall(CW.weaponPreview, shown)
+		if type(pager.SetMessage) == "function" then
+			pager:SetMessage(ok and meshState == "loading" and "Loading the mesh" or nil)
+		end
 		if not ok then
 			pager:SetModel(nil)
 			return
@@ -6726,7 +6840,7 @@ guarded("Guns", function()
 			pager:SetHandle(dot, dot and function(point, done)
 				if fireMoved then fireMoved(shown, point, done) end
 			end or nil)
-			pager:SetHint(dot and EDIT_HINT or PREVIEW_HINT)
+			pager:SetHint(meshState == "failed" and FAILED_HINT or dot and EDIT_HINT or PREVIEW_HINT)
 		end
 	end
 	if type(GunsTab.AddPager) == "function" then
@@ -9401,7 +9515,8 @@ guarded("Settings", function()
 		return value == default
 	end
 
-	local function saveSettings()
+	-- The settings file's contents: the settings that differ from the defaults, and the asset choices.
+	local function encodeSettings()
 		local savedSettings = {}
 		for key, value in pairs(CW.Settings) do
 			if key ~= "ASSET_SELECTIONS" and key ~= "SOUND_ID" and key ~= "AUTO_RELOAD_LABEL_PATH"
@@ -9432,9 +9547,17 @@ guarded("Settings", function()
 		local ok, encoded = pcall(HttpService.JSONEncode, HttpService, out)
 		if not ok then
 			CW.Warn("Failed to encode settings")
-			return
+			return nil
 		end
+		return encoded
+	end
 
+	-- After a settings slot is loaded into the settings file, this run must not write over it (savesStopped).
+	local savesStopped = false
+	local function saveSettings()
+		if savesStopped then return end
+		local encoded = encodeSettings()
+		if not encoded then return end
 		local saved, err = pcall(writefile, CW.Paths.SETTINGS_FILE, encoded)
 		if not saved then CW.Warn("Could not save settings: " .. tostring(err)) end
 	end
@@ -9448,6 +9571,11 @@ guarded("Settings", function()
 			saveSettings()
 		end)
 	end
+	local function stopSaving()
+		savesStopped = true
+		if saveThread then task.cancel(saveThread) end
+		saveThread = nil
+	end
 
 	General:Button({
 		Title = "Save Now",
@@ -9459,6 +9587,179 @@ guarded("Settings", function()
 	if resetInterface then
 		General:Button({ Title = "Reset Interface", Callback = function() resetInterface() end })
 	end
+
+	-- Settings slots: named copies of every setting, each a file in SETTINGS_SLOTS_FOLDER written like the settings
+	-- file. Saving copies the settings in use into a slot. Loading makes a slot the settings in use and runs
+	-- CycleWare again (CW.restart), so every module and control starts from it, as on a fresh start.
+	guarded("Settings Slots", function()
+		if not CAPS.files then return end
+		local SLOTS = CW.Paths.SETTINGS_SLOTS_FOLDER
+		local Slots = SettingsTab:AddSubSection("Settings Slots", false)
+		local status = Slots:AddLabel("")
+		local function showStatus(extra)
+			local slot = CW.Settings.SETTINGS_SLOT
+			local text = slot ~= "" and ("In use: " .. slot .. ". ") or ""
+			status:Set(text .. (extra or "Save the settings you have now to a slot, or load one."))
+		end
+
+		local function slotPath(name) return SLOTS .. "/" .. name .. ".json" end
+		local function slotNames()
+			local names = {}
+			local ok, files = pcall(listfiles, SLOTS)
+			for _, path in ipairs(ok and type(files) == "table" and files or {}) do
+				local name = tostring(path):match("([^/\\]+)%.json$")
+				if name then table.insert(names, name) end
+			end
+			table.sort(names, function(a, b) return a:lower() < b:lower() end)
+			return names
+		end
+		-- A slot name is also a file name: letters, digits, spaces, - and _, at most 32.
+		local function cleanName(text)
+			local name = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+			if name == "" or #name > 32 or name:find("[^%w%s%-_]") then return nil end
+			return name
+		end
+
+		-- The settings in use, written into a slot. The slot keeps its own name, and the settings in use now say they
+		-- are that slot's (kept only when the slot was written).
+		local function writeSlot(name)
+			local previous = CW.Settings.SETTINGS_SLOT
+			CW.Settings.SETTINGS_SLOT = name
+			local encoded = encodeSettings()
+			if not isfolder(SLOTS) then pcall(makefolder, SLOTS) end
+			local ok, err = false, "the settings could not be encoded"
+			if encoded then ok, err = pcall(writefile, slotPath(name), encoded) end
+			if not ok then
+				CW.Settings.SETTINGS_SLOT = previous
+				CW.Warn("Could not save the settings slot " .. name .. ": " .. tostring(err))
+				return false
+			end
+			scheduleSave()
+			return true
+		end
+
+		local picker -- the dropdown of slots
+		-- Lists the slots again and selects `wanted`, else the slot in use, else the first.
+		local function refreshPicker(wanted)
+			local names = slotNames()
+			local options = #names > 0 and names or { "None" }
+			picker:Refresh(options)
+			local chosen = (wanted and table.find(names, wanted) and wanted)
+				or (table.find(names, CW.Settings.SETTINGS_SLOT) and CW.Settings.SETTINGS_SLOT) or options[1]
+			picker:Set(chosen, true)
+		end
+		local function selectedSlot()
+			local name = picker:Get()
+			return name and table.find(slotNames(), name) and name or nil
+		end
+
+		-- Load and Delete throw away settings, so they ask for a second press within 3 seconds.
+		local armed = {}
+		local function confirmed(action, row, index)
+			local now = os.clock()
+			if armed[action] and now - armed[action] < 3 then
+				armed[action] = nil
+				return true
+			end
+			armed[action] = now
+			if row and row.Flash then row:Flash(index, "Sure?", 3) end
+			return false
+		end
+
+		local newRow = Slots:InputRow({
+			Fields = { { Key = "name", Placeholder = "Slot name" } },
+			Buttons = { { Text = "Save", Callback = function(values, row)
+				local name = cleanName(values.name)
+				if not name then
+					row:Flash(1, "Invalid")
+					return
+				end
+				local replaced = table.find(slotNames(), name) ~= nil
+				if not writeSlot(name) then
+					row:Flash(1, "Failed")
+					return
+				end
+				row:Clear()
+				row:Flash(1, replaced and "Replaced" or "Saved")
+				refreshPicker(name)
+				showStatus()
+			end } },
+		})
+		if not newRow then -- an old CWUI without input rows
+			Slots:AddLabel("Update CWUI.lua to name and save settings slots.")
+			return
+		end
+
+		picker = Slots:Dropdown({ Title = "Slot", Options = { "None" }, Default = "None", Callback = function() end })
+
+		local function load(row)
+			local name = selectedSlot()
+			if not name then
+				row:Flash(1, "None")
+				return
+			end
+			if not confirmed("load", row, 1) then return end
+			local read, raw = pcall(readfile, slotPath(name))
+			local parsed, slot = false, nil
+			if read then parsed, slot = pcall(HttpService.JSONDecode, HttpService, raw) end
+			if not (parsed and type(slot) == "table" and type(slot.Settings) == "table") then
+				row:Flash(1, "Broken")
+				return
+			end
+			-- The slot becomes the settings file; nothing this run still has may be saved over it.
+			slot.Settings.SETTINGS_SLOT = name
+			local encodedOK, encoded = pcall(HttpService.JSONEncode, HttpService, slot)
+			stopSaving()
+			local written = encodedOK and pcall(writefile, CW.Paths.SETTINGS_FILE, encoded)
+			if not written then
+				savesStopped = false
+				row:Flash(1, "Failed")
+				return
+			end
+			CW.Log("Loading the settings slot " .. name .. ": running CycleWare again")
+			local restarted, why = CW.restart()
+			if not restarted then
+				CW.Warn("Could not run CycleWare again (" .. tostring(why) .. ")")
+				showStatus("Loaded " .. name .. ". Run CycleWare again to use it; changes made until then are not saved.")
+			end
+		end
+
+		local actions = Slots:InputRow({
+			Buttons = {
+				{ Text = "Load", Callback = function(_, row) load(row) end },
+				{ Text = "Update", Callback = function(_, row)
+					local name = selectedSlot()
+					if not name then
+						row:Flash(2, "None")
+						return
+					end
+					row:Flash(2, writeSlot(name) and "Saved" or "Failed")
+					showStatus()
+				end },
+				{ Text = "Delete", Callback = function(_, row)
+					local name = selectedSlot()
+					if not name then
+						row:Flash(3, "None")
+						return
+					end
+					if not confirmed("delete", row, 3) then return end
+					if pcall(delfile, slotPath(name)) then
+						if CW.Settings.SETTINGS_SLOT == name then
+							CW.Settings.SETTINGS_SLOT = ""
+							scheduleSave()
+						end
+						refreshPicker()
+						showStatus()
+					else
+						row:Flash(3, "Failed")
+					end
+				end },
+			},
+		})
+		if not CAPS.delfile then actions:SetButtonVisible(3, false) end
+		refreshPicker()
+		showStatus()
+	end)
 end)
 
 local soundsMigrated = false
@@ -9483,7 +9784,14 @@ end)
 if not uiOk then
 	warn("[CW] UI failed to load: " .. tostring(uiError))
 end
+-- The chosen meshes (started in the Texture module) get a few seconds to arrive before the window can open, so the
+-- Guns tab never shows a gun's own pieces in place of its mesh.
+loadingScreen.step("Loading meshes", 0.9)
+if CW.waitForMeshes then pcall(CW.waitForMeshes, 8) end
 loadingScreen.close(false, function()
-	if CW.UIWindow then pcall(CW.UIWindow.SetVisible, CW.UIWindow, true) end
+	local window = CW.UIWindow
+	if not window then return end
+	window.Ready = true
+	pcall(window.SetVisible, window, true)
 end)
 end
