@@ -2139,6 +2139,11 @@ end
 --          pager:SetModel(model, manterCâmera, centro, tamanho): mostra um Model (ou nada, com nil) e destrói o
 --          anterior. O Model chega com o comprimento no eixo Z. A prévia centraliza e enquadra a caixa dada (centro e
 --          tamanho, no espaço do Model) ou, sem ela, a do próprio Model.
+--          pager:SetHandle(peça, aoMover): uma peça do Model que se arrasta com o mouse (o ponto de tiro, na aba
+--          Guns). Arrastar começando nela a move no plano da tela; arrastar fora dela gira, como sempre. A cada passo,
+--          aoMover(posição no espaço do Model, terminou); no fim, terminou = true. Enquanto houver uma, a prévia não
+--          gira sozinha. Some com o próximo SetModel ou com SetHandle(nil).
+--          pager:SetHint(texto): troca o texto de ajuda (nil volta ao de o.Hint).
 local PAGER_YAW, PAGER_PITCH = math.rad(70), math.rad(-12) -- de lado, um pouco de cima
 local PAGER_SPIN = math.rad(30)                            -- graus por segundo
 local PAGER_FOV = 28                                       -- pouca perspectiva: a ponta que vem não incha
@@ -2189,7 +2194,7 @@ function Tab:AddPager(o)
 		BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Position = view.Position, Size = view.Size,
 		ZIndex = 2, Parent = header,
 	})
-	new("TextLabel", {
+	local hint = new("TextLabel", {
 		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 4),
 		Size = UDim2.new(1, -16, 0, 18), Text = o.Hint or "", TextColor3 = "SubText", TextSize = 13,
 		FontFace = Fonts.Body, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3, Parent = surface,
@@ -2197,8 +2202,10 @@ function Tab:AddPager(o)
 
 	local pager, pages, current = {}, {}, 0
 	local model, size = nil, Vector3.one
+	local shift = Vector3.zero -- quanto o Model foi deslocado para ficar centralizado
 	local yaw, pitch, distance = PAGER_YAW, PAGER_PITCH, 10
 	local autoRotate = true
+	local handlePart, handleMoved, handleDrag = nil, nil, nil -- a peça que se arrasta e o arraste dela
 
 	local function place()
 		local rotation = CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0)
@@ -2236,19 +2243,61 @@ function Tab:AddPager(o)
 		place()
 	end
 
-	-- Arrastar gira; a página não rola enquanto isso (no toque, arrastar rolaria).
+	-- Onde um ponto da prévia (no espaço dela, já centralizado) aparece na tela, e a que distância da câmera.
+	local function toScreen(point)
+		local p = camera.CFrame:PointToObjectSpace(point)
+		local px = view.AbsoluteSize
+		if p.Z > -1e-3 or px.X <= 0 or px.Y <= 0 then return nil end
+		local tanV = math.tan(math.rad(camera.FieldOfView) / 2)
+		local tanH = tanV * px.X / px.Y
+		local x, y = p.X / (-p.Z * tanH), p.Y / (-p.Z * tanV)
+		return view.AbsolutePosition + Vector2.new((x + 1) / 2 * px.X, (1 - y) / 2 * px.Y), -p.Z
+	end
+	-- A posição de um clique no espaço de AbsolutePosition. O clique caiu na prévia (é dela o InputBegan): se ele
+	-- não cai dentro dela sem a faixa de cima do Roblox, a faixa é somada.
+	local function clickPoint(i)
+		local pos = Vector2.new(i.Position.X, i.Position.Y)
+		if insideGui(surface, pos) then return pos end
+		local ok, inset = pcall(GuiService.GetGuiInset, GuiService)
+		return ok and pos + inset or pos
+	end
+	-- O clique começa em cima da peça que se arrasta (até 16 px dela, ou o tamanho dela na tela)?
+	local function onHandle(i)
+		if not (handlePart and handlePart.Parent) then return false end
+		local screen, depth = toScreen(handlePart.Position)
+		if not screen then return false end
+		local px = view.AbsoluteSize.Y
+		local radius = handlePart.Size.X / 2 / (2 * depth * math.tan(math.rad(camera.FieldOfView) / 2)) * px
+		return (clickPoint(i) - screen).Magnitude <= math.max(16, radius + 6)
+	end
+	local function finishHandle()
+		local drag = handleDrag
+		handleDrag = nil
+		if drag and handlePart and handlePart.Parent and handleMoved then
+			safeCall(handleMoved, handlePart.Position + shift, true)
+		end
+	end
+
+	-- Arrastar gira (ou move a peça que se arrasta, começando nela); a página não rola enquanto isso (no toque,
+	-- arrastar rolaria).
 	local dragging, lastPos, lastClick = false, nil, 0
 	surface.InputBegan:Connect(function(i)
 		if not isClick(i) or dragging then return end
-		local now = os.clock()
-		if now - lastClick < 0.35 then reset() end
-		lastClick = now
+		if onHandle(i) then
+			handleDrag = true
+			lastClick = 0
+		else
+			local now = os.clock()
+			if now - lastClick < 0.35 then reset() end
+			lastClick = now
+		end
 		dragging, lastPos = true, i.Position
 		window:_lockScroll(true)
 	end)
 	local function stopDragging()
 		if not dragging then return end
 		dragging = false
+		finishHandle()
 		window:_lockScroll(false)
 	end
 	window:_connect(UserInputService.InputEnded, function(i)
@@ -2284,6 +2333,17 @@ function Tab:AddPager(o)
 		elseif dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
 			local delta = i.Position - lastPos
 			lastPos = i.Position
+			if handleDrag then
+				-- A peça anda com o mouse, no plano da tela, na distância em que está.
+				if not (handlePart and handlePart.Parent) then return end
+				local _, depth = toScreen(handlePart.Position)
+				if not depth then return end
+				local perPixel = 2 * depth * math.tan(math.rad(camera.FieldOfView) / 2) / math.max(view.AbsoluteSize.Y, 1)
+				local cf = camera.CFrame
+				handlePart.Position += (cf.RightVector * delta.X - cf.UpVector * delta.Y) * perPixel
+				if handleMoved then safeCall(handleMoved, handlePart.Position + shift, false) end
+				return
+			end
 			yaw -= delta.X * 0.01
 			pitch = math.clamp(pitch - delta.Y * 0.01, -1.4, 1.4)
 			place()
@@ -2298,7 +2358,7 @@ function Tab:AddPager(o)
 			stopDragging()
 			return
 		end
-		if not model or dragging or not autoRotate or reducedMotion() then return end
+		if not model or dragging or handlePart or not autoRotate or reducedMotion() then return end
 		yaw += PAGER_SPIN * math.min(dt, 0.1)
 		place()
 	end)
@@ -2371,13 +2431,15 @@ function Tab:AddPager(o)
 		local zoomed = model and distance / fitDistance() or 1
 		if model then model:Destroy() end
 		model = newModel
+		handlePart, handleMoved, handleDrag = nil, nil, nil
+		shift = Vector3.zero
 		empty.Visible = newModel == nil
 		if not newModel then return end
 		if not (frameCenter and frameSize) then
 			local ok, cf, bounds = pcall(newModel.GetBoundingBox, newModel)
 			if ok then frameCenter, frameSize = cf.Position, bounds end
 		end
-		if frameCenter then pcall(newModel.TranslateBy, newModel, -frameCenter) end
+		if frameCenter and pcall(newModel.TranslateBy, newModel, -frameCenter) then shift = frameCenter end
 		size = frameSize or size
 		newModel.Parent = view
 		if keepCamera then
@@ -2386,6 +2448,16 @@ function Tab:AddPager(o)
 		else
 			reset()
 		end
+	end
+
+	function pager:SetHandle(part, onMove)
+		local valid = typeof(part) == "Instance" and part:IsA("BasePart") and model ~= nil and part:IsDescendantOf(model)
+		handlePart = valid and part or nil
+		handleMoved = valid and onMove or nil
+		handleDrag = nil
+	end
+	function pager:SetHint(text)
+		hint.Text = text or o.Hint or ""
 	end
 
 	-- A primeira página aparece já; a prévia ajusta a distância quando a página ganha tamanho.
