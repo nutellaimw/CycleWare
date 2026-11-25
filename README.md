@@ -4,23 +4,36 @@
      alt="Cycle-Ware Logo"
      width="247">
 
-<h1>Cycle-Ware</h1>
+<h1>CycleWare</h1>
 
 </div>
 
 
-## (CURRENTLY UNDER MAINTENANCE)
+## (CURRENTLY BEING UPDATED)
 
-A Prison Life script with the main purpose to apply visual hitmarkers and other *small assists. 
+CycleWare is a Prison Life script with the main purpose to apply visual hitmarkers and other *small assists. 
 Fully Customizable, and open source.
 
 *(Auto sprint, auto reload, chat toggle, and auto slot)
 
 ## Requirements
 
-You executor must support these sUNC functions:
+You executor must support these functions:
 
-TO BE ADDED
+loadstring  
+request
+getgenv
+gethui
+cloneref
+setclipboard
+hookmetamethod
+getnamecallmethod
+checkcaller
+newcclosure
+firesignal
+getconnections
+debug.getupvalues, debug.getupvalue,  debug.getinfo, debug.setupvalue
+Full File Library
 
 ## Other
 
