@@ -18,7 +18,7 @@ Fully Customizable, and open source.
 
 ## Requirements
 
-You executor must support these functions:
+You executor must support these functions in order to have full support:
 
 loadstring;  
 request;
