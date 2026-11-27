@@ -20,20 +20,23 @@ Fully Customizable, and open source.
 
 You executor must support these functions:
 
-loadstring  
-request
-getgenv
-gethui
-cloneref
-setclipboard
-hookmetamethod
-getnamecallmethod
-checkcaller
-newcclosure
-firesignal
-getconnections
-debug.getupvalues, debug.getupvalue,  debug.getinfo, debug.setupvalue
-Full File Library
+loadstring;  
+request;
+getgenv;
+gethui;
+cloneref;
+setclipboard;
+hookmetamethod;
+getnamecallmethod;
+checkcaller;
+newcclosure;
+firesignal;
+getconnections;
+debug.getupvalues;
+debug.getupvalue;  
+debug.getinfo;
+debug.setupvalue;
+Full File Library.
 
 ## Other
 
