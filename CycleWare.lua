@@ -782,37 +782,28 @@ function CW.restart()
 	return true
 end
 
---// Auto Execute -----------------------------------------------------------------------
--- Runs CycleWare by itself when the player joins Prison Life. Executors run every script in their auto-execute
--- folder (usually "autoexec", next to the workspace) in every game they attach to, so the loader written there
--- checks the place first, then the AUTO_EXECUTE setting in the settings file: turning the option off stops it
--- even where the file can't be deleted. Scripts can write outside the workspace only where the executor lets a
--- path go up with "..": that is checked by reading a file just written in the workspace back through
--- "../workspace/...", since a sandbox that drops ".." finds nothing there. Where the folder can't be reached the
--- player saves the loader there by hand (Copy Loader), and queue_on_teleport still runs it after a teleport.
-CW.Settings.AUTO_EXECUTE = boolOr(_cfg.AUTO_EXECUTE, false)
-CW.AutoExecute = {
+--// Teleport Handler -------------------------------------------------------------------
+-- Brings CycleWare back after a teleport that lands in Prison Life. queue_on_teleport hands the executor code to
+-- run in the next game the player is teleported to; the code queued here runs CycleWare only when that game is
+-- one of PLACES and the option is still on in the settings file (queued code can't be taken back, so turning the
+-- option off works through that check). The next run queues itself again, once per server.
+CW.Settings.TELEPORT_HANDLER = boolOr(_cfg.TELEPORT_HANDLER, false)
+CW.TeleportHandler = {
 	PLACES = { 155615604, 135564683255158 }, -- Prison Life
-	FILE_NAME = "CycleWare-AutoExecute.lua",
-	HEADER = "-- CycleWare Auto Execute (written by CycleWare: Settings > General > Auto Execute).",
-	-- Folder names executors use, as seen from their workspace.
-	WORKSPACES = { "workspace", "Workspace" },
-	FOLDERS = { "autoexec", "autoexecute", "Autoexec", "AutoExec", "Autoexecute", "AutoExecute" },
 }
 
-function CW.AutoExecute.loader()
+function CW.TeleportHandler.loader()
 	local places = {}
-	for _, id in ipairs(CW.AutoExecute.PLACES) do table.insert(places, "[" .. id .. "] = true") end
+	for _, id in ipairs(CW.TeleportHandler.PLACES) do table.insert(places, "[" .. id .. "] = true") end
 	local url = type(_cfg.SCRIPT_URL) == "string" and _cfg.SCRIPT_URL ~= "" and _cfg.SCRIPT_URL or SCRIPT_URL
 	return table.concat({
-		CW.AutoExecute.HEADER,
-		"-- Runs CycleWare when you join Prison Life, while Auto Execute is on. Delete this file to remove it.",
+		"-- CycleWare Teleport Handler: runs CycleWare again after a teleport into Prison Life.",
 		"local PLACES = { " .. table.concat(places, ", ") .. " }",
 		"if not PLACES[game.PlaceId] then return end",
 		"local on = false",
 		"pcall(function()",
 		"\tlocal data = game:GetService(\"HttpService\"):JSONDecode(readfile(" .. string.format("%q", CW.Paths.SETTINGS_FILE) .. "))",
-		"\ton = type(data) == \"table\" and type(data.Settings) == \"table\" and data.Settings.AUTO_EXECUTE == true",
+		"\ton = type(data) == \"table\" and type(data.Settings) == \"table\" and data.Settings.TELEPORT_HANDLER == true",
 		"end)",
 		"if not on then return end",
 		"if not game:IsLoaded() then game.Loaded:Wait() end",
@@ -821,75 +812,65 @@ function CW.AutoExecute.loader()
 	}, "\n")
 end
 
--- The executor's auto-execute folder as a path writefile takes ("../autoexec"), or nil when it can't be reached.
-function CW.AutoExecute.folder()
-	if not CAPS.files then return nil end
-	local probe = CW.Paths.CACHE_FOLDER .. "/.autoexec-check"
-	local token = HttpService:GenerateGUID(false)
-	if not pcall(writefile, probe, token) then return nil end
-	local goesUp = false
-	for _, workspaceName in ipairs(CW.AutoExecute.WORKSPACES) do
-		local ok, back = pcall(readfile, "../" .. workspaceName .. "/" .. probe)
-		goesUp = goesUp or (ok and back == token)
-	end
-	if CAPS.delfile then pcall(delfile, probe) end
-	if not goesUp then return nil end
-	for _, name in ipairs(CW.AutoExecute.FOLDERS) do
-		local ok, exists = pcall(isfolder, "../" .. name)
-		if ok and exists then return "../" .. name end
-	end
-	return nil
-end
-
--- Writes the loader into the auto-execute folder. Returns the folder's name, or nil and why not.
-function CW.AutoExecute.install()
-	local folder = CW.AutoExecute.folder()
-	if not folder then return nil, "unreachable" end
-	local path = folder .. "/" .. CW.AutoExecute.FILE_NAME
-	local loader = CW.AutoExecute.loader()
-	local ok, back = pcall(function()
-		writefile(path, loader)
-		return readfile(path)
-	end)
-	if not ok or back ~= loader then return nil, "write failed" end
-	return folder:sub(4)
-end
-
--- Removes the loader this wrote (only a file that starts with its header). Returns true when it is gone.
-function CW.AutoExecute.uninstall()
-	local folder = CW.AutoExecute.folder()
-	if not folder then return true end
-	local path = folder .. "/" .. CW.AutoExecute.FILE_NAME
-	local okExists, exists = pcall(isfile, path)
-	if not (okExists and exists) then return true end
-	local okRead, content = pcall(readfile, path)
-	local header = CW.AutoExecute.HEADER
-	if not (okRead and type(content) == "string" and content:sub(1, #header) == header) then return false end
-	return CAPS.delfile and pcall(delfile, path) or false
-end
-
--- After a teleport the executor runs what was queued; once per server is enough.
-function CW.AutoExecute.queueTeleport()
-	if not X.queueOnTeleport or CW.State.autoExecuteQueued then return false end
-	local ok = pcall(X.queueOnTeleport, CW.AutoExecute.loader())
-	CW.State.autoExecuteQueued = ok
+-- Queues the loader for the next teleport, once per server. Returns whether it is queued.
+function CW.TeleportHandler.queue()
+	if CW.State.teleportQueued then return true end
+	if not X.queueOnTeleport then return false end
+	local ok = pcall(X.queueOnTeleport, CW.TeleportHandler.loader())
+	CW.State.teleportQueued = ok
 	return ok
+end
+
+--// Executor support ------------------------------------------------------------------
+-- What of CycleWare this executor runs, read from CAPS and X: for the startup report and Settings > General.
+-- Each feature is "full", "limited" (it works another way, said in `limited`) or "none" (it doesn't work here),
+-- with what it needs.
+function CW.supportList()
+	local canDownload = CAPS.httpGet or CAPS.request ~= nil
+	local function row(name, state, needs, limited)
+		return { Name = name, State = state, Needs = needs, Limited = limited }
+	end
+	return {
+		row("Saved settings and asset library", CAPS.files and "full" or "none", "file functions (readfile, writefile...)"),
+		row("Custom images and sounds", CAPS.files and CAPS.customAsset and "full" or "none",
+			CAPS.files and "getcustomasset" or "file functions and getcustomasset"),
+		row("Asset downloads", canDownload and "full" or "none", "request or game:HttpGet"),
+		row("Hitmarker and hit sound", CAPS.hook and "full" or "none", "hookmetamethod"),
+		row("Auto Slot pickup swap", CAPS.hook and "full" or "none", "hookmetamethod"),
+		row("Auto Slot with the game's bar", CAPS.upvalues and "full" or "limited",
+			"getconnections and debug.getupvalue", "works only with Use Old Backpack"),
+		row("Instant Auto Reload", CAPS.signals and "full" or "limited", "firesignal or getconnections",
+			"presses R instead"),
+		row("Interface hidden from the game", CAPS.gethui and "full" or "limited", "gethui", "uses CoreGui instead"),
+		row("Clean re-run", CAPS.getgenv and "full" or "limited", "getgenv", "rejoin before running it again"),
+		row("Removing assets added by ID", CAPS.delfile and "full" or "limited", "delfile",
+			"the file stays in its folder"),
+		row("Teleport Handler", X.queueOnTeleport and "full" or "none", "queue_on_teleport"),
+	}
+end
+
+-- The executor's name and version, when it says (identifyexecutor), else nil.
+function CW.executorName()
+	local identify = (type(identifyexecutor) == "function" and identifyexecutor)
+		or (type(getexecutorname) == "function" and getexecutorname) or nil
+	if not identify then return nil end
+	local ok, name, version = pcall(Exec.call, "identifyexecutor", 2, identify)
+	if not ok or type(name) ~= "string" or name == "" then return nil end
+	return type(version) == "string" and version ~= "" and (name .. " " .. version) or name
 end
 
 --// Startup report -------------------------------------------------------------------
 do
-	local missing = {}
-	if not CAPS.getgenv then table.insert(missing, "getgenv (re-running without rejoining will not be clean)") end
-	if not CAPS.files then table.insert(missing, "file functions (asset library, cursor, textures, sounds and saved settings are disabled; custom IDs last until you rejoin)") end
-	if not CAPS.customAsset then table.insert(missing, "getcustomasset (custom images and sounds are disabled)") end
-	if not CAPS.hook then table.insert(missing, "hookmetamethod/getnamecallmethod (hitmarker and hit sound detection is disabled)") end
-	if not CAPS.signals then table.insert(missing, "firesignal/getconnections (Auto Reload presses R instead of reloading instantly)") end
-	if not CAPS.gethui then table.insert(missing, "gethui (using CoreGui instead)") end
-	if not CAPS.upvalues then table.insert(missing, "getconnections + debug.getupvalue (Auto Slot works only with Use Old Backpack)") end
-	if not CAPS.delfile then table.insert(missing, "delfile (removing a cursor added by ID leaves its PNG in the Cursors folder)") end
-	if not CAPS.httpGet and not CAPS.request then table.insert(missing, "HTTP (asset sync and the UI download are disabled)") end
-	if #missing > 0 then
-		CW.Warn("Missing executor functions: " .. table.concat(missing, "; "))
+	local notes = {}
+	for _, feature in ipairs(CW.supportList()) do
+		if feature.State == "none" then
+			table.insert(notes, feature.Name .. " is off (needs " .. feature.Needs .. ")")
+		elseif feature.State == "limited" then
+			table.insert(notes, feature.Name .. ": " .. feature.Limited .. " (needs " .. feature.Needs .. ")")
+		end
+	end
+	if #notes > 0 then
+		CW.Warn("Not everything works on this executor: " .. table.concat(notes, "; "))
 	end
 end
 
@@ -3883,6 +3864,23 @@ function CW.retryMesh(meshId)
 	end
 end
 
+-- Holds a part we add to a gun at a fixed place in the Handle's space. A Weld given that offset, not a
+-- WeldConstraint: a WeldConstraint made while the gun is out of the workspace (in the Backpack) takes its offset
+-- only when the gun enters it (on equip), from wherever the two parts are then, so a Handle that moved meanwhile
+-- left the part off the hand. Checked in Studio: the Handle moved before entering the workspace put the part about
+-- 47 studs away with a WeldConstraint, and exactly where it belongs with this Weld. That was the M9 you spawn with
+-- (a given gun's parts arrive after it) showing its mesh in front of the player until the next spawn.
+local HANDLE_WELD = "CW_HandleWeld"
+local function weldToHandle(handle, part, offset)
+	part.CFrame = handle.CFrame * offset -- where it shows before the Weld acts (out of the workspace, the preview)
+	local weld = Instance.new("Weld")
+	weld.Name = HANDLE_WELD
+	weld.Part0, weld.Part1 = handle, part
+	weld.C0 = offset
+	weld.Parent = part
+	return weld
+end
+
 -- nil while the mesh loads (the gun keeps its pieces; it is built when the mesh is there) or without a Handle yet.
 local function buildCustomMesh(tool, cfg)
 	local handle = tool:FindFirstChild("Handle")
@@ -3899,15 +3897,9 @@ local function buildCustomMesh(tool, cfg)
 	mesh.CanQuery   = false
 	mesh.CanTouch   = false
 	mesh.Massless   = true
-	mesh.CFrame = handle.CFrame
-		* CFrame.new(cfg.offset)
-		* CFrame.Angles(math.rad(cfg.rotation.X), math.rad(cfg.rotation.Y), math.rad(cfg.rotation.Z))
+	weldToHandle(handle, mesh, CFrame.new(cfg.offset)
+		* CFrame.Angles(math.rad(cfg.rotation.X), math.rad(cfg.rotation.Y), math.rad(cfg.rotation.Z)))
 	mesh.Parent = tool
-
-	local weld = Instance.new("WeldConstraint")
-	weld.Part0  = handle
-	weld.Part1  = mesh
-	weld.Parent = mesh
 	CW.Log("Custom mesh built for " .. tool.Name)
 	return mesh
 end
@@ -3948,6 +3940,10 @@ end
 local function applyCustomTexture(tool, cfg)
 	local textureId = CW.Assets.weaponTextures[tool.Name]
 	local custom = tool:FindFirstChild(cfg.meshName)
+	if custom and not custom:FindFirstChild(HANDLE_WELD) then -- built by an older run, with a WeldConstraint
+		custom:Destroy()
+		custom = nil
+	end
 	if textureId then
 		if not custom then custom = buildCustomMesh(tool, cfg) end
 		if not custom then return false end -- no Handle yet, or the mesh is loading
@@ -4350,7 +4346,8 @@ local function applyCustomMesh(tool, entry)
 	local meshId = entry.Mesh or entry.Id
 	local adjust = adjustOf(entry)
 	local offset = MeshProfiles.fireOffset(tool.Name, CW.CustomIds.selectionOf(entry.Id))
-	local key = string.format("%s|%.3f|%.3f|%.3f|%.3f|%.2f|%.2f|%.2f|%.4f|%.4f|%.4f", meshId, adjust.Size, adjust.Right,
+	-- "w2": held by a Weld (weldToHandle); a part of an older run (a WeldConstraint) has another key and is rebuilt.
+	local key = string.format("w2|%s|%.3f|%.3f|%.3f|%.3f|%.2f|%.2f|%.2f|%.4f|%.4f|%.4f", meshId, adjust.Size, adjust.Right,
 		adjust.Up, adjust.Forward, adjust.Turn, adjust.Tilt, adjust.Roll, offset.X, offset.Y, offset.Z)
 	local part = tool:FindFirstChild(MESH_PART)
 	if part and part:GetAttribute("CW_MeshKey") ~= key then
@@ -4373,7 +4370,7 @@ local function applyCustomMesh(tool, entry)
 		part.Name = MESH_PART
 		part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch, part.Massless = false, false, false, false, true
 		part.Size = template.MeshSize * (box.Z / math.max(longest, 1e-3)) * adjust.Size
-		part.CFrame = handle.CFrame * CFrame.new(moved) * turned * rotation
+		weldToHandle(handle, part, CFrame.new(moved) * turned * rotation)
 		part:SetAttribute("CW_MeshKey", key)
 		-- The Muzzle goes where the same size, move and turn take it (from the gun's own place for it, plus the
 		-- mesh's fire point offset).
@@ -4383,9 +4380,6 @@ local function applyCustomMesh(tool, entry)
 			part:SetAttribute("CW_MuzzleAt", firePoint(origin, center, entry, offset))
 		end
 		part.Parent = tool
-		local weld = Instance.new("WeldConstraint")
-		weld.Part0, weld.Part1 = handle, part
-		weld.Parent = part
 	end
 	local texture = CW.Assets.weaponTextures[tool.Name] or (entry.Texture and "rbxassetid://" .. entry.Texture) or ""
 	if part.TextureID ~= texture then pcall(function() part.TextureID = texture end) end
@@ -6980,7 +6974,8 @@ local function customIdEditor(opts, view)
 
 	-- An ID is saved only once Roblox has loaded it (audio as audio, image as image); a new name for an ID
 	-- that is already saved needs no check. Pressing again while a check runs starts over with what is typed.
-	function editor.save(values)
+	-- asNew: added as another ID even while one is being edited (that one stays as it is).
+	function editor.save(values, asNew)
 		attempt += 1
 		local mine = attempt
 		local weapon = editor.weapon()
@@ -6989,7 +6984,7 @@ local function customIdEditor(opts, view)
 			view.flash("Invalid")
 			return
 		end
-		local oldId = editor.editingId
+		local oldId = not asNew and editor.editingId or nil
 		local known = (oldId and newId == oldId) or (not oldId and CW.CustomIds.get(category, weapon, newId) ~= nil)
 		if known then
 			commit(values, weapon, newId, oldId)
@@ -7073,45 +7068,67 @@ local function addCustomIdRow(section, opts)
 	return row
 end
 
--- A gun's sound IDs, always shown in its drawer, in a panel of their own:
---   [Audio ID or link] [Name (optional)]
---   [Add | Save] [Cancel] [Edit] [Remove]
--- Add puts a new ID in this gun's list. Edit loads the selected custom ID into the boxes, and Save keeps the
--- change. Cancel drops what was typed, or the edit, and nothing is applied. Remove deletes the selected custom
--- ID (the edited one while editing). A button is shown only while it can do something.
--- opts: as customIdEditor. Returns { refresh } (the drawer calls it when its sound changes).
+-- A gun's mesh or sound IDs, always shown in its drawer, in a panel of their own:
+--   [ID or link] [Name (optional)]
+--   [Add | Save] [Add] [Cancel] [Remove]
+-- The boxes follow what the drawer has chosen: a custom ID shows its ID and name there, so changing them and
+-- pressing Save changes that ID (another ID in its place keeps its choices). Add, next to Save, puts a different
+-- typed ID in the list as one more, leaving the chosen one as it is. With nothing custom chosen the boxes are for
+-- a new ID (Add). Cancel puts back what the boxes showed. Remove deletes the chosen custom ID. A button other
+-- than the first is shown only while it can do something.
+-- opts: as customIdEditor. Returns { refresh } (the drawer calls it when its choice changes).
 local function addAssetEditor(section, opts)
 	local CAPTION = opts.kind == "Mesh" and "Add a mesh by its ID" or "Add a sound by its ID"
 	local group = section:Group(CAPTION)
 	local fields, buttons, editor
+	local shown = false -- the choice whose values the boxes hold ("" for none; false until the first look)
+
+	-- Fills the boxes from the drawer's choice: its ID and name when it is a custom ID, empty otherwise.
+	local function load()
+		local id = editor.selectedId()
+		shown = id or ""
+		editor.cancel()
+		local entry = editor.entry(id)
+		editor.editingId = entry and entry.Id or nil
+		if entry then
+			fields:Set("id", tostring(entry.Id))
+			fields:Set("name", entry.Name or "")
+		else
+			fields:Clear()
+		end
+	end
+	-- Whether the boxes hold something other than what load() put there.
+	local function changed(entry)
+		local id, name = fields:Get("id") or "", fields:Get("name") or ""
+		if entry then return id ~= tostring(entry.Id) or name ~= (entry.Name or "") end
+		return id ~= "" or name ~= ""
+	end
 
 	local function refresh()
 		if not (fields and buttons) then return end
-		local editing = editor.editingId ~= nil
-		local selected = editor.selectedId()
-		local typed = (fields:Get("id") or "") ~= "" or (fields:Get("name") or "") ~= ""
-		buttons:SetButtonText(1, editing and "Save" or "Add")
+		if (editor.selectedId() or "") ~= shown then load() end
+		local entry = editor.entry(editor.editingId)
+		local typedId = CW.CustomIds.parse(fields:Get("id"))
+		buttons:SetButtonText(1, entry and "Save" or "Add")
 		if buttons.SetButtonVisible then
-			buttons:SetButtonVisible(2, editing or typed)                               -- Cancel
-			buttons:SetButtonVisible(3, selected ~= nil and selected ~= editor.editingId) -- Edit
-			buttons:SetButtonVisible(4, (editor.editingId or selected) ~= nil)          -- Remove
+			buttons:SetButtonVisible(2, entry ~= nil and typedId ~= nil and typedId ~= tostring(entry.Id)) -- Add
+			buttons:SetButtonVisible(3, changed(entry))                                                  -- Cancel
+			buttons:SetButtonVisible(4, entry ~= nil)                                                    -- Remove
 		end
 		if group.SetCaption then
-			local entry = editing and editor.entry(editor.editingId)
 			group:SetCaption(entry and ("Editing " .. entry.Name) or CAPTION)
 		end
 	end
-	local function reset()
-		editor.cancel()
-		fields:Clear()
-		editor.editingId = nil
+	-- Back to what the drawer has chosen (after a save, a removal or Cancel).
+	local function reload()
+		shown = false
 		refresh()
 	end
 
 	editor = customIdEditor(opts, {
 		flash = function(text, seconds) buttons:Flash(1, text, seconds) end,
 		saved = function(text)
-			reset()
+			reload()
 			buttons:Flash(1, text)
 		end,
 	})
@@ -7120,24 +7137,22 @@ local function addAssetEditor(section, opts)
 		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
 	}, {}, refresh)
 	buttons = inputRow(group, {}, {
-		{ Text = "Add", Title = "Add ID", Callback = function()
+		{ Text = "Add", Title = "Save or Add ID", Callback = function()
 			editor.save({ id = fields:Get("id"), name = fields:Get("name") })
 		end },
-		{ Text = "Cancel", Title = "Cancel", Callback = reset },
-		{ Text = "Edit", Title = "Edit Selected ID", Callback = function()
-			local entry = editor.entry(editor.selectedId())
-			if not entry then return end
-			editor.editingId = entry.Id
-			fields:Set("id", entry.Id)
-			fields:Set("name", entry.Name)
-			refresh()
+		{ Text = "Add", Title = "Add as Another ID", Callback = function()
+			editor.save({ id = fields:Get("id"), name = fields:Get("name") }, true)
+		end },
+		{ Text = "Cancel", Title = "Cancel", Callback = function()
+			editor.cancel()
+			reload()
 		end },
 		{ Text = "Remove", Title = "Remove Selected ID", Callback = function()
-			if editor.remove(editor.editingId or editor.selectedId()) then reset() end
+			if editor.remove(editor.editingId) then reload() end
 		end },
 	})
 	refresh()
-	table.insert(customIdActionUpdaters, refresh) -- the sound can also change from elsewhere (a library refresh)
+	table.insert(customIdActionUpdaters, refresh) -- the choice can also change from elsewhere (a library refresh)
 	return { refresh = refresh }
 end
 
@@ -10449,8 +10464,31 @@ guarded("Settings", function()
 		end
 	end)
 
-	-- General: the asset library, putting the interface back to its defaults, and Auto Execute.
+	-- General: what this executor supports, the asset library, putting the interface back to its defaults,
+	-- and the Teleport Handler.
 	local General = SettingsTab:AddSubSection("General", false)
+	-- What this executor runs (CW.supportList): "Full Support" when it runs everything.
+	do
+		local executor = CW.executorName()
+		local supported, limited, missing = {}, {}, {}
+		for _, feature in ipairs(CW.supportList()) do
+			if feature.State == "full" then
+				table.insert(supported, "• " .. feature.Name)
+			elseif feature.State == "limited" then
+				table.insert(limited, "• " .. feature.Name .. ": " .. feature.Limited .. " (needs " .. feature.Needs .. ")")
+			else
+				table.insert(missing, "• " .. feature.Name .. " (needs " .. feature.Needs .. ")")
+			end
+		end
+		if executor then General:AddLabel("Executor: " .. executor) end
+		if #limited == 0 and #missing == 0 then
+			General:AddLabel("Full Support")
+		else
+			General:AddLabel("Supported:\n" .. table.concat(supported, "\n"))
+			if #limited > 0 then General:AddLabel("Limited:\n" .. table.concat(limited, "\n")) end
+			if #missing > 0 then General:AddLabel("Not supported:\n" .. table.concat(missing, "\n")) end
+		end
+	end
 	General:AddLabel("Every change is saved by itself about a second later.")
 	General:Button({
 		Title = "Refresh Asset Library",
@@ -10467,70 +10505,19 @@ guarded("Settings", function()
 		General:Button({ Title = "Reset Interface", Callback = function() resetInterface() end })
 	end
 
-	-- Auto Execute (CW.AutoExecute): the switch puts the loader in the executor's auto-execute folder, or, where
-	-- CycleWare can't reach it, says so and offers the loader to save there by hand.
-	guarded("Auto Execute", function()
-		if not CAPS.files then return end
-		local status, copyButton
-		local function show(text, manual)
-			pcall(function()
-				status:Set(text or "")
-				status.Instance.Visible = text ~= nil
-			end)
-			pcall(function() copyButton.Instance.Visible = manual == true end)
-		end
-
-		local applied = 0
-		local function apply()
-			applied += 1
-			local this = applied
-			if CW.Settings.AUTO_EXECUTE then
-				local folder = CW.AutoExecute.install()
-				if this ~= applied then return end -- switched again meanwhile
-				if folder then
-					show("CycleWare runs by itself when you join Prison Life. The loader is in your executor's "
-						.. folder .. " folder.")
-				else
-					local queued = CW.AutoExecute.queueTeleport()
-					show("CycleWare can't reach your executor's auto-execute folder. Copy the loader and save it there "
-						.. "as a .lua file." .. (queued and " Until then, it runs again after a teleport." or ""), true)
-				end
-			else
-				CW.AutoExecute.uninstall()
-				if this ~= applied then return end
-				show(nil)
-			end
-		end
-
+	-- Teleport Handler (CW.TeleportHandler): only where the executor has queue_on_teleport; the support list
+	-- above says so where it hasn't.
+	if X.queueOnTeleport then
 		General:Toggle({
-			Title = "Auto Execute",
-			Default = CW.Settings.AUTO_EXECUTE == true,
+			Title = "Teleport Handler",
+			Default = CW.Settings.TELEPORT_HANDLER == true,
 			Callback = function(enabled)
-				CW.Settings.AUTO_EXECUTE = enabled == true
+				CW.Settings.TELEPORT_HANDLER = enabled == true
 				scheduleSave()
-				task.spawn(apply)
+				if enabled then task.spawn(CW.TeleportHandler.queue) end
 			end,
 		})
-		status = General:AddLabel("")
-		copyButton = General:Button({
-			Title = "Copy Loader",
-			Callback = function()
-				local loader = CW.AutoExecute.loader()
-				local copied = X.setclipboard and pcall(X.setclipboard, loader)
-				if not copied then
-					-- No clipboard: the loader goes in the workspace, to move from there.
-					local saved = pcall(writefile, CW.Paths.CURSOR_ROOT .. "/AutoExecute.lua", loader)
-					show(saved and ("The loader is saved as " .. CW.Paths.CURSOR_ROOT .. "/AutoExecute.lua in your "
-						.. "executor's workspace. Move it to its auto-execute folder.") or "The loader could not be copied.", true)
-					return
-				end
-				copyButton:SetText("Copied")
-				task.delay(1.5, function() pcall(function() copyButton:SetText("Copy Loader") end) end)
-			end,
-		})
-		show(nil)
-		if CW.Settings.AUTO_EXECUTE then task.spawn(apply) end -- keeps the loader up to date
-	end)
+	end
 
 	-- Settings slots: named copies of every setting, each a file in SETTINGS_SLOTS_FOLDER written like the settings
 	-- file. Saving copies the settings in use into a slot. Loading makes a slot the settings in use and runs
@@ -10652,8 +10639,8 @@ guarded("Settings", function()
 			end
 			-- The slot becomes the settings file; nothing this run still has may be saved over it.
 			slot.Settings.SETTINGS_SLOT = name
-			-- Auto Execute belongs to this executor, not to a slot: it stays as it is.
-			slot.Settings.AUTO_EXECUTE = CW.Settings.AUTO_EXECUTE == true or nil
+			-- The Teleport Handler belongs to this executor, not to a slot: it stays as it is.
+			slot.Settings.TELEPORT_HANDLER = CW.Settings.TELEPORT_HANDLER == true or nil
 			local encodedOK, encoded = pcall(HttpService.JSONEncode, HttpService, slot)
 			stopSaving()
 			local written = encodedOK and pcall(writefile, CW.Paths.SETTINGS_FILE, encoded)
@@ -10741,6 +10728,8 @@ local STEP_NAMES = {
 local MESH_WAIT = 2 -- seconds the chosen meshes get before the window opens (one still loading shows "Loading the mesh")
 runModule("Finish", function()
 	if not isCurrentRun() then return end
+	-- Before anything here can stop: a run whose interface failed still comes back after a teleport.
+	if CW.Settings.TELEPORT_HANDLER then task.spawn(CW.TeleportHandler.queue) end
 	local window = interface.window
 	if not window then
 		loadingScreen.finish("failed", interface.failure or "The interface could not start. Run CycleWare again.")
