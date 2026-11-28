@@ -2760,8 +2760,11 @@ function Window:AddTab(o)
 	return tab
 end
 
-function Window:SetVisible(v) self._shell.Visible = v end
-function Window:Toggle() self._shell.Visible = not self._shell.Visible end
+function Window:SetVisible(v)
+	self._shell.Visible = v
+	if not v and self._dialog then self._dialog.close() end -- a question can't wait behind a hidden window
+end
+function Window:Toggle() self:SetVisible(not self._shell.Visible) end
 
 -- A line over the content for what the host needs the player to know (CycleWare: the parts that did not load).
 -- SetNotice(nil) or its Dismiss button takes it away; the pages move down while it shows.
@@ -2798,6 +2801,155 @@ function Window:SetNotice(text)
 	dismiss.MouseButton1Click:Connect(function() self:SetNotice(nil) end)
 	self._notice = notice
 	place(NOTICE_H)
+end
+
+--// Confirmation -------------------------------------------------------------------
+-- A question in front of the window: a card with the title ("Are you sure you want to ...?"), a close button (X),
+-- Cancel and Confirm. Meanwhile the screen behind is dimmed and takes no clicks, and the game behind is blurred: a
+-- BlurEffect on the camera, which Roblox applies to the 3D view only (interface is never blurred), so the window
+-- behind is dimmed instead. Cancel, the X and hiding the window close it without confirming. One at a time: a new
+-- question replaces the one showing.
+-- Confirm({ Title = text, ConfirmText = "Confirm", CancelText = "Cancel", OnConfirm = fn, OnCancel = fn })
+-- Returns { close = function() } (closes it without confirming).
+local DIALOG_W, DIALOG_Z, DIALOG_BLUR = 380, 100, 12
+local function dialogButton(parent, text, primary, order)
+	local hit = new("TextButton", {
+		BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(104, ROW_H),
+		LayoutOrder = order, Parent = parent,
+	})
+	local face = new("TextLabel", {
+		AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.new(1, 0, 0, 32),
+		BackgroundColor3 = primary and "Accent" or "Track", BorderSizePixel = 0, Text = text,
+		TextColor3 = primary and "OnAccent" or "Text", TextSize = 15, FontFace = Fonts.Bold, Parent = hit,
+	}, { corner(RADIUS) })
+	if primary then
+		-- the accent has no lighter role: the face lightens through its transparency instead
+		hit.MouseEnter:Connect(function() tween(face, { BackgroundTransparency = 0.12 }, 0.12) end)
+		hit.MouseLeave:Connect(function() tween(face, { BackgroundTransparency = 0 }, 0.12) end)
+	else
+		hoverColors(hit, face, "Track", "Header")
+	end
+	return hit
+end
+
+function Window:Confirm(o)
+	o = type(o) == "table" and o or { Title = tostring(o) }
+	if self._dialog then self._dialog.close() end
+	self:_popupOpening(nil) -- an open dropdown or color picker closes
+	local gui, shell = self._gui, self._shell
+	local conns, closed = {}, false
+	local dialog = {}
+
+	-- The whole screen: dimmed, and it keeps clicks from the window and the game (Modal frees the mouse in first
+	-- person, as the window does).
+	local scrim = new("TextButton", {
+		Name = "Confirm", Text = "", AutoButtonColor = false, Active = true, Modal = true,
+		BackgroundColor3 = "Track", BackgroundTransparency = 1, BorderSizePixel = 0,
+		Size = UDim2.fromScale(1, 1), ZIndex = DIALOG_Z, Parent = gui,
+	})
+	local card = new("Frame", {
+		Name = "Card", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(DIALOG_W, 0),
+		AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = "Item", BorderSizePixel = 0, ZIndex = 2,
+		Parent = scrim,
+	}, {
+		corner(RADIUS + 2),
+		new("UIStroke", { Color = "Divider", Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }),
+	})
+	local scale = new("UIScale", { Scale = 0.96, Parent = card })
+	new("Frame", { -- the orange edge, as on the notice: something to read
+		Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = "Accent", BorderSizePixel = 0, Parent = card,
+	}, { corner(RADIUS) })
+	local body = new("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Parent = card,
+	}, {
+		new("UIPadding", {
+			PaddingLeft = UDim.new(0, 20), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 12),
+			PaddingBottom = UDim.new(0, 8),
+		}),
+		new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }),
+	})
+
+	-- Title and the X
+	local top = new("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		LayoutOrder = 1, Parent = body,
+	})
+	new("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(0, 6), Size = UDim2.new(1, -44, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y, Text = o.Title or "Are you sure?", TextColor3 = "Text", TextSize = 17,
+		LineHeight = 1.1, FontFace = Fonts.Bold, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = top,
+	}, { new("UIPadding", { PaddingBottom = UDim.new(0, 6) }) })
+	local x = new("TextButton", {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.fromOffset(32, 32),
+		BackgroundColor3 = "Track", BackgroundTransparency = 1, BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+		Parent = top,
+	}, { corner(RADIUS) })
+	for _, angle in ipairs({ 45, -45 }) do
+		new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(14, 2),
+			Rotation = angle, BackgroundColor3 = "SubText", BorderSizePixel = 0, Parent = x,
+		}, { corner(1) })
+	end
+	x.MouseEnter:Connect(function() tween(x, { BackgroundTransparency = 0 }, 0.12) end)
+	x.MouseLeave:Connect(function() tween(x, { BackgroundTransparency = 1 }, 0.12) end)
+
+	-- Cancel and Confirm, on the right
+	local row = new("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, ROW_H), LayoutOrder = 2, Parent = body,
+	}, { new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Right,
+		VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder,
+	}) })
+	local cancel = dialogButton(row, o.CancelText or "Cancel", false, 1)
+	local confirm = dialogButton(row, o.ConfirmText or "Confirm", true, 2)
+
+	-- In the middle of the window, wherever it is, and never wider than it.
+	local function place()
+		local at, size, origin = shell.AbsolutePosition, shell.AbsoluteSize, scrim.AbsolutePosition
+		card.Position = UDim2.fromOffset(at.X - origin.X + size.X / 2, at.Y - origin.Y + size.Y / 2)
+		card.Size = UDim2.fromOffset(math.max(math.min(DIALOG_W, size.X - 32), 200), 0)
+	end
+	place()
+	table.insert(conns, shell:GetPropertyChangedSignal("AbsolutePosition"):Connect(place))
+	table.insert(conns, shell:GetPropertyChangedSignal("AbsoluteSize"):Connect(place))
+
+	local blur
+	pcall(function()
+		local camera = workspace.CurrentCamera
+		if not camera then return end
+		blur = Instance.new("BlurEffect")
+		blur.Name = "CW_ConfirmBlur"
+		blur.Size = 0
+		blur.Parent = camera
+	end)
+
+	local function close(confirmed)
+		if closed then return end
+		closed = true
+		if self._dialog == dialog then self._dialog = nil end
+		for _, c in ipairs(conns) do c:Disconnect() end
+		self:_lockScroll(false)
+		card.Visible = false
+		tween(scrim, { BackgroundTransparency = 1 }, 0.12)
+		if blur then tween(blur, { Size = 0 }, 0.12) end
+		task.delay(0.15, function()
+			scrim:Destroy()
+			if blur then blur:Destroy() end
+		end)
+		safeCall(confirmed and o.OnConfirm or o.OnCancel)
+	end
+	dialog.close = function() close(false) end
+	self._dialog = dialog
+	self:_lockScroll(true)
+	x.MouseButton1Click:Connect(function() close(false) end)
+	cancel.MouseButton1Click:Connect(function() close(false) end)
+	confirm.MouseButton1Click:Connect(function() close(true) end)
+
+	tween(scrim, { BackgroundTransparency = 0.45 }, 0.15)
+	tween(scale, { Scale = 1 }, 0.15)
+	if blur then tween(blur, { Size = DIALOG_BLUR }, 0.2) end
+	return dialog
 end
 
 --// Camadas de fundo com parallax ------------------------------------------------
@@ -2883,6 +3035,7 @@ end
 
 function Window:Destroy()
 	self._destroyed = true
+	if self._dialog then self._dialog.close() end -- its blur is on the camera, outside the window's GUI
 	for _, c in ipairs(self._conns) do c:Disconnect() end
 	table.clear(self._conns)
 	self._gui:Destroy()
