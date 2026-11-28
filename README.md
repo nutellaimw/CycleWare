@@ -14,6 +14,10 @@
 CycleWare is a Prison Life script with the main purpose to apply visual hitmarkers and other *small assists. 
 Fully Customizable, and open source.
 
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CycleWare.lua"))()
+```
+
 *(Auto sprint, auto reload, chat toggle, and auto slot)
 
 ## Requirements
