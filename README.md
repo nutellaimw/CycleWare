@@ -9,7 +9,7 @@
 </div>
 
 
-## (CURRENTLY BEING UPDATED)
+## (CURRENTLY IN TESTING PHASE)
 
 CycleWare is a Prison Life script with the main purpose to apply visual hitmarkers and other *small assists. 
 Fully Customizable, and open source.
