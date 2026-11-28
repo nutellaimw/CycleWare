@@ -20,8 +20,7 @@ Fully Customizable, and open source.
 
 You executor must support these functions in order to have full support:
 
-loadstring;  
-request;
+loadstring; request;
 getgenv;
 gethui;
 cloneref;
