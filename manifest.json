@@ -175,6 +175,12 @@
           "path": "WeaponSounds/AK-47/plublub.mp3"
         }
       ],
+      "FAL": [
+        {
+          "crc32": "7ac1155d",
+          "path": "WeaponSounds/FAL/plublub.mp3"
+        }
+      ],
       "M4A1": [
         {
           "crc32": "663843af",
@@ -183,6 +189,12 @@
         {
           "crc32": "7ac1155d",
           "path": "WeaponSounds/M4A1/plublub.mp3"
+        }
+      ],
+      "M700": [
+        {
+          "crc32": "7ac1155d",
+          "path": "WeaponSounds/M700/plublub.mp3"
         }
       ],
       "M9": [
@@ -215,6 +227,6 @@
       ]
     }
   },
-  "revision": "5f12c83c7170",
+  "revision": "ec32f0b89db7",
   "schemaVersion": 1
 }
