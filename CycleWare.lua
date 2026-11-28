@@ -6837,8 +6837,8 @@ local function inputRow(section, fields, buttons, changed)
 	return shim
 end
 
--- Custom ID controls follow what is selected (Edit and Remove only while it is a custom ID): in a gallery's
--- header (attachActions), or in a gun sound's own editor (addAssetEditor). One light loop keeps them in step.
+-- The ID forms (idForm) follow what their list has chosen. One light loop keeps them in step with a choice made
+-- elsewhere (a gallery click, a library refresh).
 local customIdActionUpdaters = {}
 CW.track("customIdActions", game:GetService("RunService").Heartbeat:Connect((function()
 	local elapsed = 0
@@ -6850,30 +6850,97 @@ CW.track("customIdActions", game:GetService("RunService").Heartbeat:Connect((fun
 	end
 end)()))
 
--- Puts Edit and Remove in the header of the controls while canEdit; with an older cached CWUI, plain buttons
--- under the list. Returns a function(canEdit); it only touches the header when that changes.
-local function attachActions(section, controls, onEdit, onRemove)
-	local attached = {}
-	for _, control in ipairs(controls or {}) do
-		if type(control) == "table" and type(control.SetActions) == "function" then table.insert(attached, control) end
+-- The form under a list whose items can be added by ID (gun meshes and sounds, the hitmarker and texture galleries,
+-- the cursors), the same everywhere:
+--   [ID or link] [Name (optional)]
+--   [Add | Save] [Add] [Cancel] [Remove]
+-- The boxes follow what the list has chosen: a custom ID shows its ID and name there, so changing them and pressing
+-- Save changes that ID (another ID in its place keeps its choices). Add, next to Save, puts a different typed ID in
+-- the list as one more, leaving the chosen one as it is. With nothing custom chosen the boxes are for a new ID (Add).
+-- Cancel puts back what the boxes showed; Remove deletes the chosen custom ID. A button other than the first is shown
+-- only while it can do something.
+-- spec = {
+--   idTitle, idPlaceholder         the ID box
+--   choice()        -> what the list has chosen now (any value; a change of it fills the boxes again)
+--   chosen()        -> the chosen custom entry { Id, Name }, or nil
+--   setEditing(entry or nil)        the entry the boxes hold (Save changes it)
+--   save(values, asNew, view)       view.flash(text, seconds); view.saved(text) after an add or a change
+--   cancel()                        drops a check or a download still running
+--   remove(entry)   -> true when it was removed
+--   caption(entry or nil)           (optional) the panel's caption
+-- }
+-- Returns { refresh, view }.
+local function idForm(holder, spec)
+	local fields, buttons
+	local shown = false -- the choice whose values the boxes hold (false until the first look)
+	local editing
+
+	-- Fills the boxes from the list's choice: its ID and name when it is a custom ID, empty otherwise.
+	local function load()
+		shown = spec.choice()
+		if shown == nil then shown = "" end
+		spec.cancel()
+		editing = spec.chosen()
+		spec.setEditing(editing)
+		if editing then
+			fields:Set("id", tostring(editing.Id))
+			fields:Set("name", editing.Name or "")
+		else
+			fields:Clear()
+		end
 	end
-	if #attached == 0 then
-		section:Button({ Title = "Edit Selected ID", Callback = onEdit })
-		section:Button({ Title = "Remove Selected ID", Callback = onRemove })
-		return function() end
+	-- Whether the boxes hold something other than what load() put there.
+	local function changed()
+		local id, name = fields:Get("id") or "", fields:Get("name") or ""
+		if editing then return id ~= tostring(editing.Id) or name ~= (editing.Name or "") end
+		return id ~= "" or name ~= ""
 	end
-	for _, control in ipairs(attached) do
-		pcall(control.SetActions, control, { { Text = "Edit", Callback = onEdit }, { Text = "Remove", Callback = onRemove } })
+
+	local function refresh()
+		if not (fields and buttons) then return end
+		local choice = spec.choice()
+		if (choice == nil and "" or choice) ~= shown then load() end
+		local typedId = CW.CustomIds.parse(fields:Get("id"))
+		buttons:SetButtonText(1, editing and "Save" or "Add")
+		if buttons.SetButtonVisible then
+			buttons:SetButtonVisible(2, editing ~= nil and typedId ~= nil and typedId ~= tostring(editing.Id)) -- Add
+			buttons:SetButtonVisible(3, changed())                                                         -- Cancel
+			buttons:SetButtonVisible(4, editing ~= nil)                                                     -- Remove
+		end
+		if spec.caption then spec.caption(editing) end
 	end
-	local shown
-	local function update(canEdit)
-		canEdit = canEdit == true
-		if shown == canEdit then return end
-		shown = canEdit
-		for _, control in ipairs(attached) do pcall(control.ShowActions, control, canEdit) end
+	-- Back to what the list has chosen (after a save, a removal or Cancel).
+	local function reload()
+		shown = false
+		refresh()
 	end
-	update(false)
-	return update
+
+	local view = {
+		flash = function(text, seconds) buttons:Flash(1, text, seconds) end,
+		saved = function(text)
+			reload()
+			buttons:Flash(1, text)
+		end,
+	}
+	local function values() return { id = fields:Get("id"), name = fields:Get("name") } end
+	fields = inputRow(holder, {
+		{ Key = "id", Title = spec.idTitle, Placeholder = spec.idPlaceholder, Weight = 0.55 },
+		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
+	}, {}, refresh)
+	buttons = inputRow(holder, {}, {
+		{ Text = "Add", Title = "Save or Add ID", Callback = function() spec.save(values(), false, view) end },
+		{ Text = "Add", Title = "Add as Another ID", Callback = function() spec.save(values(), true, view) end },
+		{ Text = "Cancel", Title = "Cancel", Callback = function()
+			spec.cancel()
+			reload()
+		end },
+		{ Text = "Remove", Title = "Remove Selected ID", Callback = function()
+			if editing and spec.remove(editing) then reload() end
+		end },
+	})
+	refresh()
+	table.insert(customIdActionUpdaters, refresh)
+	return { refresh = refresh, view = view }
 end
 
 -- What one list's custom IDs need, however they are shown: add, rename, replace and remove, each asset
@@ -7022,138 +7089,41 @@ local function customIdEditor(opts, view)
 	return editor
 end
 
--- A gallery's custom IDs: the form always shown under the gallery, Edit and Remove in the gallery's header
--- while a custom ID is selected (see attachActions). opts: as customIdEditor, plus controls = { the gallery }.
-local function addCustomIdRow(section, opts)
-	local row, editor
-	local function setEditing(id)
-		editor.editingId = id
-		row:SetButtonText(1, id and "Save" or "Add")
-	end
-	local function reset()
-		editor.cancel()
-		row:Clear()
-		setEditing(nil)
-	end
-	editor = customIdEditor(opts, {
-		flash = function(text, seconds) row:Flash(1, text, seconds) end,
-		saved = function(text)
-			reset()
-			row:Flash(1, text)
-		end,
+-- The ID form (idForm) of a list of custom IDs kept by customIdEditor. caption: function(entry) for a panel, or nil.
+local function customIdForm(holder, opts, caption)
+	local form
+	local editor = customIdEditor(opts, {
+		flash = function(text, seconds) form.view.flash(text, seconds) end,
+		saved = function(text) form.view.saved(text) end,
 	})
-
-	row = inputRow(section, {
-		{ Key = "id", Title = opts.kind .. " ID", Placeholder = opts.kind .. " ID or link", Weight = 0.55 },
-		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
-	}, {
-		{ Text = "Add", Title = "Add ID", Callback = function(values) editor.save(values) end },
-		{ Text = "Cancel", Title = "Cancel", Callback = reset },
+	form = idForm(holder, {
+		idTitle = opts.kind .. " ID",
+		idPlaceholder = opts.kind .. " ID or link",
+		choice = function() return editor.selectedId() end,
+		chosen = function() return editor.entry(editor.selectedId()) end,
+		setEditing = function(entry) editor.editingId = entry and entry.Id or nil end,
+		save = function(values, asNew) editor.save(values, asNew) end,
+		cancel = editor.cancel,
+		remove = function(entry) return editor.remove(entry.Id) end,
+		caption = caption,
 	})
-
-	local function edit()
-		local entry = editor.entry(editor.selectedId())
-		if not entry then return end
-		row:Set("id", entry.Id)
-		row:Set("name", entry.Name)
-		setEditing(entry.Id)
-	end
-	local function remove()
-		local id = editor.selectedId()
-		local wasEditing = id ~= nil and editor.editingId == id
-		if editor.remove(id) and wasEditing then reset() end
-	end
-	local showActions = attachActions(section, opts.controls, edit, remove)
-	table.insert(customIdActionUpdaters, function() showActions(editor.selectedId() ~= nil) end)
-	return row
+	return form
 end
 
--- A gun's mesh or sound IDs, always shown in its drawer, in a panel of their own:
---   [ID or link] [Name (optional)]
---   [Add | Save] [Add] [Cancel] [Remove]
--- The boxes follow what the drawer has chosen: a custom ID shows its ID and name there, so changing them and
--- pressing Save changes that ID (another ID in its place keeps its choices). Add, next to Save, puts a different
--- typed ID in the list as one more, leaving the chosen one as it is. With nothing custom chosen the boxes are for
--- a new ID (Add). Cancel puts back what the boxes showed. Remove deletes the chosen custom ID. A button other
--- than the first is shown only while it can do something.
--- opts: as customIdEditor. Returns { refresh } (the drawer calls it when its choice changes).
+-- A gallery's custom IDs: the form always shown under the gallery (hitmarkers, a gun's textures).
+-- opts: as customIdEditor.
+local function addCustomIdRow(section, opts)
+	return customIdForm(section, opts)
+end
+
+-- A gun's mesh or sound IDs, always shown in its drawer, in a panel of their own (the panel's caption says which ID
+-- the boxes hold). opts: as customIdEditor. Returns { refresh } (the drawer calls it when its choice changes).
 local function addAssetEditor(section, opts)
 	local CAPTION = opts.kind == "Mesh" and "Add a mesh by its ID" or "Add a sound by its ID"
 	local group = section:Group(CAPTION)
-	local fields, buttons, editor
-	local shown = false -- the choice whose values the boxes hold ("" for none; false until the first look)
-
-	-- Fills the boxes from the drawer's choice: its ID and name when it is a custom ID, empty otherwise.
-	local function load()
-		local id = editor.selectedId()
-		shown = id or ""
-		editor.cancel()
-		local entry = editor.entry(id)
-		editor.editingId = entry and entry.Id or nil
-		if entry then
-			fields:Set("id", tostring(entry.Id))
-			fields:Set("name", entry.Name or "")
-		else
-			fields:Clear()
-		end
-	end
-	-- Whether the boxes hold something other than what load() put there.
-	local function changed(entry)
-		local id, name = fields:Get("id") or "", fields:Get("name") or ""
-		if entry then return id ~= tostring(entry.Id) or name ~= (entry.Name or "") end
-		return id ~= "" or name ~= ""
-	end
-
-	local function refresh()
-		if not (fields and buttons) then return end
-		if (editor.selectedId() or "") ~= shown then load() end
-		local entry = editor.entry(editor.editingId)
-		local typedId = CW.CustomIds.parse(fields:Get("id"))
-		buttons:SetButtonText(1, entry and "Save" or "Add")
-		if buttons.SetButtonVisible then
-			buttons:SetButtonVisible(2, entry ~= nil and typedId ~= nil and typedId ~= tostring(entry.Id)) -- Add
-			buttons:SetButtonVisible(3, changed(entry))                                                  -- Cancel
-			buttons:SetButtonVisible(4, entry ~= nil)                                                    -- Remove
-		end
-		if group.SetCaption then
-			group:SetCaption(entry and ("Editing " .. entry.Name) or CAPTION)
-		end
-	end
-	-- Back to what the drawer has chosen (after a save, a removal or Cancel).
-	local function reload()
-		shown = false
-		refresh()
-	end
-
-	editor = customIdEditor(opts, {
-		flash = function(text, seconds) buttons:Flash(1, text, seconds) end,
-		saved = function(text)
-			reload()
-			buttons:Flash(1, text)
-		end,
-	})
-	fields = inputRow(group, {
-		{ Key = "id", Title = opts.kind .. " ID", Placeholder = opts.kind .. " ID or link", Weight = 0.55 },
-		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
-	}, {}, refresh)
-	buttons = inputRow(group, {}, {
-		{ Text = "Add", Title = "Save or Add ID", Callback = function()
-			editor.save({ id = fields:Get("id"), name = fields:Get("name") })
-		end },
-		{ Text = "Add", Title = "Add as Another ID", Callback = function()
-			editor.save({ id = fields:Get("id"), name = fields:Get("name") }, true)
-		end },
-		{ Text = "Cancel", Title = "Cancel", Callback = function()
-			editor.cancel()
-			reload()
-		end },
-		{ Text = "Remove", Title = "Remove Selected ID", Callback = function()
-			if editor.remove(editor.editingId) then reload() end
-		end },
-	})
-	refresh()
-	table.insert(customIdActionUpdaters, refresh) -- the choice can also change from elsewhere (a library refresh)
-	return { refresh = refresh }
+	return customIdForm(group, opts, function(entry)
+		if group.SetCaption then group:SetCaption(entry and ("Editing " .. entry.Name) or CAPTION) end
+	end)
 end
 
 -- One gun's sound, laid out the same in Hit Sound, Shoot Sounds and Reload Sounds:
@@ -7253,10 +7223,10 @@ local function downloadCursorPng(id)
 	return buildCursorPng(png)
 end
 
-local function addCursorIdRow(section, controls)
+local function addCursorIdRow(section)
 	local attempt = 0 -- each save or cancel takes a new number; a download that ends under an old one is dropped
-	local row
-	local editing -- the entry being edited; nil while adding
+	local view -- the form's (idForm): flash and saved
+	local editing -- the cursor whose values the boxes hold; nil while adding
 
 	local function afterChange()
 		CW.Library.invalidate()
@@ -7277,20 +7247,6 @@ local function addCursorIdRow(section, controls)
 		local selected = CW.Library.relative(CW.Paths.CURSOR_FILE)
 		return selected and CW.CustomIds.byFile("Cursors", nil, selected) or nil
 	end
-	local function setEditing(entry)
-		editing = entry
-		row:SetButtonText(1, entry and "Save" or "Add")
-	end
-	local function reset()
-		attempt += 1
-		row:Clear()
-		setEditing(nil)
-	end
-	-- After a save: the form empties and the result shows on the button for a moment.
-	local function finish(text)
-		reset()
-		row:Flash(1, text)
-	end
 	-- After a rename or a new ID: the old file goes, the entry and every choice point at the new file.
 	local function replaceEntry(old, id, name, relative)
 		CW.CustomIds.remove("Cursors", nil, old.Id)
@@ -7299,23 +7255,24 @@ local function addCursorIdRow(section, controls)
 		CW.Library.replaceSelectionOf("Cursors", nil, old.File, relative)
 	end
 
-	-- Pressing again while a download runs starts over with what is typed.
-	local function save(values)
+	-- Pressing again while a download runs starts over with what is typed. asNew: added as another cursor even
+	-- while one is in the boxes (that one stays as it is).
+	local function save(values, asNew)
 		attempt += 1
 		local mine = attempt
 		if not CAPS.files then
-			row:Flash(1, "No files", 2)
+			view.flash("No files", 2)
 			CW.Warn("Cursor by ID needs the executor's file functions")
 			return
 		end
 		local id = CW.CustomIds.parse(values.id)
 		if not id then
-			row:Flash(1, "Invalid")
+			view.flash("Invalid")
 			return
 		end
-		local old = editing
+		local old = not asNew and editing or nil
 		if not old and CW.CustomIds.get("Cursors", nil, id) then
-			row:Flash(1, "Exists", 2)
+			view.flash("Exists", 2)
 			CW.Warn("Cursor ID " .. id .. " was already added")
 			return
 		end
@@ -7327,7 +7284,7 @@ local function addCursorIdRow(section, controls)
 		local taken = CW.CustomIds.nameTaken("Cursors", nil, name, old and old.Id, old and old.File)
 			or ((okExists and exists and not ownFile) and ("a file named " .. relative .. " already exists") or nil)
 		if taken then
-			row:Flash(1, "Name used", 2)
+			view.flash("Name used", 2)
 			CW.Warn("Cursor ID not saved: " .. taken)
 			return
 		end
@@ -7337,25 +7294,25 @@ local function addCursorIdRow(section, controls)
 			if not ownFile then
 				local okRead, data = pcall(readfile, pathOf(old.File))
 				if not okRead or type(data) ~= "string" then
-					row:Flash(1, "Failed", 3)
+					view.flash("Failed", 3)
 					CW.Warn("Could not read " .. pathOf(old.File) .. ": " .. tostring(data))
 					return
 				end
 				writefile(path, data)
 				replaceEntry(old, id, name, relative)
 			end
-			finish("Saved")
+			view.saved("Saved")
 			afterChange()
 			pcall(CW.reloadCoreAssets)
 			return
 		end
 
 		if not (CAPS.httpGet or CAPS.request) then
-			row:Flash(1, "No HTTP", 2)
+			view.flash("No HTTP", 2)
 			CW.Warn("Cursor by ID needs HttpGet or request in the executor")
 			return
 		end
-		row:Flash(1, "Loading", 60)
+		view.flash("Loading", 60)
 		task.spawn(function()
 			local downloaded, data, why = pcall(downloadCursorPng, id)
 			if mine ~= attempt then return end
@@ -7374,46 +7331,39 @@ local function addCursorIdRow(section, controls)
 				end
 			end)
 			if ok then
-				finish(old and "Saved" or "Added")
+				view.saved(old and "Saved" or "Added")
 				CW.Log("Cursor ID " .. id .. " saved as " .. relative)
 				afterChange()
 				if old then pcall(CW.reloadCoreAssets) end
 			else
-				row:Flash(1, "Failed", 3)
+				view.flash("Failed", 3)
 				CW.Warn("Cursor ID " .. id .. " not saved: " .. tostring(err))
 			end
 		end)
 	end
 
-	row = inputRow(section, {
-		{ Key = "id", Title = "Image or Decal ID", Placeholder = "Image/Decal ID or link", Weight = 0.55 },
-		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
-	}, {
-		{ Text = "Add", Title = "Add ID", Callback = function(values) save(values) end },
-		{ Text = "Cancel", Title = "Cancel", Callback = reset },
-	})
-
-	local function edit()
-		local entry = selectedEntry()
-		if not entry then return end
-		row:Set("id", entry.Id)
-		row:Set("name", entry.Name)
-		setEditing(entry)
-	end
-	-- Removes the cursor in use (only cursors added by ID: the others never show the button).
-	local function remove()
-		local entry = selectedEntry()
-		if not entry then return end
+	-- Removes a cursor added by ID (its file too); the cursor in use goes back to the game's.
+	local function remove(entry)
 		CW.CustomIds.remove("Cursors", nil, entry.Id)
 		deleteFile(entry.File)
 		CW.Library.clearSelectionOf("Cursors", nil, entry.File)
-		if editing and editing.Id == entry.Id then reset() end
 		afterChange()
 		pcall(CW.reloadCoreAssets)
+		return true
 	end
-	local showActions = attachActions(section, controls, edit, remove)
-	table.insert(customIdActionUpdaters, function() showActions(selectedEntry() ~= nil) end)
-	return row
+
+	local form = idForm(section, {
+		idTitle = "Image or Decal ID",
+		idPlaceholder = "Image/Decal ID or link",
+		choice = function() return CW.Library.relative(CW.Paths.CURSOR_FILE) end,
+		chosen = selectedEntry,
+		setEditing = function(entry) editing = entry end,
+		save = function(values, asNew) save(values, asNew) end,
+		cancel = function() attempt += 1 end,
+		remove = remove,
+	})
+	view = form.view
+	return form
 end
 
 ------------------------------------------------------------------------------
@@ -7517,7 +7467,7 @@ guarded("Cursors", function()
 			Callback = applyCursorFile,
 		})
 
-		guarded("Cursor Custom IDs", function() addCursorIdRow(CursorSection, { CursorGallery }) end)
+		guarded("Cursor Custom IDs", function() addCursorIdRow(CursorSection) end)
 
 		local showOwner = ownerLabel(CursorSection, "cursor")
 		local controls = {}
@@ -7607,7 +7557,7 @@ guarded("Cursors", function()
 
 		guarded("Hitmarker Custom IDs", function()
 			addCustomIdRow(HitmarkerSection, {
-				category = "Hitmarkers", kind = "Image", controls = { HitmarkerGallery },
+				category = "Hitmarkers", kind = "Image",
 				selected = function() return CW.Library.relative(CW.Paths.HITMARKER_FILE) end,
 			})
 		end)
@@ -7923,7 +7873,7 @@ guarded("Guns", function()
 		-- Custom IDs for this gun only, right under its gallery.
 		guarded(gun .. " Texture Custom IDs", function()
 			addCustomIdRow(page, {
-				category = "Textures", kind = "Texture", controls = { gallery },
+				category = "Textures", kind = "Texture",
 				weapon = function() return gun end,
 				selected = function()
 					local textures = CW.Settings.ASSET_SELECTIONS.Textures
@@ -10489,7 +10439,6 @@ guarded("Settings", function()
 			if #missing > 0 then General:AddLabel("Not supported:\n" .. table.concat(missing, "\n")) end
 		end
 	end
-	General:AddLabel("Every change is saved by itself about a second later.")
 	General:Button({
 		Title = "Refresh Asset Library",
 		Callback = function()
@@ -10519,18 +10468,19 @@ guarded("Settings", function()
 		})
 	end
 
-	-- Settings slots: named copies of every setting, each a file in SETTINGS_SLOTS_FOLDER written like the settings
-	-- file. Saving copies the settings in use into a slot. Loading makes a slot the settings in use and runs
-	-- CycleWare again (CW.restart), so every module and control starts from it, as on a fresh start.
-	guarded("Settings Slots", function()
+	-- Saved Profiles (settings slots in the code and on disk): named copies of every setting, each a file in
+	-- SETTINGS_SLOTS_FOLDER written like the settings file. Saving copies the settings in use into a slot. Loading
+	-- makes a slot the settings in use and runs CycleWare again (CW.restart), so every module and control starts
+	-- from it, as on a fresh start.
+	guarded("Saved Profiles", function()
 		if not CAPS.files then return end
 		local SLOTS = CW.Paths.SETTINGS_SLOTS_FOLDER
-		local Slots = SettingsTab:AddSubSection("Settings Slots", false)
+		local Slots = SettingsTab:AddSubSection("Saved Profiles", false)
 		local status = Slots:AddLabel("")
 		local function showStatus(extra)
 			local slot = CW.Settings.SETTINGS_SLOT
 			local text = slot ~= "" and ("In use: " .. slot .. ". ") or ""
-			status:Set(text .. (extra or "Save the settings you have now to a slot, or load one."))
+			status:Set(text .. (extra or "Save the settings you have now to a profile, or load one."))
 		end
 
 		local function slotPath(name) return SLOTS .. "/" .. name .. ".json" end
@@ -10584,21 +10534,27 @@ guarded("Settings", function()
 			return name and table.find(slotNames(), name) and name or nil
 		end
 
-		-- Load and Delete throw away settings, so they ask for a second press within 3 seconds.
+		-- Load and Delete throw away settings, so they ask first: a question in front of the window (CWUI's
+		-- Window:Confirm), or, with an older CWUI that has none, a second press within 3 seconds.
 		local armed = {}
-		local function confirmed(action, row, index)
+		local function askFirst(action, question, row, index, run)
+			local window = CW.UIWindow
+			if type(window) == "table" and type(window.Confirm) == "function"
+				and pcall(window.Confirm, window, { Title = question, ConfirmText = "Confirm", OnConfirm = run }) then
+				return
+			end
 			local now = os.clock()
 			if armed[action] and now - armed[action] < 3 then
 				armed[action] = nil
-				return true
+				run()
+				return
 			end
 			armed[action] = now
 			if row and row.Flash then row:Flash(index, "Sure?", 3) end
-			return false
 		end
 
 		local newRow = Slots:InputRow({
-			Fields = { { Key = "name", Placeholder = "Slot name" } },
+			Fields = { { Key = "name", Placeholder = "Profile name" } },
 			Buttons = { { Text = "Save", Callback = function(values, row)
 				local name = cleanName(values.name)
 				if not name then
@@ -10617,19 +10573,13 @@ guarded("Settings", function()
 			end } },
 		})
 		if not newRow then -- an old CWUI without input rows
-			Slots:AddLabel("Update CWUI.lua to name and save settings slots.")
+			Slots:AddLabel("Update CWUI.lua to name and save profiles.")
 			return
 		end
 
-		picker = Slots:Dropdown({ Title = "Slot", Options = { "None" }, Default = "None", Callback = function() end })
+		picker = Slots:Dropdown({ Title = "Profile", Options = { "None" }, Default = "None", Callback = function() end })
 
-		local function load(row)
-			local name = selectedSlot()
-			if not name then
-				row:Flash(1, "None")
-				return
-			end
-			if not confirmed("load", row, 1) then return end
+		local function load(row, name)
 			local read, raw = pcall(readfile, slotPath(name))
 			local parsed, slot = false, nil
 			if read then parsed, slot = pcall(HttpService.JSONDecode, HttpService, raw) end
@@ -10659,7 +10609,15 @@ guarded("Settings", function()
 
 		local actions = Slots:InputRow({
 			Buttons = {
-				{ Text = "Load", Callback = function(_, row) load(row) end },
+				{ Text = "Load", Callback = function(_, row)
+					local name = selectedSlot()
+					if not name then
+						row:Flash(1, "None")
+						return
+					end
+					askFirst("load", 'Are you sure you want to load the profile "' .. name .. '"?', row, 1,
+						function() load(row, name) end)
+				end },
 				{ Text = "Save", Callback = function(_, row) -- over the slot picked above
 					local name = selectedSlot()
 					if not name then
@@ -10675,17 +10633,18 @@ guarded("Settings", function()
 						row:Flash(3, "None")
 						return
 					end
-					if not confirmed("delete", row, 3) then return end
-					if pcall(delfile, slotPath(name)) then
-						if CW.Settings.SETTINGS_SLOT == name then
-							CW.Settings.SETTINGS_SLOT = ""
-							scheduleSave()
+					askFirst("delete", 'Are you sure you want to delete the profile "' .. name .. '"?', row, 3, function()
+						if pcall(delfile, slotPath(name)) then
+							if CW.Settings.SETTINGS_SLOT == name then
+								CW.Settings.SETTINGS_SLOT = ""
+								scheduleSave()
+							end
+							refreshPicker()
+							showStatus()
+						else
+							row:Flash(3, "Failed")
 						end
-						refreshPicker()
-						showStatus()
-					else
-						row:Flash(3, "Failed")
-					end
+					end)
 				end },
 			},
 		})
