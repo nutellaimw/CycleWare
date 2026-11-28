@@ -181,6 +181,8 @@ local X = {
 	keyrelease     = Exec.wrap("keyrelease", keyrelease),
 	loadstring     = Exec.wrap("loadstring", loadstring),
 	setclipboard   = Exec.wrap("setclipboard", setclipboard or toclipboard),
+	queueOnTeleport = Exec.wrap("queue_on_teleport", queue_on_teleport or queueonteleport
+		or (syn and syn.queue_on_teleport)),
 	cloneref       = Exec.wrap("cloneref", cloneref),
 	protectGui     = Exec.wrap("protect_gui", syn and syn.protect_gui),
 	firesignal     = type(firesignal) == "function" and function(...) Exec.spawn("firesignal", firesignal, ...) end or nil,
@@ -780,6 +782,100 @@ function CW.restart()
 	return true
 end
 
+--// Auto Execute -----------------------------------------------------------------------
+-- Runs CycleWare by itself when the player joins Prison Life. Executors run every script in their auto-execute
+-- folder (usually "autoexec", next to the workspace) in every game they attach to, so the loader written there
+-- checks the place first, then the AUTO_EXECUTE setting in the settings file: turning the option off stops it
+-- even where the file can't be deleted. Scripts can write outside the workspace only where the executor lets a
+-- path go up with "..": that is checked by reading a file just written in the workspace back through
+-- "../workspace/...", since a sandbox that drops ".." finds nothing there. Where the folder can't be reached the
+-- player saves the loader there by hand (Copy Loader), and queue_on_teleport still runs it after a teleport.
+CW.Settings.AUTO_EXECUTE = boolOr(_cfg.AUTO_EXECUTE, false)
+CW.AutoExecute = {
+	PLACES = { 155615604, 135564683255158 }, -- Prison Life
+	FILE_NAME = "CycleWare-AutoExecute.lua",
+	HEADER = "-- CycleWare Auto Execute (written by CycleWare: Settings > General > Auto Execute).",
+	-- Folder names executors use, as seen from their workspace.
+	WORKSPACES = { "workspace", "Workspace" },
+	FOLDERS = { "autoexec", "autoexecute", "Autoexec", "AutoExec", "Autoexecute", "AutoExecute" },
+}
+
+function CW.AutoExecute.loader()
+	local places = {}
+	for _, id in ipairs(CW.AutoExecute.PLACES) do table.insert(places, "[" .. id .. "] = true") end
+	local url = type(_cfg.SCRIPT_URL) == "string" and _cfg.SCRIPT_URL ~= "" and _cfg.SCRIPT_URL or SCRIPT_URL
+	return table.concat({
+		CW.AutoExecute.HEADER,
+		"-- Runs CycleWare when you join Prison Life, while Auto Execute is on. Delete this file to remove it.",
+		"local PLACES = { " .. table.concat(places, ", ") .. " }",
+		"if not PLACES[game.PlaceId] then return end",
+		"local on = false",
+		"pcall(function()",
+		"\tlocal data = game:GetService(\"HttpService\"):JSONDecode(readfile(" .. string.format("%q", CW.Paths.SETTINGS_FILE) .. "))",
+		"\ton = type(data) == \"table\" and type(data.Settings) == \"table\" and data.Settings.AUTO_EXECUTE == true",
+		"end)",
+		"if not on then return end",
+		"if not game:IsLoaded() then game.Loaded:Wait() end",
+		"loadstring(game:HttpGet(" .. string.format("%q", url) .. "))()",
+		"",
+	}, "\n")
+end
+
+-- The executor's auto-execute folder as a path writefile takes ("../autoexec"), or nil when it can't be reached.
+function CW.AutoExecute.folder()
+	if not CAPS.files then return nil end
+	local probe = CW.Paths.CACHE_FOLDER .. "/.autoexec-check"
+	local token = HttpService:GenerateGUID(false)
+	if not pcall(writefile, probe, token) then return nil end
+	local goesUp = false
+	for _, workspaceName in ipairs(CW.AutoExecute.WORKSPACES) do
+		local ok, back = pcall(readfile, "../" .. workspaceName .. "/" .. probe)
+		goesUp = goesUp or (ok and back == token)
+	end
+	if CAPS.delfile then pcall(delfile, probe) end
+	if not goesUp then return nil end
+	for _, name in ipairs(CW.AutoExecute.FOLDERS) do
+		local ok, exists = pcall(isfolder, "../" .. name)
+		if ok and exists then return "../" .. name end
+	end
+	return nil
+end
+
+-- Writes the loader into the auto-execute folder. Returns the folder's name, or nil and why not.
+function CW.AutoExecute.install()
+	local folder = CW.AutoExecute.folder()
+	if not folder then return nil, "unreachable" end
+	local path = folder .. "/" .. CW.AutoExecute.FILE_NAME
+	local loader = CW.AutoExecute.loader()
+	local ok, back = pcall(function()
+		writefile(path, loader)
+		return readfile(path)
+	end)
+	if not ok or back ~= loader then return nil, "write failed" end
+	return folder:sub(4)
+end
+
+-- Removes the loader this wrote (only a file that starts with its header). Returns true when it is gone.
+function CW.AutoExecute.uninstall()
+	local folder = CW.AutoExecute.folder()
+	if not folder then return true end
+	local path = folder .. "/" .. CW.AutoExecute.FILE_NAME
+	local okExists, exists = pcall(isfile, path)
+	if not (okExists and exists) then return true end
+	local okRead, content = pcall(readfile, path)
+	local header = CW.AutoExecute.HEADER
+	if not (okRead and type(content) == "string" and content:sub(1, #header) == header) then return false end
+	return CAPS.delfile and pcall(delfile, path) or false
+end
+
+-- After a teleport the executor runs what was queued; once per server is enough.
+function CW.AutoExecute.queueTeleport()
+	if not X.queueOnTeleport or CW.State.autoExecuteQueued then return false end
+	local ok = pcall(X.queueOnTeleport, CW.AutoExecute.loader())
+	CW.State.autoExecuteQueued = ok
+	return ok
+end
+
 --// Startup report -------------------------------------------------------------------
 do
 	local missing = {}
@@ -873,15 +969,16 @@ CW.Paths.CURSOR_FILE = nil
 CW.Paths.HITMARKER_FILE = nil
 CW.Paths.SOUND_FILE = nil
 
--- Everything is off by default; only what the player changes is saved (see saveSettings).
+-- Toggles are off by default unless noted; only what the player changes is saved (see saveSettings).
+-- The hitmarker rotates at random and follows the mouse by default (schema 5).
 CW.Settings.HITMARKER_SIZE             = numOr(_cfg.HITMARKER_SIZE, 50, 1)
 CW.Settings.SOUND_VOLUME               = numOr(_cfg.SOUND_VOLUME, 1, 0)
 CW.Settings.CURSOR_TARGET_SIZE         = numOr(_cfg.CURSOR_TARGET_SIZE, 82, 1)
 CW.Settings.HITMARKER_VISIBLE_DURATION = numOr(_cfg.HITMARKER_VISIBLE_DURATION, 0.05, 0)
 CW.Settings.HITMARKER_FADEOUT_DURATION = numOr(_cfg.HITMARKER_FADEOUT_DURATION, 0.15, 0)
 
-CW.Settings.HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, false)
-CW.Settings.HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, false)
+CW.Settings.HITMARKER_RANDOM_ROTATION = boolOr(_cfg.HITMARKER_RANDOM_ROTATION, true)
+CW.Settings.HITMARKER_FOLLOW_MOUSE    = boolOr(_cfg.HITMARKER_FOLLOW_MOUSE, true)
 CW.Settings.HITMARKER_FADEOUT         = boolOr(_cfg.HITMARKER_FADEOUT, false)
 
 -- Cursor team check: the cursor takes the enemy color over an enemy and the teammate color over a teammate.
@@ -1026,6 +1123,29 @@ if settingsFileExists then
 				end
 				for _, key in ipairs({ "Textures", "Meshes" }) do
 					if type(selections[key]) == "table" then CW.Settings.ASSET_SELECTIONS[key] = selections[key] end
+				end
+			end
+
+			-- Before schema 5, Random Rotation and Follow Mouse were off by default, so a file that doesn't hold
+			-- them had them off. They are written in as off, so the defaults being on never changes a hitmarker
+			-- someone already uses; a hitmarker picked later starts with the defaults.
+			if savedVersion < 5 then
+				local WERE_OFF = { "HITMARKER_RANDOM_ROTATION", "HITMARKER_FOLLOW_MOUSE" }
+				for _, key in ipairs(WERE_OFF) do
+					-- Settings shared by every hitmarker (an older build): CW.Profiles.start makes them a profile.
+					if values[key] == nil then CW.Settings[key] = false end
+				end
+				local profiles = type(CW.Settings.ASSET_PROFILES) == "table" and CW.Settings.ASSET_PROFILES.Hitmarkers
+				if type(profiles) == "table" then
+					local chosen = CW.Settings.ASSET_SELECTIONS.Hitmarker
+					if type(chosen) == "string" and chosen ~= "" and profiles[chosen] == nil then profiles[chosen] = {} end
+					for _, profile in pairs(profiles) do
+						if type(profile) == "table" then
+							for _, key in ipairs(WERE_OFF) do
+								if profile[key] == nil then profile[key] = false end
+							end
+						end
+					end
 				end
 			end
 
@@ -2163,12 +2283,12 @@ end
 
 -- Returns the file to use for a category (and weapon) plus its relative path.
 -- A saved selection whose file is not on disk is NOT overwritten: it stays saved and is used as soon
--- as the file exists. The cursor and the per-gun looks use nothing meanwhile, and nothing at all until
--- the player picks one (the game's own cursor and guns). The hitmarker and the hit sound need a file to
--- work, so with nothing chosen, or a chosen file that is still missing once the download finished, they
--- use the library's file named "default" (or else its first file). That fallback is never saved as a
+-- as the file exists. The cursor, the hitmarker and the per-gun looks use nothing meanwhile, and nothing at
+-- all until the player picks one (the game's own cursor and guns, no hitmarker). The hit sound needs a file
+-- to work, so with nothing chosen, or a chosen file that is still missing once the download finished, it
+-- uses the library's file named "default" (or else its first file). That fallback is never saved as a
 -- selection, and a custom ID is never picked on its own.
-local NEEDS_A_FILE = { Hitmarkers = true, HitSounds = true }
+local NEEDS_A_FILE = { HitSounds = true }
 function CW.Library.selectedPath(category, weapon)
 	local selections = CW.Settings.ASSET_SELECTIONS
 	local selected
@@ -3326,6 +3446,10 @@ end
 CW.HMTemplate.Size = UDim2.new(0, CW.Settings.HITMARKER_SIZE, 0, CW.Settings.HITMARKER_SIZE)
 
 local function reloadHitmarker()
+	if not CW.Paths.HITMARKER_FILE then -- none chosen: hits draw nothing
+		CW.HMTemplate.Image = ""
+		return
+	end
 	local asset = CW.loadLibraryAsset({
 		file = CW.Paths.HITMARKER_FILE,
 		label = "hitmarker",
@@ -5067,7 +5191,7 @@ function CW.processShot(hits)
 	local character = Players.LocalPlayer.Character
 	local tool = character and character:FindFirstChildOfClass("Tool")
 	CW.playHitSound(tool and tool.Name)
-	if not CW.HMTemplate or not CW.IAPortable then return end
+	if not CW.HMTemplate or not CW.IAPortable or CW.HMTemplate.Image == "" then return end -- no hitmarker
 
 	-- Read the real mouse position now; mouseX/Y only update on MouseMovement.
 	local loc = UserInputService:GetMouseLocation()
@@ -5226,6 +5350,7 @@ function CW.cleanup()
 		local contextActions = game:GetService("ContextActionService")
 		contextActions:UnbindAction("CycleWareSprintToggle")
 		contextActions:UnbindAction("CycleWareProtectSprint")
+		contextActions:UnbindAction("CycleWareChatKey")
 	end)
 	pcall(CW.untrackAll)
 	CW.ActiveFollowClones = {}
@@ -5497,7 +5622,8 @@ local function encodeSettings()
 	saveColor("TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX")
 
 	local out = {
-		schemaVersion = 4, -- 4: the default look is DEFAULT_THEME and DEFAULT_LAYERS
+		-- 4: the default look is DEFAULT_THEME and DEFAULT_LAYERS. 5: Random Rotation and Follow Mouse default on.
+		schemaVersion = 5,
 		Settings = savedSettings,
 		AssetSelections = CW.Settings.ASSET_SELECTIONS,
 	}
@@ -7432,10 +7558,11 @@ guarded("Cursors", function()
 
 	-- Hitmarkers: the library, whose hitmarker the settings below belong to, then the size, then two drawers.
 	guarded("Hitmarker", function()
+		-- A hitmarker from the gallery, or nil when the chosen one is clicked again: no hitmarker.
 		local function applyHitmarkerFile(value)
-			if type(value) ~= "table" or type(value.Path) ~= "string" then return end
-			CW.Paths.HITMARKER_FILE = value.Path
-			local relative = CW.Library.relative(value.Path)
+			if value ~= nil and (type(value) ~= "table" or type(value.Path) ~= "string") then return end
+			CW.Paths.HITMARKER_FILE = value and value.Path or nil
+			local relative = value and CW.Library.relative(value.Path) or nil
 			CW.Library.setSelection("Hitmarkers", nil, relative)
 			CW.Profiles.use("Hitmarkers", relative)
 			if CW.reloadHitmarkerAsset then CW.reloadHitmarkerAsset() end
@@ -7451,10 +7578,12 @@ guarded("Cursors", function()
 			if key == "HITMARKER_SIZE" then applySize() end
 		end
 
+		HitmarkerSection:AddLabel("Pick a hitmarker to use it. Click the chosen one again to use none.")
 		HitmarkerGallery = HitmarkerSection:Gallery({
 			Name = "Hitmarker Library",
 			Items = galleryItems("Hitmarkers"),
 			Default = CW.Paths.HITMARKER_FILE,
+			AllowDeselect = true,
 			LazyLoad = true,
 			Columns = 4,
 			MaxHeight = 260,
@@ -8315,7 +8444,7 @@ guarded("Utilities", function()
 	})
 	-- <<< SPRINT TOGGLE END
 
-	-- The chat is no longer forced on at load: it is only touched by the Z toggle below.
+	-- The chat is no longer forced on at load: it is only touched by the Z key below.
 	local function setChatVisible(visible)
 		pcall(function()
 			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, visible)
@@ -8325,21 +8454,30 @@ guarded("Utilities", function()
 		end)
 	end
 
-	if CW.State.chatToggleConn then
+	-- Z is the chat key, never the sniper's zoom: GunController zooms on Z only when the input was not processed,
+	-- and an input this action sinks reaches UserInputService.InputBegan as processed (checked in Studio). The
+	-- sniper still zooms with the right mouse button. Typing a "z" is not affected: actions don't run while a
+	-- text box has focus.
+	if CW.State.chatToggleConn then -- the listener of an older build
 		CW.State.chatToggleConn:Disconnect()
+		CW.State.chatToggleConn = nil
 	end
-	CW.State.chatToggleConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-		if gameProcessed or not CW.Settings.CHAT_TOGGLE_ENABLED then return end
-		if input.KeyCode ~= Enum.KeyCode.Z then return end
-		-- Z is also the sniper's zoom (GunController): with one in hand it is left to the game.
-		local character = LocalPlayer.Character
-		local held = character and character:FindFirstChildOfClass("Tool")
-		if held and held:GetAttribute("Behavior") == "Sniper" then return end
-
-		chatHidden = not chatHidden
-		CW.State.chatHidden = chatHidden
-		setChatVisible(not chatHidden)
-	end)
+	local function onChatKey(_, inputState)
+		if inputState == Enum.UserInputState.Begin and CW.Settings.CHAT_TOGGLE_ENABLED then
+			chatHidden = not chatHidden
+			CW.State.chatHidden = chatHidden
+			setChatVisible(not chatHidden)
+		end
+		return Enum.ContextActionResult.Sink
+	end
+	ContextActionService:UnbindAction("CycleWareChatKey")
+	ContextActionService:BindActionAtPriority(
+		"CycleWareChatKey",
+		onChatKey,
+		false,
+		Enum.ContextActionPriority.High.Value + 1,
+		Enum.KeyCode.Z
+	)
 
 	UtilityTab:Toggle({
 		Title = "Toggle Chat with Z",
@@ -10311,7 +10449,7 @@ guarded("Settings", function()
 		end
 	end)
 
-	-- General: the asset library, saving, and putting the interface back to its defaults.
+	-- General: the asset library, putting the interface back to its defaults, and Auto Execute.
 	local General = SettingsTab:AddSubSection("General", false)
 	General:AddLabel("Every change is saved by itself about a second later.")
 	General:Button({
@@ -10325,17 +10463,74 @@ guarded("Settings", function()
 		end,
 	})
 
-
-	General:Button({
-		Title = "Save Now",
-		Callback = function()
-			saveSettings()
-			CW.Log("Settings saved.")
-		end,
-	})
 	if resetInterface then
 		General:Button({ Title = "Reset Interface", Callback = function() resetInterface() end })
 	end
+
+	-- Auto Execute (CW.AutoExecute): the switch puts the loader in the executor's auto-execute folder, or, where
+	-- CycleWare can't reach it, says so and offers the loader to save there by hand.
+	guarded("Auto Execute", function()
+		if not CAPS.files then return end
+		local status, copyButton
+		local function show(text, manual)
+			pcall(function()
+				status:Set(text or "")
+				status.Instance.Visible = text ~= nil
+			end)
+			pcall(function() copyButton.Instance.Visible = manual == true end)
+		end
+
+		local applied = 0
+		local function apply()
+			applied += 1
+			local this = applied
+			if CW.Settings.AUTO_EXECUTE then
+				local folder = CW.AutoExecute.install()
+				if this ~= applied then return end -- switched again meanwhile
+				if folder then
+					show("CycleWare runs by itself when you join Prison Life. The loader is in your executor's "
+						.. folder .. " folder.")
+				else
+					local queued = CW.AutoExecute.queueTeleport()
+					show("CycleWare can't reach your executor's auto-execute folder. Copy the loader and save it there "
+						.. "as a .lua file." .. (queued and " Until then, it runs again after a teleport." or ""), true)
+				end
+			else
+				CW.AutoExecute.uninstall()
+				if this ~= applied then return end
+				show(nil)
+			end
+		end
+
+		General:Toggle({
+			Title = "Auto Execute",
+			Default = CW.Settings.AUTO_EXECUTE == true,
+			Callback = function(enabled)
+				CW.Settings.AUTO_EXECUTE = enabled == true
+				scheduleSave()
+				task.spawn(apply)
+			end,
+		})
+		status = General:AddLabel("")
+		copyButton = General:Button({
+			Title = "Copy Loader",
+			Callback = function()
+				local loader = CW.AutoExecute.loader()
+				local copied = X.setclipboard and pcall(X.setclipboard, loader)
+				if not copied then
+					-- No clipboard: the loader goes in the workspace, to move from there.
+					local saved = pcall(writefile, CW.Paths.CURSOR_ROOT .. "/AutoExecute.lua", loader)
+					show(saved and ("The loader is saved as " .. CW.Paths.CURSOR_ROOT .. "/AutoExecute.lua in your "
+						.. "executor's workspace. Move it to its auto-execute folder.") or "The loader could not be copied.", true)
+					return
+				end
+				copyButton:SetText("Copied")
+				task.delay(1.5, function() pcall(function() copyButton:SetText("Copy Loader") end) end)
+			end,
+		})
+		show(nil)
+		if CW.Settings.AUTO_EXECUTE then task.spawn(apply) end -- keeps the loader up to date
+	end)
 
 	-- Settings slots: named copies of every setting, each a file in SETTINGS_SLOTS_FOLDER written like the settings
 	-- file. Saving copies the settings in use into a slot. Loading makes a slot the settings in use and runs
@@ -10457,6 +10652,8 @@ guarded("Settings", function()
 			end
 			-- The slot becomes the settings file; nothing this run still has may be saved over it.
 			slot.Settings.SETTINGS_SLOT = name
+			-- Auto Execute belongs to this executor, not to a slot: it stays as it is.
+			slot.Settings.AUTO_EXECUTE = CW.Settings.AUTO_EXECUTE == true or nil
 			local encodedOK, encoded = pcall(HttpService.JSONEncode, HttpService, slot)
 			stopSaving()
 			local written = encodedOK and pcall(writefile, CW.Paths.SETTINGS_FILE, encoded)
@@ -10476,7 +10673,7 @@ guarded("Settings", function()
 		local actions = Slots:InputRow({
 			Buttons = {
 				{ Text = "Load", Callback = function(_, row) load(row) end },
-				{ Text = "Update", Callback = function(_, row)
+				{ Text = "Save", Callback = function(_, row) -- over the slot picked above
 					local name = selectedSlot()
 					if not name then
 						row:Flash(2, "None")
