@@ -2805,13 +2805,17 @@ end
 
 --// Confirmation -------------------------------------------------------------------
 -- A question in front of the window: a card with the title ("Are you sure you want to ...?"), a close button (X),
--- Cancel and Confirm. Meanwhile the screen behind is dimmed and takes no clicks, and the game behind is blurred: a
--- BlurEffect on the camera, which Roblox applies to the 3D view only (interface is never blurred), so the window
--- behind is dimmed instead. Cancel, the X and hiding the window close it without confirming. One at a time: a new
--- question replaces the one showing.
+-- Cancel and Confirm. Only the window changes behind it: Roblox can't blur interface (BlurEffect blurs the whole 3D
+-- view, never a frame), so the window's own background is blurred here by drawing its layers several times, each
+-- faint and a few pixels apart (a box blur), over the pages, under a light frost of the window's color; a window with
+-- no background layers gets the frost alone. The pages behind take no clicks meanwhile; the rest of the screen is
+-- left as it is. Cancel, the X and hiding the window close it without confirming. One at a time: a new question
+-- replaces the one showing.
 -- Confirm({ Title = text, ConfirmText = "Confirm", CancelText = "Cancel", OnConfirm = fn, OnCancel = fn })
 -- Returns { close = function() } (closes it without confirming).
-local DIALOG_W, DIALOG_Z, DIALOG_BLUR = 380, 100, 12
+local DIALOG_W, DIALOG_Z = 380, 100
+local BLUR_STEP, BLUR_OPACITY = 8, 0.85 -- pixels between the copies (3 x 3 of them); how much of the pages they cover
+local FROST = 0.78                       -- transparency of the window's color over the blurred copies
 local function dialogButton(parent, text, primary, order)
 	local hit = new("TextButton", {
 		BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Size = UDim2.fromOffset(104, ROW_H),
@@ -2836,24 +2840,61 @@ function Window:Confirm(o)
 	o = type(o) == "table" and o or { Title = tostring(o) }
 	if self._dialog then self._dialog.close() end
 	self:_popupOpening(nil) -- an open dropdown or color picker closes
-	local gui, shell = self._gui, self._shell
-	local conns, closed = {}, false
+	local shell = self._shell
+	local closed = false
 	local dialog = {}
 
-	-- The whole screen: dimmed, and it keeps clicks from the window and the game (Modal frees the mouse in first
-	-- person, as the window does).
-	local scrim = new("TextButton", {
-		Name = "Confirm", Text = "", AutoButtonColor = false, Active = true, Modal = true,
-		BackgroundColor3 = "Track", BackgroundTransparency = 1, BorderSizePixel = 0,
-		Size = UDim2.fromScale(1, 1), ZIndex = DIALOG_Z, Parent = gui,
+	-- Over the window only: it keeps clicks from the pages (Modal frees the mouse in first person, as the window
+	-- does). The frost is a CanvasGroup, so it fades as one and is cut to the window's corners.
+	local blocker = new("TextButton", {
+		Name = "Confirm", Text = "", AutoButtonColor = false, Active = true, Modal = true, BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1), ZIndex = DIALOG_Z, Parent = shell,
 	})
+	local frost = new("CanvasGroup", {
+		BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), GroupTransparency = 1, Parent = blocker,
+	}, { corner(6) })
+	local layers = {}
+	for _, label in ipairs(self._layerLabels or {}) do
+		if label.Parent and self._backdrop.Visible then table.insert(layers, label) end
+	end
+	-- Under the copies the window's own color covers the pages; with no layers it is the frost by itself.
+	new("Frame", {
+		Size = UDim2.fromScale(1, 1), BackgroundColor3 = "Content", BorderSizePixel = 0,
+		BackgroundTransparency = #layers > 0 and 0.35 or 0.2, Parent = frost,
+	})
+	if #layers > 0 then
+		-- Each copy at alpha a: nine of them stacked cover 1 - (1 - a)^9 = BLUR_OPACITY.
+		local alpha = 1 - (1 - BLUR_OPACITY) ^ (1 / 9)
+		local function faint(transparency) return 1 - (1 - transparency) * alpha end
+		-- Each copy is a step larger on every side than the window, so a shifted one still reaches its edges.
+		for dx = -1, 1 do
+			for dy = -1, 1 do
+				local tap = new("Frame", {
+					BackgroundTransparency = 1, Size = UDim2.new(1, 2 * BLUR_STEP, 1, 2 * BLUR_STEP),
+					Position = UDim2.fromOffset((dx - 1) * BLUR_STEP, (dy - 1) * BLUR_STEP), Parent = frost,
+				})
+				for _, label in ipairs(layers) do
+					local copy = label:Clone()
+					copy.ImageTransparency = faint(copy.ImageTransparency)
+					copy.BackgroundTransparency = faint(copy.BackgroundTransparency)
+					copy.Parent = tap
+				end
+			end
+		end
+		new("Frame", {
+			Size = UDim2.fromScale(1, 1), BackgroundColor3 = "Content", BorderSizePixel = 0,
+			BackgroundTransparency = FROST, Parent = frost,
+		})
+	end
+
 	local card = new("Frame", {
-		Name = "Card", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(DIALOG_W, 0),
-		AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = "Item", BorderSizePixel = 0, ZIndex = 2,
-		Parent = scrim,
+		Name = "Card", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, -32, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = "Item",
+		BorderSizePixel = 0, ZIndex = 2, Parent = blocker,
 	}, {
 		corner(RADIUS + 2),
 		new("UIStroke", { Color = "Divider", Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }),
+		new("UISizeConstraint", { MaxSize = Vector2.new(DIALOG_W, math.huge) }),
 	})
 	local scale = new("UIScale", { Scale = 0.96, Parent = card })
 	new("Frame", { -- the orange edge, as on the notice: something to read
@@ -2904,39 +2945,14 @@ function Window:Confirm(o)
 	local cancel = dialogButton(row, o.CancelText or "Cancel", false, 1)
 	local confirm = dialogButton(row, o.ConfirmText or "Confirm", true, 2)
 
-	-- In the middle of the window, wherever it is, and never wider than it.
-	local function place()
-		local at, size, origin = shell.AbsolutePosition, shell.AbsoluteSize, scrim.AbsolutePosition
-		card.Position = UDim2.fromOffset(at.X - origin.X + size.X / 2, at.Y - origin.Y + size.Y / 2)
-		card.Size = UDim2.fromOffset(math.max(math.min(DIALOG_W, size.X - 32), 200), 0)
-	end
-	place()
-	table.insert(conns, shell:GetPropertyChangedSignal("AbsolutePosition"):Connect(place))
-	table.insert(conns, shell:GetPropertyChangedSignal("AbsoluteSize"):Connect(place))
-
-	local blur
-	pcall(function()
-		local camera = workspace.CurrentCamera
-		if not camera then return end
-		blur = Instance.new("BlurEffect")
-		blur.Name = "CW_ConfirmBlur"
-		blur.Size = 0
-		blur.Parent = camera
-	end)
-
 	local function close(confirmed)
 		if closed then return end
 		closed = true
 		if self._dialog == dialog then self._dialog = nil end
-		for _, c in ipairs(conns) do c:Disconnect() end
 		self:_lockScroll(false)
 		card.Visible = false
-		tween(scrim, { BackgroundTransparency = 1 }, 0.12)
-		if blur then tween(blur, { Size = 0 }, 0.12) end
-		task.delay(0.15, function()
-			scrim:Destroy()
-			if blur then blur:Destroy() end
-		end)
+		tween(frost, { GroupTransparency = 1 }, 0.12)
+		task.delay(0.15, function() blocker:Destroy() end)
 		safeCall(confirmed and o.OnConfirm or o.OnCancel)
 	end
 	dialog.close = function() close(false) end
@@ -2946,9 +2962,8 @@ function Window:Confirm(o)
 	cancel.MouseButton1Click:Connect(function() close(false) end)
 	confirm.MouseButton1Click:Connect(function() close(true) end)
 
-	tween(scrim, { BackgroundTransparency = 0.45 }, 0.15)
+	tween(frost, { GroupTransparency = 0 }, 0.15)
 	tween(scale, { Scale = 1 }, 0.15)
-	if blur then tween(blur, { Size = DIALOG_BLUR }, 0.2) end
 	return dialog
 end
 
@@ -3035,7 +3050,7 @@ end
 
 function Window:Destroy()
 	self._destroyed = true
-	if self._dialog then self._dialog.close() end -- its blur is on the camera, outside the window's GUI
+	if self._dialog then self._dialog.close() end
 	for _, c in ipairs(self._conns) do c:Disconnect() end
 	table.clear(self._conns)
 	self._gui:Destroy()
