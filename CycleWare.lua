@@ -6853,18 +6853,17 @@ end)()))
 -- The form under a list whose items can be added by ID (gun meshes and sounds, the hitmarker and texture galleries,
 -- the cursors), the same everywhere:
 --   [ID or link] [Name (optional)]
---   [Add | Save] [Add] [Cancel] [Remove]
--- The boxes follow what the list has chosen: a custom ID shows its ID and name there, so changing them and pressing
--- Save changes that ID (another ID in its place keeps its choices). Add, next to Save, puts a different typed ID in
--- the list as one more, leaving the chosen one as it is. With nothing custom chosen the boxes are for a new ID (Add).
--- Cancel puts back what the boxes showed; Remove deletes the chosen custom ID. A button other than the first is shown
--- only while it can do something.
+--   [Save] [Remove]     while the list has one of the player's own IDs chosen
+--   [Add]               otherwise
+-- The boxes follow what the list has chosen: an ID the player added shows its ID and name there, so changing them
+-- and pressing Save changes that ID (another ID in its place keeps its choices), and Remove deletes it. With anything
+-- else chosen the boxes are for a new ID (Add).
 -- spec = {
 --   idTitle, idPlaceholder         the ID box
 --   choice()        -> what the list has chosen now (any value; a change of it fills the boxes again)
 --   chosen()        -> the chosen custom entry { Id, Name }, or nil
 --   setEditing(entry or nil)        the entry the boxes hold (Save changes it)
---   save(values, asNew, view)       view.flash(text, seconds); view.saved(text) after an add or a change
+--   save(values)                    then view.flash(text, seconds), or view.saved(text) after an add or a change
 --   cancel()                        drops a check or a download still running
 --   remove(entry)   -> true when it was removed
 --   caption(entry or nil)           (optional) the panel's caption
@@ -6889,27 +6888,16 @@ local function idForm(holder, spec)
 			fields:Clear()
 		end
 	end
-	-- Whether the boxes hold something other than what load() put there.
-	local function changed()
-		local id, name = fields:Get("id") or "", fields:Get("name") or ""
-		if editing then return id ~= tostring(editing.Id) or name ~= (editing.Name or "") end
-		return id ~= "" or name ~= ""
-	end
 
 	local function refresh()
 		if not (fields and buttons) then return end
 		local choice = spec.choice()
 		if (choice == nil and "" or choice) ~= shown then load() end
-		local typedId = CW.CustomIds.parse(fields:Get("id"))
 		buttons:SetButtonText(1, editing and "Save" or "Add")
-		if buttons.SetButtonVisible then
-			buttons:SetButtonVisible(2, editing ~= nil and typedId ~= nil and typedId ~= tostring(editing.Id)) -- Add
-			buttons:SetButtonVisible(3, changed())                                                         -- Cancel
-			buttons:SetButtonVisible(4, editing ~= nil)                                                     -- Remove
-		end
+		if buttons.SetButtonVisible then buttons:SetButtonVisible(2, editing ~= nil) end -- Remove
 		if spec.caption then spec.caption(editing) end
 	end
-	-- Back to what the list has chosen (after a save, a removal or Cancel).
+	-- Back to what the list has chosen (after a save or a removal).
 	local function reload()
 		shown = false
 		refresh()
@@ -6928,12 +6916,7 @@ local function idForm(holder, spec)
 		{ Key = "name", Title = "Name (optional)", Placeholder = "Name (optional)", Weight = 0.45 },
 	}, {}, refresh)
 	buttons = inputRow(holder, {}, {
-		{ Text = "Add", Title = "Save or Add ID", Callback = function() spec.save(values(), false, view) end },
-		{ Text = "Add", Title = "Add as Another ID", Callback = function() spec.save(values(), true, view) end },
-		{ Text = "Cancel", Title = "Cancel", Callback = function()
-			spec.cancel()
-			reload()
-		end },
+		{ Text = "Add", Title = "Save or Add ID", Callback = function() spec.save(values()) end },
 		{ Text = "Remove", Title = "Remove Selected ID", Callback = function()
 			if editing and spec.remove(editing) then reload() end
 		end },
@@ -7041,8 +7024,7 @@ local function customIdEditor(opts, view)
 
 	-- An ID is saved only once Roblox has loaded it (audio as audio, image as image); a new name for an ID
 	-- that is already saved needs no check. Pressing again while a check runs starts over with what is typed.
-	-- asNew: added as another ID even while one is being edited (that one stays as it is).
-	function editor.save(values, asNew)
+	function editor.save(values)
 		attempt += 1
 		local mine = attempt
 		local weapon = editor.weapon()
@@ -7051,7 +7033,7 @@ local function customIdEditor(opts, view)
 			view.flash("Invalid")
 			return
 		end
-		local oldId = not asNew and editor.editingId or nil
+		local oldId = editor.editingId
 		local known = (oldId and newId == oldId) or (not oldId and CW.CustomIds.get(category, weapon, newId) ~= nil)
 		if known then
 			commit(values, weapon, newId, oldId)
@@ -7102,7 +7084,7 @@ local function customIdForm(holder, opts, caption)
 		choice = function() return editor.selectedId() end,
 		chosen = function() return editor.entry(editor.selectedId()) end,
 		setEditing = function(entry) editor.editingId = entry and entry.Id or nil end,
-		save = function(values, asNew) editor.save(values, asNew) end,
+		save = editor.save,
 		cancel = editor.cancel,
 		remove = function(entry) return editor.remove(entry.Id) end,
 		caption = caption,
@@ -7255,9 +7237,8 @@ local function addCursorIdRow(section)
 		CW.Library.replaceSelectionOf("Cursors", nil, old.File, relative)
 	end
 
-	-- Pressing again while a download runs starts over with what is typed. asNew: added as another cursor even
-	-- while one is in the boxes (that one stays as it is).
-	local function save(values, asNew)
+	-- Pressing again while a download runs starts over with what is typed.
+	local function save(values)
 		attempt += 1
 		local mine = attempt
 		if not CAPS.files then
@@ -7270,7 +7251,7 @@ local function addCursorIdRow(section)
 			view.flash("Invalid")
 			return
 		end
-		local old = not asNew and editing or nil
+		local old = editing
 		if not old and CW.CustomIds.get("Cursors", nil, id) then
 			view.flash("Exists", 2)
 			CW.Warn("Cursor ID " .. id .. " was already added")
@@ -7358,7 +7339,7 @@ local function addCursorIdRow(section)
 		choice = function() return CW.Library.relative(CW.Paths.CURSOR_FILE) end,
 		chosen = selectedEntry,
 		setEditing = function(entry) editing = entry end,
-		save = function(values, asNew) save(values, asNew) end,
+		save = save,
 		cancel = function() attempt += 1 end,
 		remove = remove,
 	})
@@ -7810,7 +7791,7 @@ guarded("Guns", function()
 				if resetFire.Instance then resetFire.Instance.Visible = CW.State.meshEdit == true end
 			end
 		end
-		adjust = page:AddSubSection("Adjust Mesh", true)
+		adjust = page:AddSubSection("Adjust Mesh", false)
 		for _, spec in ipairs(ADJUST_SLIDERS) do
 			local field, limits = spec[1], CW.MeshAdjust[spec[1]]
 			sliders[field] = adjust:Slider({
