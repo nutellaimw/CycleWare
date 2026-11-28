@@ -32,8 +32,25 @@
 
 local CW = { Version = "3.2.0" }
 
+--// Executor functions -------------------------------------------------------
+-- CycleWare passes its own versions of these (each call runs on a thread of its own, so an executor that lowers
+-- the permissions of the thread calling it can't break the interface). Loaded by anything else, the library uses
+-- the executor's own.
+local host = ...
+local function hostFn(name, fallback)
+	if type(host) == "table" and type(host[name]) == "function" then return host[name] end
+	return fallback
+end
+local cloneref = hostFn("cloneref", cloneref) or function(x) return x end
+local gethui = hostFn("gethui", gethui)
+local protectGui = hostFn("protectGui", syn and syn.protect_gui)
+local setclipboard = hostFn("setclipboard", setclipboard)
+local getcustomasset = hostFn("getcustomasset", getcustomasset)
+local isfile = hostFn("isfile", isfile)
+local isfolder = hostFn("isfolder", isfolder)
+local listfiles = hostFn("listfiles", listfiles)
+
 --// Services ---------------------------------------------------------------
-local cloneref = cloneref or function(x) return x end
 local TweenService     = cloneref(game:GetService("TweenService"))
 local RunService       = cloneref(game:GetService("RunService"))
 local UserInputService = cloneref(game:GetService("UserInputService"))
@@ -2746,6 +2763,43 @@ end
 function Window:SetVisible(v) self._shell.Visible = v end
 function Window:Toggle() self._shell.Visible = not self._shell.Visible end
 
+-- A line over the content for what the host needs the player to know (CycleWare: the parts that did not load).
+-- SetNotice(nil) or its Dismiss button takes it away; the pages move down while it shows.
+local NOTICE_H = 56
+function Window:SetNotice(text)
+	if self._notice then
+		self._notice:Destroy()
+		self._notice = nil
+	end
+	local content, sidebarW = self._content, self._sidebarW or 164
+	local function place(offset)
+		content.Position = UDim2.fromOffset(sidebarW, offset)
+		content.Size = UDim2.new(1, -sidebarW, 1, -offset)
+	end
+	if type(text) ~= "string" or text == "" then
+		place(0)
+		return
+	end
+	local notice = new("Frame", {
+		Name = "Notice", Position = UDim2.fromOffset(sidebarW + 8, 8), Size = UDim2.new(1, -(sidebarW + 16), 0, NOTICE_H - 12),
+		Surface = "Panel", BackgroundColor3 = "Item", BorderSizePixel = 0, Parent = self._shell,
+	}, { corner(RADIUS) })
+	new("Frame", { -- the orange edge: something to read
+		Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = "Accent", BorderSizePixel = 0, Parent = notice,
+	}, { corner(RADIUS) })
+	new("TextLabel", { -- a longer text gets smaller instead of running out of the box
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 4), Size = UDim2.new(1, -120, 1, -8),
+		Text = text, TextColor3 = "Text", TextScaled = true, FontFace = Fonts.Medium, TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center, Parent = notice,
+	}, { new("UITextSizeConstraint", { MaxTextSize = 14, MinTextSize = 10 }) })
+	local dismiss = smallButton(notice, "Dismiss", 88, 2)
+	dismiss.AnchorPoint = Vector2.new(1, 0.5)
+	dismiss.Position = UDim2.new(1, -8, 0.5, 0)
+	dismiss.MouseButton1Click:Connect(function() self:SetNotice(nil) end)
+	self._notice = notice
+	place(NOTICE_H)
+end
+
 --// Camadas de fundo com parallax ------------------------------------------------
 -- Adaptado do editor de camadas do Iterator Meadow e do parallax estilo Rain World, com estas mudanças:
 --   * posição e tamanho em frações da janela (a referência usava pixels de uma prévia 399x280 e
@@ -2860,8 +2914,21 @@ function CW:CreateWindow(cfg)
 		Name = cfg.Name or "CW_UI", ResetOnSpawn = false, IgnoreGuiInset = true,
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 999999,
 	})
-	if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
-	gui.Parent = (gethui and gethui()) or CoreGui
+	if protectGui then pcall(protectGui, gui) end
+	-- The first container that takes it: the executor's hidden one, CoreGui, then the player's own.
+	local containers = {}
+	if gethui then
+		local ok, hidden = pcall(gethui)
+		if ok and typeof(hidden) == "Instance" then table.insert(containers, hidden) end
+	end
+	table.insert(containers, CoreGui)
+	local localPlayer = game:GetService("Players").LocalPlayer
+	local playerGui = localPlayer and localPlayer:FindFirstChildOfClass("PlayerGui")
+	if playerGui then table.insert(containers, playerGui) end
+	for _, container in ipairs(containers) do
+		if pcall(function() gui.Parent = container end) and gui.Parent == container then break end
+	end
+	if not gui.Parent then error("no container accepted the window", 0) end
 	self._gui = gui
 
 	local WIN_R, SIDEBAR_W, LOGO_H, FOOTER_H, INSET = 6, 164, 72, 58, 6
@@ -2902,6 +2969,7 @@ function CW:CreateWindow(cfg)
 		Position = UDim2.fromOffset(SIDEBAR_W, 0), Size = UDim2.new(1, -SIDEBAR_W, 1, 0), Parent = window,
 	})
 	self._content = content
+	self._sidebarW = SIDEBAR_W
 
 	-- Barra lateral: painel embutido com margem, sem peças sobrepostas (com transparência, sobreposição
 	-- apareceria como uma faixa mais escura).
