@@ -1,13 +1,124 @@
 -- CycleWare. Standalone entry point; module bodies below are kept in isolated scopes.
 
 --=============================================================================
+-- Thread permissions
+--   Roblox keeps a thread's permissions as they are across yields and resumes (checked in Studio). Some
+--   executors don't: one of their functions can return with the permissions of the thread that called it
+--   lowered, and from then on that thread can't touch the GUI ("The current thread cannot access 'Instance'
+--   (lacking capability Plugin)"). That once stopped a whole start: the interface never showed and the loading
+--   screen only left when its safety timer ran out, a minute later. Three rules keep the script's own threads
+--   out of it:
+--     * every executor function is called on a short-lived thread of its own (Exec.call): whatever it does to
+--       that thread, the caller keeps its permissions;
+--     * the startup and the GUI run on threads from cleanThread, made here before any executor call;
+--     * a startup step or a UI section that finds its thread lowered anyway runs on a new clean thread
+--       (runClean), and the console says which executor function did it.
+--=============================================================================
+local SCRIPT_VERSION = "2.0.0"
+
+-- New threads made by a thread that never calls an executor function, so each one starts with the
+-- permissions this script started with (a new thread gets those of the thread that made it).
+local cleanThread
+do
+	local factory = coroutine.create(function()
+		local fn = coroutine.yield()
+		while true do
+			fn = coroutine.yield(coroutine.create(fn))
+		end
+	end)
+	coroutine.resume(factory)
+	function cleanThread(fn)
+		local made, thread = coroutine.resume(factory, fn)
+		if made and type(thread) == "thread" then return thread end
+		return coroutine.create(fn)
+	end
+end
+
+-- A small object in the GUI container (see CW.attachGui). Changing it fails on a thread that lost its
+-- permissions, which is how such a thread is told apart. Until it exists every thread counts as fine.
+local guiProbe
+local function threadCanTouchGui()
+	if not guiProbe then return true end
+	return (pcall(function() guiProbe.Name = "CW_Probe" end))
+end
+
+local Exec = {}
+do
+	local reported = {}
+	-- Once per function: the console names the executor function that lowered a thread.
+	function Exec.noteLowered(name)
+		if reported[name] then return end
+		reported[name] = true
+		warn("[CW] The executor's " .. name .. " lowered the permissions of the thread that called it. CycleWare "
+			.. "calls executor functions on threads of their own, so it keeps working.")
+	end
+
+	-- Calls fn(...) on a thread of its own and returns what it returns (raises its error). A call that yields (HTTP)
+	-- is waited for, up to `timeout` seconds (30 when nil); then it raises "<name> did not answer in N s".
+	function Exec.call(name, timeout, fn, ...)
+		local box = {}
+		local worker = coroutine.create(function(...)
+			local clean = threadCanTouchGui()
+			box.result = table.pack(pcall(fn, ...))
+			if clean and not threadCanTouchGui() then Exec.noteLowered(name) end
+			box.done = true
+		end)
+		local started, startError = coroutine.resume(worker, ...)
+		if not started then error(startError, 0) end
+		if not box.done then
+			local limit = timeout or 30
+			local deadline = os.clock() + limit
+			while not box.done do
+				if os.clock() >= deadline then error(name .. " did not answer in " .. limit .. " s", 0) end
+				task.wait()
+			end
+		end
+		local result = box.result
+		if not result[1] then error(result[2], 0) end
+		return table.unpack(result, 2, result.n)
+	end
+
+	-- The executor's function wrapped so every call goes through Exec.call; nil when the executor has none.
+	function Exec.wrap(name, fn, timeout)
+		if type(fn) ~= "function" then return nil end
+		return function(...) return Exec.call(name, timeout, fn, ...) end
+	end
+
+	-- Starts fn(...) on a thread of its own without waiting for it (firesignal: the game's handlers can yield).
+	function Exec.spawn(name, fn, ...)
+		local worker = coroutine.create(function(...)
+			local clean = threadCanTouchGui()
+			local ok, err = pcall(fn, ...)
+			if clean and not threadCanTouchGui() then Exec.noteLowered(name) end
+			if not ok then warn("[CW] " .. name .. " failed: " .. tostring(err)) end
+		end)
+		local started, startError = coroutine.resume(worker, ...)
+		if not started then warn("[CW] " .. name .. " failed: " .. tostring(startError)) end
+	end
+end
+
+-- Runs fn(...) now. On a thread that lost its permissions it runs on a new clean thread instead; the caller
+-- waits for it either way (a fn that yields is waited for). Returns pcall's results.
+local function runClean(label, fn, ...)
+	if threadCanTouchGui() then return pcall(fn, ...) end
+	warn("[CW] The thread running " .. label .. " lost its permissions; continuing on a new thread.")
+	local box = {}
+	local thread = cleanThread(function(...)
+		box.result = table.pack(pcall(fn, ...))
+		box.done = true
+	end)
+	local started, startError = coroutine.resume(thread, ...)
+	if not started then return false, startError end
+	while not box.done do task.wait() end
+	return table.unpack(box.result, 1, box.result.n)
+end
+
+--=============================================================================
 -- Preflight
 --   Executor functions this script depends on. Whatever is missing is replaced by a safe
 --   stand-in, so a single missing function disables one feature instead of aborting the
 --   whole script. What was found is stored in CW.Caps and reported once at startup.
 --=============================================================================
-local SCRIPT_VERSION = "2.0.0"
-
 local CAPS = {
 	files = type(isfile) == "function" and type(isfolder) == "function"
 		and type(makefolder) == "function" and type(readfile) == "function"
@@ -31,31 +142,77 @@ do
 	CAPS.httpGet = indexed and type(value) == "function"
 end
 
-local getgenv = getgenv
-if not CAPS.getgenv then
-	local privateEnv = {}
-	getgenv = function() return privateEnv end
+-- The executor's environment, read once (every getgenv call would be one more executor call).
+local genv
+if CAPS.getgenv then
+	local ok, env = pcall(Exec.call, "getgenv", nil, getgenv)
+	if ok and type(env) == "table" then genv = env else CAPS.getgenv = false end
 end
-local isfile         = isfile or function() return false end
-local isfolder       = isfolder or function() return false end
-local makefolder     = makefolder or function() end
-local readfile       = readfile or function() error("readfile is unavailable", 0) end
-local writefile      = writefile or function() error("writefile is unavailable", 0) end
-local delfile        = delfile or function() error("delfile is unavailable", 0) end
-local listfiles      = listfiles or function() return {} end
-local getcustomasset = getcustomasset or getsynasset
+genv = genv or {}
+local function getgenv() return genv end
+
+-- File functions, each call on a thread of its own (Exec); a missing one is a safe stand-in.
+local isfile         = Exec.wrap("isfile", isfile) or function() return false end
+local isfolder       = Exec.wrap("isfolder", isfolder) or function() return false end
+local makefolder     = Exec.wrap("makefolder", makefolder) or function() end
+local readfile       = Exec.wrap("readfile", readfile) or function() error("readfile is unavailable", 0) end
+local writefile      = Exec.wrap("writefile", writefile) or function() error("writefile is unavailable", 0) end
+local delfile        = Exec.wrap("delfile", delfile) or function() error("delfile is unavailable", 0) end
+local listfiles      = Exec.wrap("listfiles", listfiles) or function() return {} end
+local getcustomasset = Exec.wrap("getcustomasset", getcustomasset or getsynasset)
 	or function() error("getcustomasset is unavailable", 0) end
 
--- Runs one module in isolation: if it throws, the error is reported and the modules after it still load.
-local function runModule(name, fn)
-	local ok, err = xpcall(fn, function(message)
-		return debug.traceback(tostring(message), 2)
+-- Every other executor function the script calls, wrapped the same way (nil when the executor lacks it).
+-- getnamecallmethod and checkcaller are not here: they describe the thread they run on, so the hooks call them
+-- directly.
+local dbg = type(debug) == "table" and debug or {}
+local X = {
+	gethui         = Exec.wrap("gethui", gethui),
+	hookmetamethod = Exec.wrap("hookmetamethod", hookmetamethod),
+	newcclosure    = Exec.wrap("newcclosure", newcclosure),
+	getconnections = Exec.wrap("getconnections", getconnections),
+	getupvalues    = Exec.wrap("debug.getupvalues", dbg.getupvalues),
+	getupvalue     = Exec.wrap("debug.getupvalue", dbg.getupvalue),
+	setupvalue     = Exec.wrap("debug.setupvalue", dbg.setupvalue),
+	getinfo        = Exec.wrap("debug.getinfo", dbg.getinfo),
+	islclosure     = Exec.wrap("islclosure", islclosure),
+	iscclosure     = Exec.wrap("iscclosure", iscclosure),
+	keypress       = Exec.wrap("keypress", keypress),
+	keyrelease     = Exec.wrap("keyrelease", keyrelease),
+	loadstring     = Exec.wrap("loadstring", loadstring),
+	setclipboard   = Exec.wrap("setclipboard", setclipboard or toclipboard),
+	cloneref       = Exec.wrap("cloneref", cloneref),
+	protectGui     = Exec.wrap("protect_gui", syn and syn.protect_gui),
+	firesignal     = type(firesignal) == "function" and function(...) Exec.spawn("firesignal", firesignal, ...) end or nil,
+}
+
+-- The connections of a signal (getconnections) as plain tables { fn, foreign, canFire, raw }, read on a thread of their own
+-- (on some executors even reading a connection's fields runs executor code). Empty without getconnections.
+local function connectionsOf(signal)
+	if not X.getconnections then return {} end
+	local ok, list = pcall(Exec.call, "getconnections", nil, function()
+		local result = {}
+		for _, connection in ipairs(getconnections(signal)) do
+			local entry = { raw = connection }
+			pcall(function() entry.foreign = connection.ForeignState end)
+			-- (connections of a foreign Luau state, such as CoreScripts, are left alone)
+			if entry.foreign ~= true then pcall(function() entry.fn = connection.Function end) end
+			pcall(function() entry.canFire = type(connection.Fire) == "function" end)
+			table.insert(result, entry)
+		end
+		return result
 	end)
-	if not ok then
-		warn("[CW] Module '" .. name .. "' failed: " .. tostring(err))
-	end
-	return ok
+	return ok and type(list) == "table" and list or {}
 end
+
+-- Startup steps: each module of this file, then the interface. runModule only records a step; the Startup section
+-- (end of the file) runs them in order on a clean thread. A step that throws is reported and the next one still runs.
+local steps = {}
+local function runModule(name, fn)
+	table.insert(steps, { name = name, fn = fn })
+end
+-- What failed while starting (step or UI section name -> error); the window lists them (Finish step).
+local startupProblems = {}
 
 local _env = getgenv()
 local _cfg = _env.CW_CONFIG
@@ -116,6 +273,15 @@ CW.IsFirstRun  = isFirstRun
 CW.LocalPlayer = LocalPlayer
 CW.Mouse       = Mouse
 
+-- Each run has a number; a run whose number is no longer the latest stops at its next step (a re-run took over).
+CW.State.runId = (CW.State.runId or 0) + 1
+local runId = CW.State.runId
+local function isCurrentRun() return CW.State.runId == runId end
+if CW.State.startupThread and coroutine.status(CW.State.startupThread) == "suspended" then
+	pcall(task.cancel, CW.State.startupThread) -- the last run was still starting
+end
+CW.State.startupProblems = startupProblems
+
 CW.PreviousVersion = CW.Version
 CW.Version         = SCRIPT_VERSION
 CW.Caps            = CAPS
@@ -171,11 +337,23 @@ end
 
 --// GUI parent -----------------------------------------------------------------------
 -- Parents the GUI to the first container that accepts it: gethui() when the executor has it,
--- otherwise CoreGui, otherwise PlayerGui.
+-- otherwise CoreGui, otherwise PlayerGui. The first GUI also takes the permission probe (guiProbe) along:
+-- it sits in the same container, so it is protected exactly like the GUI.
+local function placeProbe(container)
+	if guiProbe and guiProbe.Parent == container then return end
+	local probe = Instance.new("Folder")
+	probe.Name = "CW_Probe"
+	if pcall(function() probe.Parent = container end) and probe.Parent == container then
+		local previous = CW.State.guiProbe -- the last run's
+		if previous and previous ~= probe then pcall(function() previous:Destroy() end) end
+		CW.State.guiProbe = probe
+		guiProbe = probe
+	end
+end
 function CW.attachGui(gui)
 	local candidates = {}
-	if type(gethui) == "function" then
-		local ok, container = pcall(gethui)
+	if X.gethui then
+		local ok, container = pcall(X.gethui)
 		if ok and typeof(container) == "Instance" then table.insert(candidates, container) end
 	end
 	local okCore, coreGui = pcall(function() return game:GetService("CoreGui") end)
@@ -185,25 +363,45 @@ function CW.attachGui(gui)
 
 	for _, container in ipairs(candidates) do
 		local attached = pcall(function() gui.Parent = container end)
-		if attached and gui.Parent == container then return true end
+		if attached and gui.Parent == container then
+			if not guiProbe then placeProbe(container) end
+			return true
+		end
 	end
 	return false
 end
 
 --// Loading screen -------------------------------------------------------------------
--- On screen from here until the UI is built (loadingScreen.close, at the end of the UI); the window stays hidden
--- until then. Size, text sizes, places and the opening and closing come from the owner's Intro (350x200); the
--- look (colors, texts, color bar, lighter band, ring) from the owner's reference image. Arimo is the closest
--- Roblox font to the reference's regular sans.
-local loadingScreen = {} -- step(label, progress) while loading; close(now, onClosed)
-do
+-- On screen from here until the interface is built; the window stays hidden until it goes. Size, text sizes,
+-- places and the opening and closing come from the owner's Intro (350x200); the look (colors, texts, color bar,
+-- lighter band, ring) from the owner's reference image. Arimo is the closest Roblox font to the reference's
+-- regular sans.
+-- It only shows what the startup reports: step(label, progress) while loading, then finish(outcome, message,
+-- onClosed). It draws from its own frame loop, made on a clean thread, so a step whose thread lost its
+-- permissions can't break it, and the end it shows is the real one:
+--   "ready"     Ready, then it goes and onClosed opens the window;
+--   "problems"  the window opens too, after the screen said how many parts failed (the window lists them);
+--   "failed"    the interface could not start: the screen says why and stays until clicked (or FAILED_SHOWN s).
+-- A step that takes long gets a "taking longer than usual" line; a startup that ends without a result is shown
+-- as stopped, at the step it was on.
+local loadingScreen = {} -- step(label, progress), finish(outcome, message, onClosed), watch(thread)
+-- Stand-ins, for when the screen can't be built: steps are ignored and finish opens the window at once.
+function loadingScreen.step() end
+function loadingScreen.watch() end
+function loadingScreen.finish(outcome, message, onClosed)
+	if outcome == "failed" then warn("[CW] " .. tostring(message)) end
+	if onClosed then task.spawn(cleanThread(onClosed)) end
+end
+local screenBuilt, screenError = pcall(function()
 	local RunService = game:GetService("RunService")
 	local TweenService = game:GetService("TweenService")
-	local MIN_SHOWN, GIVE_UP = 2, 60 -- seconds: shortest time on screen (the opening takes 1.6), safety close
+	local MIN_SHOWN = 1.7 -- seconds: shortest time on screen (the opening takes 1.65)
+	local SLOW_AFTER = 15 -- seconds on one step before the "taking longer" line shows
+	local FAILED_SHOWN = 20 -- seconds a failure stays up when not clicked
 	local FONT = Font.new("rbxasset://fonts/families/Arimo.json")
 	local DARK, BAND, WHITE = Color3.fromRGB(38, 38, 38), Color3.fromRGB(64, 64, 64), Color3.new(1, 1, 1)
 
-	if CW.closeLoadingScreen then CW.closeLoadingScreen(true) end -- a re-run replaces the last run's screen
+	if CW.closeLoadingScreen then pcall(CW.closeLoadingScreen, true) end -- a re-run replaces the last run's screen
 
 	-- With Reduced Motion on (Roblox's settings), it shows and goes at once and the ring stays still.
 	local still = false
@@ -287,6 +485,10 @@ do
 	local status = text("Loading modules", 14, {
 		Position = UDim2.fromOffset(20, 110), Size = UDim2.fromOffset(180, 25), TextTransparency = 1,
 	}, card)
+	-- Under the bar: "taking longer than usual" while a step is slow; after a failure, where the details are.
+	local hint = text("", 12, {
+		Position = UDim2.fromOffset(20, 152), Size = UDim2.fromOffset(180, 18), TextTransparency = 1,
+	}, card)
 	local track = make("Frame", {
 		Position = UDim2.fromOffset(110, 145), Size = UDim2.fromOffset(0, 4), BackgroundColor3 = BAND, BorderSizePixel = 0,
 	}, card)
@@ -353,9 +555,6 @@ do
 		BackgroundColor3 = BAND, BorderSizePixel = 0, ZIndex = 3,
 	})
 
-	local spin = not still and RunService.RenderStepped:Connect(function(dt)
-		ring.Rotation = (ring.Rotation - 330 * dt) % 360
-	end)
 	CW.attachGui(gui)
 
 	-- Opening, as in the Intro: the card closes in from both ends; then the dark side wipes in, the title and
@@ -377,53 +576,141 @@ do
 		tween(ringScale, 0.35, { Scale = 1 }, Enum.EasingStyle.Back)
 	end)
 
-	function loadingScreen.step(label, progress)
-		status.Text = label
-		tween(fill, 0.25, { Size = UDim2.fromScale(progress, 1) })
-	end
+	--// What the startup reports (plain values: these never touch the GUI)
+	local report = { label = "Loading modules", progress = 0.1 }
+	local reportedAt, shownAt = os.clock(), os.clock()
+	local finished -- { outcome, message, onClosed } once finish was called
+	local startupThread -- the thread running the startup: if it ends without finish, the startup stopped
 
-	local shownAt, closed = os.clock(), false
+	function loadingScreen.step(label, progress)
+		report.label, report.progress = label, progress or report.progress
+		reportedAt = os.clock()
+	end
+	function loadingScreen.finish(outcome, message, onClosed)
+		if finished then return end
+		finished = { outcome = outcome or "ready", message = message, onClosed = onClosed }
+	end
+	function loadingScreen.watch(thread) startupThread = thread end
+
+	--// Drawing, from the frame loop only
+	local driver
+	local removed, closing, failedShown = false, false, false
+	local drawn: { [string]: any } = {} -- what is on screen now (label, progress, hint, when the end began)
 	local function remove()
-		if spin then spin:Disconnect() end
+		if removed then return end
+		removed = true
+		if driver then driver:Disconnect() end
 		gui:Destroy()
 	end
-	-- now: remove it at once (a re-run). Otherwise, once it has been up MIN_SHOWN seconds, it closes as the Intro
-	-- does: the bar fills (the full color line stays a moment), the texts fade, the dark side covers the card and
-	-- a last sweep takes it away. onClosed runs as the card goes (at once when it is already gone).
-	function loadingScreen.close(now, onClosed)
-		if closed then
-			if onClosed then pcall(onClosed) end
-			return
+	local function showHint(content)
+		if drawn.hint == content then return end
+		drawn.hint = content
+		hint.Text = content
+		tween(hint, 0.25, { TextTransparency = content == "" and 1 or 0.4 })
+	end
+	-- As the Intro closes: the texts fade, the dark side covers the card and a last sweep takes it away. onClosed
+	-- (the window opening) runs as the card goes.
+	local function closeCard(onClosed)
+		if closing then return end
+		closing = true
+		for _, label in ipairs({ title, subtitle, status, version, hint }) do tween(label, 0.25, { TextTransparency = 1 }) end
+		for _, piece in ipairs(fill:GetChildren()) do
+			if piece:IsA("Frame") then tween(piece, 0.25, { BackgroundTransparency = 1 }) end
 		end
-		closed = true
-		if CW.closeLoadingScreen == loadingScreen.close then CW.closeLoadingScreen = nil end
-		if now then
-			remove()
-			if onClosed then pcall(onClosed) end
-			return
-		end
-		task.delay(math.max(0, MIN_SHOWN - (os.clock() - shownAt)), function()
-			loadingScreen.step("Ready", 1)
-			after(0.5, function()
-				for _, label in ipairs({ title, subtitle, status, version }) do tween(label, 0.25, { TextTransparency = 1 }) end
-				for _, piece in ipairs(fill:GetChildren()) do
-					if piece:IsA("Frame") then tween(piece, 0.25, { BackgroundTransparency = 1 }) end
-				end
-				tween(track, 0.25, { BackgroundTransparency = 1 })
-				tween(ringScale, 0.25, { Scale = 0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-				tween(dark, 0.4, { Position = DARK_OVER }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
-				after(0.5, function()
-					if onClosed then pcall(onClosed) end
-					mask.Rotation = 30
-					animate(0.4, function(a) mask.Transparency = sequence({ { 0, 1 }, { a, 1 }, { a + 0.05, 0 }, { 1, 1 } }) end)
-					after(0.45, remove)
-				end)
-			end)
+		tween(track, 0.25, { BackgroundTransparency = 1 })
+		tween(ringScale, 0.25, { Scale = 0 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		tween(dark, 0.4, { Position = DARK_OVER }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+		after(0.5, function()
+			if onClosed then
+				local ok, err = pcall(onClosed)
+				if not ok then warn("[CW] Opening the window failed: " .. tostring(err)) end
+			end
+			mask.Rotation = 30
+			animate(0.4, function(a) mask.Transparency = sequence({ { 0, 1 }, { a, 1 }, { a + 0.05, 0 }, { 1, 1 } }) end)
+			after(0.45, remove)
 		end)
 	end
-	CW.closeLoadingScreen = loadingScreen.close
-	task.delay(GIVE_UP, loadingScreen.close) -- never left on screen if the UI stops loading
-end
+	-- A failure: the message takes the status line (left-aligned, room for two lines), the bar and the ring go,
+	-- and a click on the card (or FAILED_SHOWN seconds) closes it.
+	local function showFailure(message)
+		if failedShown then return end
+		failedShown = true
+		status.TextXAlignment = Enum.TextXAlignment.Left
+		status.TextWrapped = true
+		status.Size = UDim2.fromOffset(300, 34)
+		status.Position = UDim2.fromOffset(20, 108)
+		status.Text = message
+		drawn.label = message
+		tween(status, 0.25, { TextTransparency = 0 })
+		tween(track, 0.25, { BackgroundTransparency = 1 })
+		for _, piece in ipairs(fill:GetChildren()) do
+			if piece:IsA("Frame") then tween(piece, 0.25, { BackgroundTransparency = 1 }) end
+		end
+		tween(ringScale, 0.25, { Scale = 0 })
+		hint.TextXAlignment = Enum.TextXAlignment.Left -- under the message, as wide
+		hint.Size = UDim2.fromOffset(300, 18)
+		showHint("Details in the console (F9). Click to close.")
+		local closer = make("TextButton", {
+			BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Text = "", ZIndex = 10, AutoButtonColor = false,
+		}, card)
+		closer.MouseButton1Click:Connect(function() closeCard(nil) end)
+		task.delay(FAILED_SHOWN, function() closeCard(nil) end)
+	end
+
+	local function drive(dt)
+		if not still then ring.Rotation = (ring.Rotation - 330 * dt) % 360 end
+		if closing then return end
+		if failedShown then
+			-- a startup that went on after all (on a new thread) still opens the window
+			if finished and finished.outcome ~= "failed" then closeCard(finished.onClosed) end
+			return
+		end
+		local now = os.clock()
+		if not finished then
+			if report.label ~= drawn.label then
+				drawn.label = report.label
+				status.Text = report.label
+			end
+			if report.progress ~= drawn.progress then
+				drawn.progress = report.progress
+				tween(fill, 0.25, { Size = UDim2.fromScale(math.clamp(report.progress, 0, 1), 1) })
+			end
+		else
+			-- Nothing is shown before the opening is over (MIN_SHOWN): its last tweens would move it back.
+			if now - shownAt < MIN_SHOWN then return end
+			if finished.outcome == "failed" then
+				showFailure(finished.message or "CycleWare could not start")
+				return
+			end
+			-- Ready (or how many parts failed) a moment on screen, then the card goes and the window opens.
+			if not drawn.ending then
+				drawn.ending = now
+				local problems = finished.outcome == "problems"
+				status.Text = problems and (finished.message or "Loaded with problems") or "Ready"
+				drawn.label = status.Text
+				tween(fill, 0.25, { Size = UDim2.fromScale(1, 1) })
+				showHint(problems and "The window lists them" or "")
+			end
+			if now - drawn.ending >= (finished.outcome == "problems" and 2 or 0.5) then closeCard(finished.onClosed) end
+			return
+		end
+		if startupThread and coroutine.status(startupThread) == "dead" and now - shownAt >= MIN_SHOWN then
+			showFailure("CycleWare stopped while: " .. tostring(report.label))
+			return
+		end
+		showHint(now - reportedAt >= SLOW_AFTER and "Taking longer than usual" or "")
+	end
+	task.spawn(cleanThread(function()
+		driver = RunService.RenderStepped:Connect(drive)
+	end))
+
+	-- A re-run takes this screen away at once (the new run brings its own).
+	CW.closeLoadingScreen = function()
+		closing = true
+		pcall(remove)
+	end
+end)
+if not screenBuilt then warn("[CW] The loading screen could not be shown: " .. tostring(screenError)) end
 
 --// Teams ----------------------------------------------------------------------------
 -- The original rule: anyone on a different team than you is an enemy, whether or not a shot could
@@ -436,12 +723,15 @@ end
 
 --// HTTP -----------------------------------------------------------------------------
 -- The executor's request function goes first: game:HttpGet blocks the main thread on many
--- executors, so it is only the fallback. Raises an error when nothing works.
-function CW.httpGet(url)
-	local lastError
+-- executors, so it is only the fallback. Each runs on a thread of its own (Exec) and is waited for
+-- `timeout` seconds at most (20 by default); a request that did not answer is not tried again with
+-- HttpGet (the connection is the problem then). Raises an error when nothing works.
+function CW.httpGet(url, timeout)
+	timeout = timeout or 20
+	local lastError, timedOut
 	local requestFn = CW.Caps.request
 	if requestFn then
-		local sent, response = pcall(requestFn, { Url = url, Method = "GET" })
+		local sent, response = pcall(Exec.call, "request", timeout, requestFn, { Url = url, Method = "GET" })
 		if sent and type(response) == "table" then
 			local status = tonumber(response.StatusCode)
 			local success = response.Success == true or (status ~= nil and status >= 200 and status < 300)
@@ -449,12 +739,16 @@ function CW.httpGet(url)
 			lastError = "HTTP " .. tostring(response.StatusCode or "?") .. " " .. tostring(response.StatusMessage or "")
 		else
 			lastError = response
+			timedOut = type(response) == "string" and response:find("did not answer", 1, true) ~= nil
 		end
 	end
 
-	local ok, result = pcall(function() return game:HttpGet(url) end)
-	if ok and type(result) == "string" then return result end
-	error(tostring(lastError or result or "no HTTP function available"), 0)
+	if CW.Caps.httpGet and not timedOut then
+		local ok, result = pcall(Exec.call, "HttpGet", timeout, function() return game:HttpGet(url) end)
+		if ok and type(result) == "string" then return result end
+		lastError = lastError or result
+	end
+	error(tostring(lastError or "no HTTP function available"), 0)
 end
 
 --// Running again ----------------------------------------------------------------------
@@ -478,9 +772,11 @@ function CW.restart()
 		end
 		source = data
 	end
-	local run, compileError = loadstring(source)
-	if type(run) ~= "function" then return false, tostring(compileError) end
-	task.spawn(run)
+	if not X.loadstring then return false, "this executor has no loadstring" end
+	local compiled, run, compileError = pcall(X.loadstring, source)
+	if not compiled or type(run) ~= "function" then return false, tostring(compileError or run) end
+	-- On a clean thread: the button that asked for it runs on a thread that has just called the executor.
+	task.spawn(cleanThread(run))
 	return true
 end
 
@@ -527,6 +823,51 @@ CW.Paths.SETTINGS_FILE = CW.Paths.CACHE_FOLDER .. "/ui_settings.json"
 CW.Paths.SETTINGS_SLOTS_FOLDER = CW.Paths.CURSOR_ROOT .. "/Settings Slots"
 CW.Paths.AUDIO_COPIES_FOLDER = CW.Paths.CACHE_FOLDER .. "/Audio"
 CW.Paths.AUDIO_PROBE_FILE = CW.Paths.CACHE_FOLDER .. "/audio_probe.json"
+-- The official files the sync has checked: relative path -> { crc32, size } (see CW.Library.sync).
+CW.Paths.LIBRARY_INDEX_FILE = CW.Paths.LIBRARY_ROOT .. "/.index.json"
+CW.Paths.UI_CACHE_FILE = CW.Paths.CACHE_FOLDER .. "/CWUI.lua"
+
+--// Interface source -----------------------------------------------------------------
+-- The UI library (CWUI.lua) is downloaded from the start, while the modules load, so it is mostly in by the time
+-- the interface is built (Interface step). CW_CONFIG.UI_FILE (a file in the executor's workspace) is used instead
+-- when set. The last good download is kept (UI_CACHE_FILE): when GitHub is slow, that copy is used after
+-- UI_CACHED_WAIT seconds, and the download, which goes on, refreshes it for the next run. The asset sync waits
+-- for this download, so the two don't share the connection.
+local UI_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CWUI.lua"
+local UI_CACHED_WAIT, UI_DOWNLOAD_WAIT = 4, 25 -- seconds to wait for the download, with and without a saved copy
+local function isUISource(text) return type(text) == "string" and text:find("CreateWindow", 1, true) ~= nil end
+local uiFetch = { done = false } -- source or error once done
+do
+	local localFile = type(_cfg.UI_FILE) == "string" and _cfg.UI_FILE ~= "" and _cfg.UI_FILE or nil
+	local localSource
+	if localFile then
+		local ok, data = pcall(readfile, localFile)
+		if ok and isUISource(data) then
+			localSource = data
+		else
+			CW.Warn("UI_FILE could not be read (" .. localFile .. "); downloading the UI instead")
+		end
+	end
+	if localSource then
+		uiFetch.source, uiFetch.fromFile, uiFetch.done = localSource, localFile, true
+	else
+		CW.Log("Downloading CycleWare UI from GitHub")
+		task.spawn(function()
+			local ok, body = pcall(CW.httpGet, UI_URL, UI_DOWNLOAD_WAIT)
+			if ok and isUISource(body) then
+				uiFetch.source = body
+				if not isfolder(CW.Paths.CACHE_FOLDER) then
+					pcall(makefolder, CW.Paths.CURSOR_ROOT)
+					pcall(makefolder, CW.Paths.CACHE_FOLDER)
+				end
+				pcall(writefile, CW.Paths.UI_CACHE_FILE, body) -- the last good copy
+			else
+				uiFetch.error = ok and "the downloaded file is not the UI library" or tostring(body)
+			end
+			uiFetch.done = true
+		end)
+	end
+end
 
 CW.Paths.CURSOR_FILE = nil
 CW.Paths.HITMARKER_FILE = nil
@@ -567,6 +908,8 @@ CW.Settings.HIT_SOUND_GUN_VOLUMES = {}
 CW.Settings.MESH_PROFILES = {}
 -- The settings slot the settings in use were last loaded from or saved to ("" when none; Settings tab).
 CW.Settings.SETTINGS_SLOT = ""
+-- Anti-AFK (AntiAFK module): on unless the player turns it off, since it only keeps Roblox's idle kick away.
+CW.Settings.ANTI_AFK_ENABLED = boolOr(_cfg.ANTI_AFK, true)
 
 -- Snapshot of the defaults, taken before any saved value is applied. The save routine
 -- writes only the settings whose value differs from these.
@@ -574,7 +917,7 @@ CW.Defaults = {}
 for _, key in ipairs({
 	"HITMARKER_SIZE", "SOUND_VOLUME", "CURSOR_TARGET_SIZE", "HITMARKER_VISIBLE_DURATION",
 	"HITMARKER_FADEOUT_DURATION", "HITMARKER_RANDOM_ROTATION", "HITMARKER_FOLLOW_MOUSE", "HITMARKER_FADEOUT",
-	"CURSOR_TEAM_CHECK", "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR", "UI_LAYERS",
+	"CURSOR_TEAM_CHECK", "CURSOR_ENEMY_COLOR", "CURSOR_TEAM_COLOR", "UI_LAYERS", "ANTI_AFK_ENABLED",
 }) do
 	CW.Defaults[key] = CW.Settings[key]
 end
@@ -872,25 +1215,54 @@ if not CW._crcT then
 end
 local _crcT = CW._crcT
 
-function CW.crc32(s)
+-- Eight bytes per step (slicing-by-8): the same checksum about twice as fast as one byte at a time, which
+-- matters on a first start, when every downloaded file (9 MB of them) is checked. T[k][i] is the table for
+-- the byte k places before the end of the eight. Needs the buffer library; without it, one byte at a time.
+local crcSlices
+if type(buffer) == "table" and type(buffer.readu32) == "function" then
+	crcSlices = { [0] = _crcT }
+	for k = 1, 7 do
+		local previous, current = crcSlices[k - 1], {}
+		for i = 0, 255 do current[i] = bxor(rshift(previous[i], 8), _crcT[band(previous[i], 0xFF)]) end
+		crcSlices[k] = current
+	end
+end
+
+local function crc32Of(s, yielding)
 	local c = 0xFFFFFFFF
-	for i = 1, #s do
-		c = bxor(_crcT[band(bxor(c, sbyte(s, i)), 0xFF)], rshift(c, 8))
+	local length = #s
+	if not crcSlices then
+		for i = 1, length do
+			c = bxor(_crcT[band(bxor(c, sbyte(s, i)), 0xFF)], rshift(c, 8))
+			if yielding and i % 65536 == 0 then CW.yieldBudget() end
+		end
+		return bxor(c, 0xFFFFFFFF)
+	end
+	local T0, T1, T2, T3 = crcSlices[0], crcSlices[1], crcSlices[2], crcSlices[3]
+	local T4, T5, T6, T7 = crcSlices[4], crcSlices[5], crcSlices[6], crcSlices[7]
+	local readu32, readu8 = buffer.readu32, buffer.readu8
+	local bytes = buffer.fromstring(s)
+	local i, last = 0, length - 8
+	while i <= last do
+		local low = bxor(c, readu32(bytes, i))
+		local high = readu32(bytes, i + 4)
+		c = bxor(T7[band(low, 255)], T6[band(rshift(low, 8), 255)], T5[band(rshift(low, 16), 255)], T4[rshift(low, 24)],
+			T3[band(high, 255)], T2[band(rshift(high, 8), 255)], T1[band(rshift(high, 16), 255)], T0[rshift(high, 24)])
+		i += 8
+		if yielding and i % 65536 == 0 then CW.yieldBudget() end
+	end
+	while i < length do
+		c = bxor(T0[band(bxor(c, readu8(bytes, i)), 255)], rshift(c, 8))
+		i += 1
 	end
 	return bxor(c, 0xFFFFFFFF)
 end
 
+function CW.crc32(s) return crc32Of(s, false) end
+
 -- Same result as CW.crc32, but hands the thread back to the game now and then. Only call it
 -- from a thread that is allowed to yield (the sync thread, a task.spawn, the executor thread).
-function CW.crc32Yielding(s)
-	local c = 0xFFFFFFFF
-	local length = #s
-	for i = 1, length do
-		c = bxor(_crcT[band(bxor(c, sbyte(s, i)), 0xFF)], rshift(c, 8))
-		if i % 65536 == 0 then CW.yieldBudget() end
-	end
-	return bxor(c, 0xFFFFFFFF)
-end
+function CW.crc32Yielding(s) return crc32Of(s, true) end
 
 function CW.computeFileSignature(path, prefix, extra)
 	extra = extra or ""
@@ -1053,6 +1425,28 @@ function CW.Library.invalidate()
 	table.clear(audioAssetCache)
 end
 
+-- The official files the sync checked (format and checksum) when it saved or verified them:
+-- library-relative path -> { crc = "xxxxxxxx", size = bytes }. A file listed here is not read again to
+-- learn its format (scanLibrary), and the sync only compares its size (the checksum, computed in Luau,
+-- was most of the work of every start).
+local libraryIndex = {}
+do
+	local ok, text = pcall(readfile, CW.Paths.LIBRARY_INDEX_FILE)
+	local decoded, data = false, nil
+	if ok and type(text) == "string" then decoded, data = pcall(HttpService.JSONDecode, HttpService, text) end
+	if decoded and type(data) == "table" and type(data.files) == "table" then
+		for relative, info in pairs(data.files) do
+			if type(relative) == "string" and type(info) == "table" and type(info.crc) == "string" and tonumber(info.size) then
+				libraryIndex[relative] = { crc = info.crc, size = tonumber(info.size) }
+			end
+		end
+	end
+end
+local function saveLibraryIndex()
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, { schemaVersion = 1, files = libraryIndex })
+	if ok then pcall(writefile, CW.Paths.LIBRARY_INDEX_FILE, encoded) end
+end
+
 local function scanLibrary(category, weapon)
 	local info = CATEGORY_INFO[category]
 	local weaponInfo = WEAPON_CATEGORIES[category]
@@ -1070,7 +1464,8 @@ local function scanLibrary(category, weapon)
 
 	local extensions = (info or weaponInfo).extensions
 	local result = {}
-	for _, directory in ipairs(directories) do
+	for directoryIndex, directory in ipairs(directories) do
+		local official = directoryIndex == 1 -- the _Official folder comes first
 		local ok, files = pcall(listfiles, directory)
 		if ok and type(files) == "table" then
 			for _, filePath in ipairs(files) do
@@ -1080,9 +1475,12 @@ local function scanLibrary(category, weapon)
 				if extension and extensions[extension:lower()] then
 					local relative = libraryRelative(normalized)
 					if relative then
-						local okData, data = pcall(readfile, normalized)
-						local actualFormat = okData and detectAssetFormat(data) or "unreadable"
-						if formatMatches(category, normalized, actualFormat) then
+						local actualFormat = "checked"
+						if not (official and libraryIndex[relative]) then
+							local okData, data = pcall(readfile, normalized)
+							actualFormat = okData and detectAssetFormat(data) or "unreadable"
+						end
+						if actualFormat == "checked" or formatMatches(category, normalized, actualFormat) then
 							table.insert(result, {
 								Name = filename:gsub("%.[%w]+$", ""),
 								Path = CW.Paths.LIBRARY_ROOT .. "/" .. relative,
@@ -1744,8 +2142,13 @@ function CW.Library.setSelection(category, weapon, relative)
 end
 
 -- Returns the file to use for a category (and weapon) plus its relative path.
--- A saved selection whose file is not on disk yet is NOT overwritten: it stays saved and is
--- used again as soon as the file exists.
+-- A saved selection whose file is not on disk is NOT overwritten: it stays saved and is used as soon
+-- as the file exists. The cursor and the per-gun looks use nothing meanwhile, and nothing at all until
+-- the player picks one (the game's own cursor and guns). The hitmarker and the hit sound need a file to
+-- work, so with nothing chosen, or a chosen file that is still missing once the download finished, they
+-- use the library's file named "default" (or else its first file). That fallback is never saved as a
+-- selection, and a custom ID is never picked on its own.
+local NEEDS_A_FILE = { Hitmarkers = true, HitSounds = true }
 function CW.Library.selectedPath(category, weapon)
 	local selections = CW.Settings.ASSET_SELECTIONS
 	local selected
@@ -1755,15 +2158,18 @@ function CW.Library.selectedPath(category, weapon)
 		local key = SELECTION_KEYS[category]
 		selected = key and selections[key]
 	end
+	if selected == "" then selected = nil end
 	for _, item in ipairs(CW.Library.items(category, weapon)) do
 		if item.Relative == selected then return item.Path, item.Relative end
 	end
-	if PER_GUN_SELECTIONS[category] then return nil, nil end
+	if not NEEDS_A_FILE[category] then return nil, nil end
+	if selected ~= nil and not CW.State.syncFinished then return nil, nil end -- still downloading
 
-	-- Nothing chosen (or the chosen file is missing): the first library file is used, but it is NOT
-	-- saved as a selection. Only a choice made by the player is persisted. A custom ID is never
-	-- picked on its own: it is used only when the player chose it.
-	local first = CW.Library.list(category, weapon)[1]
+	local files = CW.Library.list(category, weapon)
+	for _, item in ipairs(files) do
+		if tostring(item.Name):lower() == "default" then return item.Path, item.Relative end
+	end
+	local first = files[1]
 	if not first then return nil, nil end
 	return first.Path, first.Relative
 end
@@ -1789,7 +2195,9 @@ local function encodeURLPath(path)
 end
 
 -- Removes official files that no longer exist in the manifest (never touches user files).
+-- Returns true when it removed something.
 local function pruneOfficial(expected)
+	local removed = false
 	local function pruneFolder(folder)
 		local okFolder, exists = pcall(isfolder, folder)
 		if not okFolder or not exists then return end
@@ -1801,6 +2209,7 @@ local function pruneOfficial(expected)
 			local extension = normalized:match("%.([%w]+)$")
 			if relative and extension and ASSET_EXTENSIONS[extension:lower()] and not expected[relative] then
 				if pcall(delfile, filePath) then
+					removed = true
 					CW.Log("Removed obsolete official asset " .. relative)
 				end
 			end
@@ -1818,7 +2227,10 @@ local function pruneOfficial(expected)
 			end
 		end
 	end
+	return removed
 end
+
+local DOWNLOAD_WORKERS = 4 -- downloads at the same time
 
 local function syncImpl()
 	local manifestURL = _cfg.ASSET_MANIFEST_URL
@@ -1907,11 +2319,12 @@ local function syncImpl()
 	CW.Log(string.format("Manifest contains %d supported assets; skipped %d unsupported entries", #pending, skipped))
 	pcall(writefile, CW.Paths.MANIFEST_FILE, raw)
 
+	-- Which files need a download. A file in the index with the manifest's checksum only has its size compared;
+	-- any other file is checked in full (format and checksum).
 	local expected = {}
+	local downloads = {}
+	local changed, indexChanged = false, false
 	for index, entry in ipairs(pending) do
-		if index == 1 or index % 5 == 0 or index == #pending then
-			CW.Log(string.format("Syncing asset %d/%d: %s", index, #pending, entry.path))
-		end
 		local destination = officialDestination(entry.category, entry.path)
 		if not destination then
 			complete = false
@@ -1920,57 +2333,99 @@ local function syncImpl()
 			local destinationRelative = libraryRelative(destination)
 			if destinationRelative then expected[destinationRelative] = true end
 			ensureFolderPath(destination:match("^(.*)/[^/]+$"))
+			local expectedCRC = entry.crc32 and (tostring(entry.crc32):lower():gsub("^0x", "")) or nil
 
-			-- Validate cached bytes before trusting the extension or manifest revision.
 			local needsDownload = true
 			if isfile(destination) then
 				local ok, existing = pcall(readfile, destination)
-				local actualFormat = ok and detectAssetFormat(existing) or "unreadable"
-				if formatMatches(entry.category, entry.path, actualFormat) then
-					if entry.crc32 then
-						local expectedCRC = tostring(entry.crc32):lower():gsub("^0x", "")
-						needsDownload = string.format("%08x", CW.crc32Yielding(existing)):lower() ~= expectedCRC
-					else
-						needsDownload = previousRevision ~= revision
-					end
+				local known = destinationRelative and libraryIndex[destinationRelative]
+				if ok and type(existing) == "string" and known and expectedCRC and known.crc == expectedCRC and known.size == #existing then
+					needsDownload = false
 				else
-					CW.Warn("Cached asset " .. entry.path .. " is invalid (detected " .. actualFormat .. "); downloading again")
+					local actualFormat = ok and detectAssetFormat(existing) or "unreadable"
+					if formatMatches(entry.category, entry.path, actualFormat) then
+						if expectedCRC then
+							local actualCRC = string.format("%08x", CW.crc32Yielding(existing)):lower()
+							needsDownload = actualCRC ~= expectedCRC
+							if not needsDownload and destinationRelative then
+								libraryIndex[destinationRelative] = { crc = actualCRC, size = #existing }
+								indexChanged = true
+							end
+						else
+							needsDownload = previousRevision ~= revision
+						end
+					else
+						CW.Warn("Cached asset " .. entry.path .. " is invalid (detected " .. actualFormat .. "); downloading again")
+					end
 				end
 			end
-
 			if needsDownload then
-				local remotePath = encodeURLPath(entry.path)
-				local downloaded, bytes = pcall(CW.httpGet, baseURL .. "/" .. remotePath)
-				if downloaded and type(bytes) == "string" then
-					local actualFormat = detectAssetFormat(bytes)
-					local expectedFormat = isAudioCategory(entry.category) and "audio" or entry.path:match("%.([%w]+)$"):lower()
-					local expectedCRC = entry.crc32 and tostring(entry.crc32):lower():gsub("^0x", "")
-					local actualCRC = string.format("%08x", CW.crc32Yielding(bytes)):lower()
-					if not formatMatches(entry.category, entry.path, actualFormat) then
-						complete = false
-						CW.Warn("Rejected " .. entry.path .. ": expected " .. expectedFormat .. " content, detected " .. actualFormat .. ". Check the GitHub path and file format.")
-					elseif expectedCRC and actualCRC ~= expectedCRC then
-						complete = false
-						CW.Warn("Checksum mismatch for " .. entry.path)
-					else
-						local temporary = destination .. ".download"
-						local wrote = pcall(writefile, temporary, bytes)
-						local readOK, verified = pcall(readfile, temporary)
-						local saved = wrote and readOK and verified == bytes
-						if saved then saved = pcall(writefile, destination, verified) end
-						pcall(delfile, temporary)
-						if not saved then
-							complete = false
-							CW.Warn("Could not save official asset " .. entry.path)
-						end
-					end
-				else
-					complete = false
-					CW.Warn("Could not download official asset " .. entry.path)
-				end
+				table.insert(downloads, { entry = entry, destination = destination, relative = destinationRelative, crc = expectedCRC })
 			end
 		end
-		if index % 5 == 0 then task.wait() end
+		if index % 8 == 0 then task.wait() end
+	end
+
+	-- The downloads, a few at a time. Each file is checked (format, checksum) and written through a temporary
+	-- file that is read back, so a half-written file never replaces a good one.
+	local function download(job)
+		local entry, destination = job.entry, job.destination
+		local downloaded, bytes = pcall(CW.httpGet, baseURL .. "/" .. encodeURLPath(entry.path))
+		if not (downloaded and type(bytes) == "string") then
+			complete = false
+			CW.Warn("Could not download official asset " .. entry.path)
+			return
+		end
+		local actualFormat = detectAssetFormat(bytes)
+		local expectedFormat = isAudioCategory(entry.category) and "audio" or entry.path:match("%.([%w]+)$"):lower()
+		local actualCRC = string.format("%08x", CW.crc32Yielding(bytes)):lower()
+		if not formatMatches(entry.category, entry.path, actualFormat) then
+			complete = false
+			CW.Warn("Rejected " .. entry.path .. ": expected " .. expectedFormat .. " content, detected " .. actualFormat .. ". Check the GitHub path and file format.")
+			return
+		end
+		if job.crc and actualCRC ~= job.crc then
+			complete = false
+			CW.Warn("Checksum mismatch for " .. entry.path)
+			return
+		end
+		local temporary = destination .. ".download"
+		local wrote = pcall(writefile, temporary, bytes)
+		local readOK, verified = pcall(readfile, temporary)
+		local saved = wrote and readOK and verified == bytes
+		if saved then saved = pcall(writefile, destination, verified) end
+		pcall(delfile, temporary)
+		if saved then
+			changed = true
+			if job.relative then
+				libraryIndex[job.relative] = { crc = actualCRC, size = #bytes }
+				indexChanged = true
+			end
+		else
+			complete = false
+			CW.Warn("Could not save official asset " .. entry.path)
+		end
+	end
+	if #downloads > 0 then
+		CW.Log(string.format("Downloading %d of %d assets", #downloads, #pending))
+		local nextJob, running = 0, 0
+		for _ = 1, math.min(DOWNLOAD_WORKERS, #downloads) do
+			running += 1
+			task.spawn(function()
+				while isCurrentRun() do
+					nextJob += 1
+					local job = downloads[nextJob]
+					if not job then break end
+					local ok, err = pcall(download, job)
+					if not ok then
+						complete = false
+						CW.Warn("Could not sync " .. tostring(job.entry.path) .. ": " .. tostring(err))
+					end
+				end
+				running -= 1
+			end)
+		end
+		while running > 0 do task.wait() end
 	end
 
 	-- Persist a valid manifest revision even when a few entries fail. Good files stay cached,
@@ -1981,20 +2436,28 @@ local function syncImpl()
 	-- download having succeeded; user files outside _Official are never touched.
 	if #pending > 0 then
 		if entriesTrusted then
-			pruneOfficial(expected)
+			if pruneOfficial(expected) then changed = true end
+			for relative in pairs(libraryIndex) do
+				if not expected[relative] then
+					libraryIndex[relative] = nil
+					indexChanged = true
+				end
+			end
 		else
 			CW.Warn("The manifest has invalid entries; obsolete official files were not removed this time")
 		end
 	end
+	if indexChanged then saveLibraryIndex() end
 	if complete then
-		CW.Log("Asset library synchronized at revision " .. revision)
+		CW.Log("Asset library synchronized at revision " .. revision .. (changed and "" or " (nothing changed)"))
 	else
 		CW.Warn("Asset sync finished with invalid or unavailable files; valid assets were kept")
 	end
-	return complete
+	return complete, changed
 end
 
--- Only one sync at a time; concurrent callers wait for the running one.
+-- Only one sync at a time; concurrent callers wait for the running one. Returns whether every file is
+-- in place and whether the library changed (files written or removed).
 function CW.Library.sync()
 	if CW.State.syncing then
 		local waitDeadline = os.clock() + 180
@@ -2006,12 +2469,12 @@ function CW.Library.sync()
 	end
 	CW.State.syncing = true
 	CW.Library.invalidate() -- files may have been added or removed by hand since the last scan
-	local ok, result = pcall(syncImpl)
+	local ok, result, changed = pcall(syncImpl)
 	CW.Library.invalidate() -- ... and the sync itself may have written new ones
 	CW.State.syncing = false
 	CW.State.lastSyncResult = ok and result == true
 	if not ok then error(result, 0) end
-	return result
+	return result, changed == true
 end
 
 CW.Paths.CURSOR_FILE = CW.Library.selectedPath("Cursors")
@@ -2557,11 +3020,17 @@ local function buildCursorFiles(sigHash)
 	}
 end
 
+-- Every icon this script has put on the mouse (kept across re-runs), to tell them from the game's: the game sets
+-- its own (the gun crosshair while a gun is out) and that one is put back when the custom cursor goes.
+CW.State.cursorIcons = CW.State.cursorIcons or {}
+local function isOurIcon(icon) return icon ~= nil and CW.State.cursorIcons[icon] == true end
+
 local function setOSCursor(key)
 	if CW.State.currentCursorKey == key then return end
 	CW.State.currentCursorKey = key
 	local url = CW.Assets[key]
 	if url then
+		CW.State.cursorIcons[url] = true
 		CW.State.settingCursor = true
 		UserInputService.MouseIcon = url
 		CW.State.settingCursor = false
@@ -2578,10 +3047,13 @@ local function connectEnforcer()
 	end
 
 	CW.State.enforcerConn = UserInputService:GetPropertyChangedSignal("MouseIcon"):Connect(function()
-		if CW.State.settingCursor or CW.State.scoped then return end
+		if CW.State.settingCursor then return end
+		local icon = UserInputService.MouseIcon
+		if not isOurIcon(icon) then CW.State.gameMouseIcon = icon end -- what the game wants now
+		if CW.State.scoped then return end
 		if not CW.State.cursorsReady or not CW.State.currentCursorKey then return end
 		local expected = CW.Assets[CW.State.currentCursorKey]
-		if expected and UserInputService.MouseIcon ~= expected then
+		if expected and icon ~= expected then
 			CW.State.settingCursor = true
 			UserInputService.MouseIcon = expected
 			CW.State.settingCursor = false
@@ -2590,12 +3062,38 @@ local function connectEnforcer()
 end
 
 local function activateCursors()
+	local icon = UserInputService.MouseIcon
+	if not isOurIcon(icon) then CW.State.gameMouseIcon = icon end
 	CW.State.cursorsReady = true
-	UserInputService.MouseIconEnabled = true
+	if not CW.State.scoped then UserInputService.MouseIconEnabled = true end
 	CW.State.currentCursorKey = nil
 	CW.State.lastTarget = nil -- force the PreRender loop to re-evaluate the hovered target
 	setOSCursor("white")
 	connectEnforcer()
+	if CW.State.scopeUpdate then CW.State.scopeUpdate() end
+end
+
+-- No custom cursor: the game's own. Nothing is touched unless this script had put its cursor on (then the
+-- game's last icon goes back, the gun crosshair included).
+local function deactivateCursors()
+	local wasActive = CW.State.cursorsReady
+	CW.Assets.white, CW.Assets.red, CW.Assets.green = nil, nil, nil
+	CW.State.cursorsReady = false
+	CW.State.currentCursorKey = nil
+	for _, key in ipairs({ "enforcerConn", "enableConn" }) do
+		local connection = CW.State[key]
+		if connection then
+			pcall(function() connection:Disconnect() end)
+			CW.State[key] = nil
+		end
+	end
+	CW.untrack("scopeHide")
+	if wasActive or isOurIcon(UserInputService.MouseIcon) then
+		pcall(function()
+			if isOurIcon(UserInputService.MouseIcon) then UserInputService.MouseIcon = CW.State.gameMouseIcon or "" end
+			if not CW.State.scoped then UserInputService.MouseIconEnabled = true end
+		end)
+	end
 end
 
 local function loadCachedCursorAssets(files)
@@ -2649,21 +3147,11 @@ end
 
 local function generateCursorsOnce()
 	if not CW.Paths.CURSOR_FILE then
-		CW.Assets.white, CW.Assets.red, CW.Assets.green = nil, nil, nil
-		CW.State.cursorsReady = false
-		CW.State.currentCursorKey = nil
-		for _, key in ipairs({ "enforcerConn", "enableConn" }) do
-			local connection = CW.State[key]
-			if connection then
-				pcall(function() connection:Disconnect() end)
-				CW.State[key] = nil
-			end
+		deactivateCursors()
+		local chosen = CW.Settings.ASSET_SELECTIONS.Cursor
+		if type(chosen) == "string" and chosen ~= "" then
+			CW.Log("The chosen cursor (" .. chosen .. ") is not in the library yet; the game's cursor stays until it is")
 		end
-		pcall(function()
-			UserInputService.MouseIconEnabled = true
-			UserInputService.MouseIcon = ""
-		end)
-		CW.Warn("No cursor found; add a PNG to " .. CW.Paths.CURSORS_FOLDER .. " and refresh the asset library.")
 		return
 	end
 
@@ -2731,21 +3219,27 @@ local function watchScope()
 	local scopeFrame = crosshairGui and crosshairGui:WaitForChild("ScopeFrame", 30)
 	if not scopeFrame then return end
 
+	-- Only with the custom cursor on: with the game's own cursor, the game's scope handles it as it always did.
+	local hiding = false
 	local function update()
-		if scopeFrame.Visible then
-			CW.State.scoped = true
+		CW.State.scoped = scopeFrame.Visible
+		if CW.State.scoped and CW.State.cursorsReady then
+			hiding = true
 			UserInputService.MouseIconEnabled = false
 			-- Per frame, and only while scoped: whatever turns the icon back on is undone.
 			CW.track("scopeHide", RunService.PreRender:Connect(function()
 				if UserInputService.MouseIconEnabled then UserInputService.MouseIconEnabled = false end
 			end))
-		else
-			CW.State.scoped = false
+		elseif hiding then
+			hiding = false
 			CW.untrack("scopeHide")
-			UserInputService.MouseIconEnabled = true
-			restoreCursorIcon()
+			if not CW.State.scoped then
+				UserInputService.MouseIconEnabled = true
+				restoreCursorIcon()
+			end
 		end
 	end
+	CW.State.scopeUpdate = update
 	CW.track("scopeWatch", scopeFrame:GetPropertyChangedSignal("Visible"):Connect(update))
 	update()
 end
@@ -2922,8 +3416,11 @@ function CW.HitSounds.volume(gun)
 end
 
 -- Loads every sound in use (each gun's and the one with no gun in hand) and drops the pools of the others.
+-- (Before the first download there may be no sound at all: nothing is loaded then.)
 local function prepare()
-	local wanted = { [general()] = true }
+	local wanted = {}
+	local base = general()
+	if base then wanted[base] = true end
 	for _, relative in pairs(CW.Settings.HIT_SOUND_GUNS) do wanted[relative] = true end
 	local inUse = {}
 	for relative in pairs(wanted) do
@@ -3376,7 +3873,7 @@ function CW.resolveMeshAsset(id)
 	local assetType = okInfo and type(info) == "table" and tonumber(info.AssetTypeId) or nil
 	local result = { Mesh = id }
 	if assetType ~= MESH_ASSET_TYPE then
-		local opened, objects = pcall(function() return game:GetObjects("rbxassetid://" .. id) end)
+		local opened, objects = pcall(Exec.call, "GetObjects", 20, function() return game:GetObjects("rbxassetid://" .. id) end)
 		if opened and type(objects) == "table" then
 			for _, object in ipairs(objects) do
 				local found = typeof(object) == "Instance" and meshInside(object)
@@ -4640,11 +5137,11 @@ local function installShootHook(shootEvent)
 	CW.ShootEvent = shootEvent
 
 	local isExecutorCall = type(checkcaller) == "function" and checkcaller or function() return false end
-	local wrap = type(newcclosure) == "function" and newcclosure or function(fn) return fn end
+	local wrap = X.newcclosure or function(fn) return fn end
 
 	local OldNameCall
 	-- (__namecall runs for every method call in the game: the cheap check first)
-	OldNameCall = hookmetamethod(shootEvent, "__namecall", wrap(function(self, ...)
+	OldNameCall = X.hookmetamethod(shootEvent, "__namecall", wrap(function(self, ...)
 		if self == CW.ShootEvent and getnamecallmethod() == "FireServer" and not isExecutorCall() then
 			local enqueue = CW.onShot
 			if enqueue then pcall(enqueue, (...)) end
@@ -4722,16 +5219,67 @@ end))
 end)
 
 
+runModule("AntiAFK", function()
+-- AntiAFK.lua
+-- Roblox disconnects a player after 20 minutes without input. Player.Idled fires once the player has been idle
+-- for 2 minutes; each time it does, a virtual right click (VirtualUser) counts as input and the 20 minutes start
+-- over. Where the executor can't drive VirtualUser, a key no one uses (F15) is pressed through
+-- VirtualInputManager instead. Prison Life has no idle handling of its own (no script of the game uses Idled).
+local CW = getgenv().__CW_CORE_STATE
+
+local LocalPlayer = CW.LocalPlayer
+local SPARE_KEY = Enum.KeyCode.F15
+
+local warned = false
+local function nudge()
+	local clicked = pcall(function()
+		local virtualUser = game:GetService("VirtualUser")
+		virtualUser:CaptureController()
+		virtualUser:ClickButton2(Vector2.zero)
+	end)
+	if clicked then return end
+	local pressed = pcall(function()
+		local virtualInput = game:GetService("VirtualInputManager")
+		virtualInput:SendKeyEvent(true, SPARE_KEY, false, game)
+		task.wait(0.05)
+		virtualInput:SendKeyEvent(false, SPARE_KEY, false, game)
+	end)
+	if not pressed and not warned then
+		warned = true
+		CW.Warn("Anti-AFK can't simulate input on this executor (VirtualUser and VirtualInputManager are blocked)")
+	end
+end
+
+-- Registered with CW.track: a re-run replaces it, and leaving the game takes it away (CW.cleanup).
+function CW.setAntiAFK(enabled)
+	CW.Settings.ANTI_AFK_ENABLED = enabled == true
+	if CW.Settings.ANTI_AFK_ENABLED then
+		CW.track("antiAfk", LocalPlayer.Idled:Connect(function()
+			if CW.Settings.ANTI_AFK_ENABLED then nudge() end
+		end))
+	else
+		CW.untrack("antiAfk")
+	end
+end
+CW.setAntiAFK(CW.Settings.ANTI_AFK_ENABLED)
+end)
+
+
 runModule("Sync", function()
 -- Sync.lua
 -- Runs independently of the UI: official assets are downloaded even if the UI fails to load,
 -- and everything that consumes assets is reloaded as soon as the download finishes.
 local CW = getgenv().__CW_CORE_STATE
 
-function CW.reloadCoreAssets()
-	CW.Paths.CURSOR_FILE = CW.Library.selectedPath("Cursors")
-	CW.Paths.HITMARKER_FILE = CW.Library.selectedPath("Hitmarkers")
-	CW.Paths.SOUND_FILE = CW.Library.selectedPath("HitSounds")
+-- Reloads what uses the library: the files in use (and their settings), then the hitmarker, the textures, the
+-- hit sound and the cursor. onlyIfMoved: only when one of the three files in use changed. Returns whether one did.
+function CW.reloadCoreAssets(onlyIfMoved)
+	local cursor = CW.Library.selectedPath("Cursors")
+	local hitmarker = CW.Library.selectedPath("Hitmarkers")
+	local sound = CW.Library.selectedPath("HitSounds")
+	local moved = cursor ~= CW.Paths.CURSOR_FILE or hitmarker ~= CW.Paths.HITMARKER_FILE or sound ~= CW.Paths.SOUND_FILE
+	if onlyIfMoved and not moved then return false end
+	CW.Paths.CURSOR_FILE, CW.Paths.HITMARKER_FILE, CW.Paths.SOUND_FILE = cursor, hitmarker, sound
 	-- The sync (or an edited custom ID) can change which asset is in use: its own settings come with it.
 	for category, path in pairs({ Cursors = CW.Paths.CURSOR_FILE, Hitmarkers = CW.Paths.HITMARKER_FILE, HitSounds = CW.Paths.SOUND_FILE }) do
 		local relative = CW.Library.relative(path)
@@ -4754,34 +5302,51 @@ function CW.reloadCoreAssets()
 			end
 		end
 	end
+	return moved
 end
 
 CW.State.syncFinished = false
+CW.State.syncChanged = nil
 CW.State.syncCallbacks = {}
 
 task.spawn(function()
-	local ok, result = pcall(CW.Library.sync)
+	-- After the UI download (UI_CACHED_WAIT s at most): on an executor that runs one request at a time, the asset
+	-- files would otherwise hold the interface back.
+	local waitStart = os.clock()
+	while not uiFetch.done and os.clock() - waitStart < UI_CACHED_WAIT do task.wait() end
+	if not isCurrentRun() then return end
+	local ok, result, changed = pcall(CW.Library.sync)
 	if not ok then
 		CW.Warn("Asset sync failed: " .. tostring(result))
 	elseif not result then
 		CW.Warn("Asset sync incomplete; continuing with available local files")
 	end
+	if not isCurrentRun() then return end
 
-	local reloadOK, reloadError = pcall(CW.reloadCoreAssets)
-	if not reloadOK then CW.Warn("Core asset reload failed: " .. tostring(reloadError)) end
-
+	-- Finished first: a chosen hitmarker or hit sound still missing now is gone, not downloading (selectedPath).
 	CW.State.syncFinished = true
+	local filesChanged = ok and changed == true
+	local reloadOK, moved = pcall(CW.reloadCoreAssets, not filesChanged)
+	if not reloadOK then
+		CW.Warn("Core asset reload failed: " .. tostring(moved))
+		moved = true
+	end
+	CW.State.syncChanged = filesChanged or moved == true
 	local callbacks = CW.State.syncCallbacks
 	CW.State.syncCallbacks = {}
 	for _, callback in ipairs(callbacks) do
-		pcall(callback)
+		pcall(callback, CW.State.syncChanged)
 	end
 end)
 end)
 
-do
+-- The interface: the UI library (uiFetch), the window and every tab. The window goes in `interface`; without
+-- one, the Finish step shows `interface.failure` on the loading screen. whenOpen: work that waits for the window
+-- to be shown (each runs on a clean thread). showProblems: set once the window is open; it lists in the window
+-- what failed, also what fails later (a gun page built after the start).
+local interface = { window = nil, failure = nil, whenOpen = {}, showProblems = nil }
+runModule("Interface", function()
 -- UI.lua
-local uiOk, uiError = pcall(function()
 local CW = getgenv().__CW_CORE_STATE
 assert(CW, "CycleWare must be loaded before UI.lua")
 
@@ -4823,51 +5388,161 @@ end
 
 local HttpService = game:GetService("HttpService")
 
--- Runs one UI section in isolation so a failure in one tab doesn't take the others down.
+-- Runs one UI section in isolation so a failure in one tab doesn't take the others down. A section whose thread
+-- lost its permissions runs on a new clean thread (runClean). A failure is listed by the window (Finish step).
 local function guarded(name, fn)
-	local ok, err = pcall(fn)
-	if not ok then CW.Warn("UI section '" .. name .. "' failed: " .. tostring(err)) end
+	local ok, err = runClean("the " .. name .. " section", fn)
+	if not ok then
+		startupProblems[name] = tostring(err)
+		CW.Warn("UI section '" .. name .. "' failed: " .. tostring(err))
+		if interface.showProblems then pcall(interface.showProblems) end
+	end
 	return ok
 end
 
--- Autosave (debounced). Assigned for real in the Settings section.
+-- Autosave (debounced): every control callback schedules a save 1 s after the last change. Assigned with the
+-- settings file functions below, before any tab, so saving works even if a tab fails to build.
 local scheduleSave = function() end
 
---// Download the UI library
-local UI_URL = "https://raw.githubusercontent.com/nutellaimw/CycleWare/refs/heads/main/CWUI.lua"
-CW.Log("Downloading CycleWare UI from GitHub")
-loadingScreen.step("Downloading the interface", 0.4)
-local UI_CACHE_FILE = CW.Paths.CACHE_FOLDER .. "/CWUI.lua"
-local fetchOK, uiSource = false, nil
-local localUIFile = type(_cfg.UI_FILE) == "string" and _cfg.UI_FILE ~= "" and _cfg.UI_FILE or nil
-if localUIFile then
-	-- Teste local: getgenv().CW_CONFIG = { UI_FILE = "CWUI.lua" } (caminho no workspace do executor)
-	local readOK, data = pcall(readfile, localUIFile)
-	if readOK and type(data) == "string" and data ~= "" then
-		fetchOK, uiSource = true, data
-		CW.Log("Using the local UI file: " .. localUIFile)
-	else
-		CW.Warn("UI_FILE could not be read (" .. localUIFile .. "); downloading the UI instead")
+--// Settings file
+-- Strings, numbers, booleans and tables of them (nested: ASSET_PROFILES is category -> asset -> setting).
+local function serializableValue(value, depth)
+	local valueType = type(value)
+	if valueType == "string" or valueType == "number" or valueType == "boolean" then
+		return value
 	end
-end
-if not fetchOK then
-	fetchOK, uiSource = pcall(CW.httpGet, UI_URL)
-	if fetchOK and type(uiSource) == "string" and uiSource:find("CreateWindow", 1, true) then
-		pcall(writefile, UI_CACHE_FILE, uiSource) -- guarda a última cópia boa
-	else
-		local cacheOK, cached = pcall(readfile, UI_CACHE_FILE)
-		if cacheOK and type(cached) == "string" and cached:find("CreateWindow", 1, true) then
-			CW.Warn("Could not download the UI (" .. tostring(uiSource) .. "); using the last saved copy")
-			fetchOK, uiSource = true, cached
+	if valueType ~= "table" or (depth or 0) > 4 then return nil end
+
+	local result = {}
+	for key, entry in pairs(value) do
+		local keyType = type(key)
+		if keyType == "string" or keyType == "number" then
+			local serialized = serializableValue(entry, (depth or 0) + 1)
+			if serialized ~= nil and not (type(serialized) == "table" and next(serialized) == nil) then
+				result[key] = serialized
+			end
 		end
 	end
+	return result
 end
-assert(fetchOK and type(uiSource) == "string" and uiSource ~= "", "Could not download CWUI.lua from GitHub: " .. tostring(uiSource))
 
-local loadUI, compileError = loadstring(uiSource)
-assert(type(loadUI) == "function", tostring(compileError or "Could not compile CWUI.lua"))
-local CWUI = loadUI()
-assert(type(CWUI) == "table" and type(CWUI.CreateWindow) == "function", "Invalid CWUI library")
+-- A setting is saved only when the player changed it: its value differs from the default.
+-- Switching a setting back to its default removes it from the file.
+local function isDefaultValue(key, value)
+	if type(value) == "table" then return next(value) == nil end
+	local default = CW.Defaults[key]
+	if default == nil and type(value) == "boolean" then default = false end
+	if type(value) == "number" and type(default) == "number" then return math.abs(value - default) < 1e-6 end
+	return value == default
+end
+
+-- The settings file's contents: the settings that differ from the defaults, and the asset choices.
+local function encodeSettings()
+	local savedSettings = {}
+	for key, value in pairs(CW.Settings) do
+		if key ~= "ASSET_SELECTIONS" and key ~= "SOUND_ID" and key ~= "AUTO_RELOAD_LABEL_PATH"
+			and not CW.Profiles.isKey[key] then
+			local serialized = serializableValue(value)
+			if serialized ~= nil and not isDefaultValue(key, serialized) then
+				savedSettings[key] = serialized
+			end
+		end
+	end
+
+	-- Tracer colors are Color3 (not serialisable): store them as hex, only when different from the default.
+	local function saveColor(settingKey, hexKey)
+		local color, default = CW.Settings[settingKey], CW.Defaults[settingKey]
+		if typeof(color) == "Color3" and (typeof(default) ~= "Color3" or color:ToHex() ~= default:ToHex()) then
+			savedSettings[hexKey] = color:ToHex()
+		end
+	end
+	saveColor("TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX")
+	saveColor("TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX")
+
+	local out = {
+		schemaVersion = 3,
+		Settings = savedSettings,
+		AssetSelections = CW.Settings.ASSET_SELECTIONS,
+	}
+
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, out)
+	if not ok then
+		CW.Warn("Failed to encode settings")
+		return nil
+	end
+	return encoded
+end
+
+-- After a settings slot is loaded into the settings file, this run must not write over it (savesStopped).
+local savesStopped = false
+local function saveSettings()
+	if savesStopped then return end
+	local encoded = encodeSettings()
+	if not encoded then return end
+	local saved, err = pcall(writefile, CW.Paths.SETTINGS_FILE, encoded)
+	if not saved then CW.Warn("Could not save settings: " .. tostring(err)) end
+end
+
+-- Debounced autosave (scheduleSave, declared above).
+local saveThread
+scheduleSave = function()
+	if saveThread then task.cancel(saveThread) end
+	saveThread = task.delay(1, function()
+		saveThread = nil
+		saveSettings()
+	end)
+end
+local function stopSaving()
+	savesStopped = true
+	if saveThread then task.cancel(saveThread) end
+	saveThread = nil
+end
+
+--// The UI library (downloaded since the start: uiFetch)
+loadingScreen.step("Downloading the interface", 0.4)
+local uiSource, uiOrigin
+do
+	local cached
+	local okCache, cachedText = pcall(readfile, CW.Paths.UI_CACHE_FILE)
+	if okCache and isUISource(cachedText) then cached = cachedText end
+	local limit = cached and UI_CACHED_WAIT or UI_DOWNLOAD_WAIT
+	local waitStart = os.clock()
+	while not uiFetch.done and os.clock() - waitStart < limit do task.wait() end
+	if uiFetch.source then
+		uiSource, uiOrigin = uiFetch.source, uiFetch.fromFile and ("the local file " .. uiFetch.fromFile) or "GitHub"
+	elseif cached then
+		uiSource, uiOrigin = cached, "the last saved copy"
+		CW.Warn("The UI download " .. (uiFetch.done and ("failed (" .. tostring(uiFetch.error) .. ")") or "is slow")
+			.. "; using the last saved copy")
+	end
+end
+if not isCurrentRun() then return end
+if not uiSource then
+	interface.failure = "The interface could not be downloaded. Your saved settings are still on."
+	error("Could not download CWUI.lua: " .. tostring(uiFetch.error or ("no answer in " .. UI_DOWNLOAD_WAIT .. " s")), 0)
+end
+CW.Log("UI library from " .. uiOrigin)
+
+if not X.loadstring then
+	interface.failure = "This executor can't run the interface (it has no loadstring)."
+	error("loadstring is unavailable", 0)
+end
+local compiled, loadUI, compileError = pcall(X.loadstring, uiSource)
+if not compiled or type(loadUI) ~= "function" then
+	interface.failure = "The interface file is damaged. Run CycleWare again."
+	error("Could not compile CWUI.lua: " .. tostring(compileError or loadUI), 0)
+end
+-- CWUI gets this file's executor functions, so its own calls also run on threads of their own.
+local loadedUI, CWUI = pcall(loadUI, {
+	gethui = X.gethui, cloneref = X.cloneref, setclipboard = X.setclipboard, protectGui = X.protectGui,
+	getcustomasset = CAPS.customAsset and getcustomasset or nil,
+	isfile = CAPS.files and isfile or nil, isfolder = CAPS.files and isfolder or nil,
+	listfiles = CAPS.files and listfiles or nil,
+})
+if not loadedUI or type(CWUI) ~= "table" or type(CWUI.CreateWindow) ~= "function" then
+	interface.failure = "The interface could not be built. Run CycleWare again."
+	error("Invalid CWUI library: " .. tostring(CWUI), 0)
+end
 
 if CW.UIWindow and type(CW.UIWindow.Destroy) == "function" then
 	pcall(function() CW.UIWindow:Destroy() end)
@@ -4899,7 +5574,8 @@ local canTheme = type(CWUI.SetTheme) == "function"
 if canTheme then CWUI.SetTheme(savedThemeChanges()) end
 
 loadingScreen.step("Building the interface", 0.7)
-local Window = CWUI:CreateWindow({
+local syncDoneBeforeUI = CW.State.syncFinished == true -- the lists made below are already the synced ones
+local created, Window = pcall(CWUI.CreateWindow, CWUI, {
 	Title = "CW",
 	ToggleKey = false,
 	Logo = uiIcons.Logo,
@@ -4907,7 +5583,12 @@ local Window = CWUI:CreateWindow({
 	Discord = type(_cfg.DISCORD_URL) == "string" and _cfg.DISCORD_URL or nil,
 	SettingsButton = true,
 })
+if not created or type(Window) ~= "table" then
+	interface.failure = "The interface could not be built. Run CycleWare again."
+	error("CreateWindow failed: " .. tostring(Window), 0)
+end
 CW.UIWindow = Window
+interface.window = Window
 if Window.SetVisible then Window:SetVisible(false) end -- shown as the loading screen goes
 -- RightShift opens and closes the window only once the loading screen is gone (Ready, set at the end of this file):
 -- before that the UI is still being built, and opening it would show it half made over the loading screen.
@@ -6628,10 +7309,11 @@ guarded("Cursors", function()
 		end
 
 		-- Choosing a cursor brings its own settings (CW.Profiles), then the cursor is built with them.
+		-- A cursor from the gallery, or nil when the chosen one is clicked again: the game's own cursor.
 		local function applyCursorFile(value)
-			if type(value) ~= "table" or type(value.Path) ~= "string" then return end
-			CW.Paths.CURSOR_FILE = value.Path
-			local relative = CW.Library.relative(value.Path)
+			if value ~= nil and (type(value) ~= "table" or type(value.Path) ~= "string") then return end
+			local relative = value and CW.Library.relative(value.Path) or nil
+			CW.Paths.CURSOR_FILE = value and value.Path or nil
 			CW.Library.setSelection("Cursors", nil, relative)
 			CW.Profiles.use("Cursors", relative)
 			if reloadThread then task.cancel(reloadThread) reloadThread = nil end
@@ -6645,10 +7327,12 @@ guarded("Cursors", function()
 			if reloadDelay then scheduleCursorReload(reloadDelay) end
 		end
 
+		CursorSection:AddLabel("Pick a cursor to use it. Click the chosen one again to go back to the game's cursor.")
 		CursorGallery = CursorSection:Gallery({
 			Name = "Cursor Library",
 			Items = galleryItems("Cursors"),
 			Default = CW.Paths.CURSOR_FILE,
+			AllowDeselect = true,
 			LazyLoad = true,
 			Columns = 4,
 			MaxHeight = 260,
@@ -6843,11 +7527,15 @@ guarded("Guns", function()
 			pager:SetHint(meshState == "failed" and FAILED_HINT or dot and EDIT_HINT or PREVIEW_HINT)
 		end
 	end
+	local buildGunPage -- (index): builds a gun's page the first time it is shown (below)
 	if type(GunsTab.AddPager) == "function" then
 		pager = GunsTab:AddPager({
 			Pages = guns,
 			Hint = PREVIEW_HINT,
-			Changed = function() refreshGunPreview(nil, true) end,
+			Changed = function(index)
+				if buildGunPage then buildGunPage(index) end
+				refreshGunPreview(nil, true)
+			end,
 		})
 	end
 	-- A mesh that finished loading shows on the guns already (Texture module); the preview follows.
@@ -7351,7 +8039,15 @@ guarded("Guns", function()
 		end)
 	end
 
-	for index, gun in ipairs(guns) do
+	-- With the pager, each gun's page is built the first time it is shown; at the start only the page in view
+	-- (all nine were most of the time the interface took to build). A page built later loses nothing: what it
+	-- shows comes from the settings, and what the pages share works from the settings too (sound and tracer
+	-- choices, Apply to All Guns, the Edit Gun Fire Point switch, the library lists).
+	local builtPages = {}
+	buildGunPage = function(index)
+		local gun = guns[index]
+		if not gun or builtPages[index] then return end
+		builtPages[index] = true
 		guarded(gun .. " page", function()
 			local raw = pager and pager:Page(index) or GunsTab:AddSection({ Name = gun, Open = false })
 			local page = wrapSection(raw)
@@ -7363,6 +8059,22 @@ guarded("Guns", function()
 			guarded(gun .. " Effect", function() buildEffect(settings, gun) end)
 			guarded(gun .. " Reload Sound", function() buildSound(settings, reloadSounds, "Reload", gun) end)
 		end)
+	end
+	if pager then
+		buildGunPage((pager:Get()) or 1)
+		-- The other pages are built once the window is open, a few frames apart, so switching to one later is
+		-- instant and the start does not wait for them.
+		table.insert(interface.whenOpen, function()
+			for index in ipairs(guns) do
+				if not builtPages[index] then
+					task.wait(0.15)
+					if not isCurrentRun() or Window._destroyed then return end
+					buildGunPage(index)
+				end
+			end
+		end)
+	else
+		for index in ipairs(guns) do buildGunPage(index) end -- an old CWUI: one section per gun
 	end
 	refreshGunPreview(nil, false)
 end)
@@ -7605,6 +8317,16 @@ guarded("Utilities", function()
 		end,
 	})
 
+	-- Anti-AFK (AntiAFK module): on by default.
+	if CW.setAntiAFK then
+		UtilityTab:Toggle({
+			Title = "Anti-AFK",
+			Default = CW.Settings.ANTI_AFK_ENABLED == true,
+			Callback = function(enabled) CW.setAntiAFK(enabled == true) end,
+		})
+		UtilityTab:AddLabel("Anti-AFK keeps Roblox from disconnecting you after 20 minutes without input.")
+	end
+
 	-- >>> AUTO RELOAD BEGIN
 	-- Auto reload (off by default).
 	--
@@ -7665,11 +8387,11 @@ guarded("Utilities", function()
 			end
 		end
 
-		if type(keypress) == "function" and type(keyrelease) == "function" then
-			local pressed = pcall(keypress, 0x52)
+		if X.keypress and X.keyrelease then
+			local pressed = pcall(X.keypress, 0x52)
 			if pressed then
 				task.wait(0.02)
-				local released, releaseError = pcall(keyrelease, 0x52)
+				local released, releaseError = pcall(X.keyrelease, 0x52)
 				if released then return true end
 				if not autoReloadWarned then
 					autoReloadWarned = true
@@ -7776,23 +8498,22 @@ guarded("Utilities", function()
 	-- Runs the handlers connected to a signal of the game, each in its own thread (a handler such as
 	-- reload() waits for the cooldown, so it must not run in ours).
 	local function fireGameSignal(signal)
-		if type(firesignal) == "function" then
-			firesignal(signal)
+		if X.firesignal then
+			X.firesignal(signal)
 			return
 		end
-		if type(getconnections) == "function" then
-			local fired = false
-			for _, connection in ipairs(getconnections(signal)) do
-				if type(connection.Fire) == "function" then
-					connection:Fire()
-					fired = true
-				elseif type(connection.Function) == "function" then
-					task.spawn(connection.Function)
-					fired = true
-				end
+		local fired = false
+		for _, entry in ipairs(connectionsOf(signal)) do
+			local connection = entry.raw
+			if entry.canFire then
+				Exec.spawn("connection:Fire", function() connection:Fire() end)
+				fired = true
+			elseif type(entry.fn) == "function" then
+				task.spawn(entry.fn)
+				fired = true
 			end
-			if fired then return end
 		end
+		if fired then return end
 		error("neither firesignal nor getconnections can run the game's reload button")
 	end
 
@@ -8031,12 +8752,12 @@ guarded("Utilities", function()
 	-- some executors.
 	local function isLuaClosure(fn)
 		if type(fn) ~= "function" then return false end
-		if type(islclosure) == "function" then
-			local ok, result = pcall(islclosure, fn)
+		if X.islclosure then
+			local ok, result = pcall(X.islclosure, fn)
 			return ok and result == true
 		end
-		if type(iscclosure) == "function" then
-			local ok, result = pcall(iscclosure, fn)
+		if X.iscclosure then
+			local ok, result = pcall(X.iscclosure, fn)
 			return ok and result == false
 		end
 		local ok, source = pcall(function() return debug.info(fn, "s") end)
@@ -8045,18 +8766,18 @@ guarded("Utilities", function()
 
 	local function upvaluesOf(fn)
 		if not isLuaClosure(fn) then return {} end
-		if type(debug.getupvalues) == "function" then
-			local ok, values = pcall(debug.getupvalues, fn)
+		if X.getupvalues then
+			local ok, values = pcall(X.getupvalues, fn)
 			if ok and type(values) == "table" then return values end
 		end
 		-- One by one only when the executor tells how many there are: reading past the last one is not
 		-- safe everywhere.
 		local values = {}
-		if type(debug.getupvalue) == "function" and type(debug.getinfo) == "function" then
-			local okInfo, info = pcall(debug.getinfo, fn)
+		if X.getupvalue and X.getinfo then
+			local okInfo, info = pcall(X.getinfo, fn)
 			local count = okInfo and type(info) == "table" and tonumber(info.nups) or 0
 			for i = 1, math.min(count, 64) do
-				local ok, v = pcall(debug.getupvalue, fn, i)
+				local ok, v = pcall(X.getupvalue, fn, i)
 				if not ok then break end
 				values[i] = v
 			end
@@ -8083,16 +8804,9 @@ guarded("Utilities", function()
 		end
 		local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
 		if not backpack then return nil end
-		local okConnections, connections = pcall(getconnections, backpack.ChildAdded)
-		if not okConnections or type(connections) ~= "table" then return nil end
-		for _, connection in ipairs(connections) do
-			-- Connections made by a foreign Luau state (CoreScripts) are skipped without touching them.
-			local okForeign, foreign = pcall(function() return connection.ForeignState end)
-			local okFn, fn = false, nil
-			if okForeign and foreign ~= true then
-				okFn, fn = pcall(function() return connection.Function end)
-			end
-			if okFn and isLuaClosure(fn) then
+		for _, connection in ipairs(connectionsOf(backpack.ChildAdded)) do
+			local fn = connection.fn
+			if isLuaClosure(fn) then
 				local list, hasPlayer, functions, toolbar = nil, false, {}, nil
 				for _, v in pairs(upvaluesOf(fn)) do
 					if v == LocalPlayer then
@@ -8561,8 +9275,8 @@ guarded("Utilities", function()
 	-- (onToolAdded, onToolRemoved, createDragger) get one that closes the gaps first. Kept in CW.State: a
 	-- re-run finds the game's function behind it (findInternals).
 	local function guardBar(found)
-		local getUpvalue, setUpvalue = debug.getupvalue, debug.setupvalue
-		if type(getUpvalue) ~= "function" or type(setUpvalue) ~= "function" then return false end
+		local getUpvalue, setUpvalue = X.getupvalue, X.setupvalue
+		if not (getUpvalue and setUpvalue) then return false end
 		local guard = CW.State.barGuard
 		if not (guard and guard.list == found.list and guard.update == found.update) then
 			local list, update = found.list, found.update
@@ -8966,9 +9680,9 @@ guarded("Utilities", function()
 		local giverPressed = remotes and remotes:FindFirstChild("GiverPressed")
 		if interact and giverPressed then
 			local isExecutorCall = type(checkcaller) == "function" and checkcaller or function() return false end
-			local wrap = type(newcclosure) == "function" and newcclosure or function(fn) return fn end
+			local wrap = X.newcclosure or function(fn) return fn end
 			local OldNameCall
-			OldNameCall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+			OldNameCall = X.hookmetamethod(game, "__namecall", wrap(function(self, ...)
 				if (self == interact or self == giverPressed) and not isExecutorCall() then
 					-- The method name is read FIRST: every method call made below (FindFirstChild, EquipTool...)
 					-- replaces the one __namecall remembers, so the game's call is then made by its saved name
@@ -9189,7 +9903,7 @@ guarded("Settings", function()
 
 	-- Interface: colors, transparency, corners and the background image. Changes show at once and are saved.
 	-- Three drawers so the page reads at a glance; one reset puts all of it back.
-	guarded("Interface", function()
+	guarded("Theme settings", function()
 		if not canTheme then return end
 		local look = CW.Settings.UI_THEME
 		local current = CWUI.GetTheme()
@@ -9484,98 +10198,6 @@ guarded("Settings", function()
 		end,
 	})
 
-	-- Strings, numbers, booleans and tables of them (nested: ASSET_PROFILES is category -> asset -> setting).
-	local function serializableValue(value, depth)
-		local valueType = type(value)
-		if valueType == "string" or valueType == "number" or valueType == "boolean" then
-			return value
-		end
-		if valueType ~= "table" or (depth or 0) > 4 then return nil end
-
-		local result = {}
-		for key, entry in pairs(value) do
-			local keyType = type(key)
-			if keyType == "string" or keyType == "number" then
-				local serialized = serializableValue(entry, (depth or 0) + 1)
-				if serialized ~= nil and not (type(serialized) == "table" and next(serialized) == nil) then
-					result[key] = serialized
-				end
-			end
-		end
-		return result
-	end
-
-	-- A setting is saved only when the player changed it: its value differs from the default.
-	-- Switching a setting back to its default removes it from the file.
-	local function isDefaultValue(key, value)
-		if type(value) == "table" then return next(value) == nil end
-		local default = CW.Defaults[key]
-		if default == nil and type(value) == "boolean" then default = false end
-		if type(value) == "number" and type(default) == "number" then return math.abs(value - default) < 1e-6 end
-		return value == default
-	end
-
-	-- The settings file's contents: the settings that differ from the defaults, and the asset choices.
-	local function encodeSettings()
-		local savedSettings = {}
-		for key, value in pairs(CW.Settings) do
-			if key ~= "ASSET_SELECTIONS" and key ~= "SOUND_ID" and key ~= "AUTO_RELOAD_LABEL_PATH"
-				and not CW.Profiles.isKey[key] then
-				local serialized = serializableValue(value)
-				if serialized ~= nil and not isDefaultValue(key, serialized) then
-					savedSettings[key] = serialized
-				end
-			end
-		end
-
-		-- Tracer colors are Color3 (not serialisable): store them as hex, only when different from the default.
-		local function saveColor(settingKey, hexKey)
-			local color, default = CW.Settings[settingKey], CW.Defaults[settingKey]
-			if typeof(color) == "Color3" and (typeof(default) ~= "Color3" or color:ToHex() ~= default:ToHex()) then
-				savedSettings[hexKey] = color:ToHex()
-			end
-		end
-		saveColor("TRACER_SNIPER_COLOR", "TRACER_SNIPER_COLOR_HEX")
-		saveColor("TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX")
-
-		local out = {
-			schemaVersion = 3,
-			Settings = savedSettings,
-			AssetSelections = CW.Settings.ASSET_SELECTIONS,
-		}
-
-		local ok, encoded = pcall(HttpService.JSONEncode, HttpService, out)
-		if not ok then
-			CW.Warn("Failed to encode settings")
-			return nil
-		end
-		return encoded
-	end
-
-	-- After a settings slot is loaded into the settings file, this run must not write over it (savesStopped).
-	local savesStopped = false
-	local function saveSettings()
-		if savesStopped then return end
-		local encoded = encodeSettings()
-		if not encoded then return end
-		local saved, err = pcall(writefile, CW.Paths.SETTINGS_FILE, encoded)
-		if not saved then CW.Warn("Could not save settings: " .. tostring(err)) end
-	end
-
-	-- Debounced autosave: every control callback schedules a save 1s after the last change.
-	local saveThread
-	scheduleSave = function()
-		if saveThread then task.cancel(saveThread) end
-		saveThread = task.delay(1, function()
-			saveThread = nil
-			saveSettings()
-		end)
-	end
-	local function stopSaving()
-		savesStopped = true
-		if saveThread then task.cancel(saveThread) end
-		saveThread = nil
-	end
 
 	General:Button({
 		Title = "Save Now",
@@ -9771,27 +10393,115 @@ end
 if soundsMigrated or switchesMigrated then scheduleSave() end
 print("[CW] UI loaded.")
 
--- The asset sync runs independently (Sync module). When it finishes, rebuild the UI lists.
-if CW.State.syncFinished then
-	guarded("Library refresh", refreshUIFromLibrary)
-else
-	table.insert(CW.State.syncCallbacks, function()
-		guarded("Library refresh", refreshUIFromLibrary)
-	end)
+-- The asset sync runs on its own (Sync module). When it changed the library after the lists were made, they are
+-- made again.
+local function afterSync(changed)
+	if changed then guarded("Library refresh", refreshUIFromLibrary) end
+end
+if not syncDoneBeforeUI then
+	if CW.State.syncFinished then
+		afterSync(CW.State.syncChanged)
+	else
+		table.insert(CW.State.syncCallbacks, afterSync)
+	end
 end
 end)
 
-if not uiOk then
-	warn("[CW] UI failed to load: " .. tostring(uiError))
-end
--- The chosen meshes (started in the Texture module) get a few seconds to arrive before the window can open, so the
--- Guns tab never shows a gun's own pieces in place of its mesh.
-loadingScreen.step("Loading meshes", 0.9)
-if CW.waitForMeshes then pcall(CW.waitForMeshes, 8) end
-loadingScreen.close(false, function()
-	local window = CW.UIWindow
-	if not window then return end
-	window.Ready = true
-	pcall(window.SetVisible, window, true)
+--// Finish: open the window, or say why there is none --------------------------------------
+-- Names for the window's list of what failed.
+local STEP_NAMES = {
+	Cache = "Cache folders", AssetLibrary = "Asset library", PNG = "Cursor images", Cursor = "Cursor",
+	Hitmarker = "Hitmarker", Sound = "Hit sounds", Texture = "Gun looks", Tracers = "Tracers", Hook = "Hit detection",
+	Cleanup = "Cleanup", Sync = "Library download", AntiAFK = "Anti-AFK", Interface = "Interface",
+}
+local MESH_WAIT = 2 -- seconds the chosen meshes get before the window opens (one still loading shows "Loading the mesh")
+runModule("Finish", function()
+	if not isCurrentRun() then return end
+	local window = interface.window
+	if not window then
+		loadingScreen.finish("failed", interface.failure or "The interface could not start. Run CycleWare again.")
+		return
+	end
+	if CW.waitForMeshes then
+		loadingScreen.step("Loading meshes", 0.9)
+		pcall(CW.waitForMeshes, MESH_WAIT)
+	end
+	if not isCurrentRun() then return end
+	local function problemNames()
+		local names = {}
+		for name in pairs(startupProblems) do table.insert(names, STEP_NAMES[name] or name) end
+		table.sort(names)
+		return names
+	end
+	local problems = problemNames()
+	local opened = false
+	local function open()
+		if opened or not isCurrentRun() then return end
+		opened = true
+		window.Ready = true
+		interface.showProblems = function()
+			local names = problemNames()
+			if #names == 0 or type(window.SetNotice) ~= "function" or window._destroyed then return end
+			-- Three names at most, so the line stays short; the console has them all.
+			local list = table.concat(names, ", ", 1, math.min(#names, 3))
+			if #names > 3 then list ..= " and " .. (#names - 3) .. " more" end
+			window:SetNotice("Some parts did not load: " .. list .. ". The rest works. Details are in the console (F9).")
+		end
+		pcall(interface.showProblems)
+		local shown, err = pcall(window.SetVisible, window, true)
+		if not shown then warn("[CW] Could not show the window: " .. tostring(err)) end
+		for _, fn in ipairs(interface.whenOpen) do
+			task.spawn(cleanThread(function()
+				local ok, failure = pcall(fn)
+				if not ok then warn("[CW] " .. tostring(failure)) end
+			end))
+		end
+	end
+	if #problems > 0 then
+		loadingScreen.finish("problems", "Loaded with " .. #problems .. (#problems == 1 and " problem" or " problems"), open)
+	else
+		loadingScreen.finish("ready", nil, open)
+	end
+	-- The loading screen opens it as it goes; should that not happen (its frame loop broke), the screen is taken
+	-- away and the window opens anyway.
+	task.delay(12, function()
+		if opened or not isCurrentRun() then return end
+		warn("[CW] The loading screen did not open the window; opening it now.")
+		if CW.closeLoadingScreen then pcall(CW.closeLoadingScreen) end
+		local ok, err = runClean("opening the window", open)
+		if not ok then warn("[CW] The window could not be opened: " .. tostring(err)) end
+	end)
 end)
+
+--=============================================================================
+-- Startup
+--   The steps recorded by runModule run in order, on a clean thread. A step that throws is reported (and
+--   listed by the window) and the next one still runs. If the thread lost its permissions anyway (an executor
+--   function this file does not wrap), the next step runs on a new clean thread. A re-run stops the steps of
+--   the run before it (isCurrentRun).
+--=============================================================================
+local function runSteps(from)
+	for index = from, #steps do
+		if not isCurrentRun() then return end
+		local step = steps[index]
+		if not threadCanTouchGui() then
+			warn("[CW] The startup thread lost its permissions before the " .. step.name .. " step; continuing on a new thread.")
+			local thread = cleanThread(function() runSteps(index) end)
+			CW.State.startupThread = thread
+			loadingScreen.watch(thread)
+			task.spawn(thread)
+			return
+		end
+		local ok, err = xpcall(step.fn, function(message) return debug.traceback(tostring(message), 2) end)
+		if not ok then
+			startupProblems[step.name] = tostring(err)
+			warn("[CW] Module '" .. step.name .. "' failed: " .. tostring(err))
+		end
+	end
+end
+do
+	local thread = cleanThread(function() runSteps(1) end)
+	CW.State.startupThread = thread
+	loadingScreen.watch(thread)
+	task.spawn(thread)
 end
