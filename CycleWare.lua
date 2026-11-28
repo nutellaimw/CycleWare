@@ -890,13 +890,25 @@ CW.Settings.CURSOR_TEAM_CHECK  = boolOr(_cfg.CURSOR_TEAM_CHECK, true)
 CW.Settings.CURSOR_ENEMY_COLOR = Color3.fromRGB(255, 56, 56)
 CW.Settings.CURSOR_TEAM_COLOR  = Color3.fromRGB(56, 255, 56)
 
--- UI look (CWUI.SetTheme): only what the player changed. Colors as hex, transparencies 0..1,
--- Image = Roblox ID or workspace path, ImageTransparency 0..1.
-CW.Settings.UI_THEME = {}
+-- The look of a first start, and what Reset Interface goes back to: the interface only (colors, transparency,
+-- corners, parallax, background), nothing that changes the game. Keys CWUI.SetTheme doesn't get here (Text,
+-- Selector) keep CWUI's own values. Settings files older than schema 4 were saved when the default look was
+-- CWUI's own, so a look they don't hold is CWUI's own (see the settings file below).
+local DEFAULT_THEME = {
+	Accent = "c8e3ff", Background = "ffffff", Sidebar = "313131", Panel = "100c29",
+	BackgroundTransparency = 0.5, PanelTransparency = 0.5, SelectorTransparency = 0, Corners = false,
+	Parallax = true, ParallaxStrength = 0.06, ParallaxHoverOnly = true,
+}
+local DEFAULT_LAYERS = '[{"Image":"rbxassetid://93121883450813","X":0,"Y":0,"W":1,"H":1,"Depth":2,'
+	.. '"Transparency":0.1,"Scale":"Crop","Fill":"7cd3ff","FillTransparency":1}]'
+
+-- UI look (CWUI.SetTheme). Colors as hex, transparencies 0..1, Parallax, ParallaxStrength, ParallaxHoverOnly;
+-- Image and ImageTransparency only in files of an older build (they become layer 1).
+CW.Settings.UI_THEME = table.clone(DEFAULT_THEME)
 -- Background layers (CWUI SetBackgroundLayers), kept as one JSON string because the settings file only holds
 -- flat values. Each layer: Image (Roblox ID or workspace path), X, Y, W, H (fractions of the window), Depth,
 -- Transparency, Scale, Fill (hex), FillTransparency.
-CW.Settings.UI_LAYERS = ""
+CW.Settings.UI_LAYERS = DEFAULT_LAYERS
 -- Per-asset settings (see CW.Profiles below): { [category] = { [asset's library path] = { [setting] = value } } }.
 CW.Settings.ASSET_PROFILES = {}
 -- Hit sound of each gun (CW.HitSounds, Sound module): { [gun] = library path or "id:123" }, and the volume of
@@ -921,6 +933,7 @@ for _, key in ipairs({
 }) do
 	CW.Defaults[key] = CW.Settings[key]
 end
+CW.Defaults.UI_THEME = table.freeze(table.clone(DEFAULT_THEME))
 
 CW.Settings.ASSET_SELECTIONS = CW.Settings.ASSET_SELECTIONS or {
 	Cursor = nil,
@@ -985,6 +998,13 @@ if settingsFileExists then
 				if #reset > 0 then
 					CW.Warn("Settings are now off by default. Reset once from the old save: " .. table.concat(reset, ", ") .. ". Turn on what you want; it will be saved.")
 				end
+			end
+
+			-- Before schema 4 the default look was CWUI's own: a file that doesn't hold a look keeps that one,
+			-- so updating CycleWare never changes the look someone already has.
+			if savedVersion < 4 then
+				CW.Settings.UI_THEME = {}
+				CW.Settings.UI_LAYERS = ""
 			end
 
 			CW._SavedSettings = values
@@ -5426,10 +5446,27 @@ local function serializableValue(value, depth)
 	return result
 end
 
+-- Two settings values are the same (tables key by key, numbers within rounding).
+local function sameValue(a, b)
+	if type(a) == "number" and type(b) == "number" then return math.abs(a - b) < 1e-6 end
+	if type(a) ~= "table" or type(b) ~= "table" then return a == b end
+	for key, value in pairs(a) do
+		if not sameValue(value, b[key]) then return false end
+	end
+	for key in pairs(b) do
+		if a[key] == nil then return false end
+	end
+	return true
+end
 -- A setting is saved only when the player changed it: its value differs from the default.
 -- Switching a setting back to its default removes it from the file.
 local function isDefaultValue(key, value)
-	if type(value) == "table" then return next(value) == nil end
+	if type(value) == "table" then
+		-- A table default (the look) is matched as a whole; any other table's default is empty.
+		local default = CW.Defaults[key]
+		if type(default) == "table" then return sameValue(value, default) end
+		return next(value) == nil
+	end
 	local default = CW.Defaults[key]
 	if default == nil and type(value) == "boolean" then default = false end
 	if type(value) == "number" and type(default) == "number" then return math.abs(value - default) < 1e-6 end
@@ -5460,7 +5497,7 @@ local function encodeSettings()
 	saveColor("TRACER_TASER_COLOR", "TRACER_TASER_COLOR_HEX")
 
 	local out = {
-		schemaVersion = 3,
+		schemaVersion = 4, -- 4: the default look is DEFAULT_THEME and DEFAULT_LAYERS
 		Settings = savedSettings,
 		AssetSelections = CW.Settings.ASSET_SELECTIONS,
 	}
@@ -8324,7 +8361,6 @@ guarded("Utilities", function()
 			Default = CW.Settings.ANTI_AFK_ENABLED == true,
 			Callback = function(enabled) CW.setAntiAFK(enabled == true) end,
 		})
-		UtilityTab:AddLabel("Anti-AFK keeps Roblox from disconnecting you after 20 minutes without input.")
 	end
 
 	-- >>> AUTO RELOAD BEGIN
@@ -9561,7 +9597,7 @@ guarded("Utilities", function()
 	--// Riot shield ------------------------------------------------------------------------------------------
 	-- The shield goes on the arm when the player clicks while holding it (ShieldController, decompiled):
 	-- Remotes.ShieldEquipped:FireServer(); the server then adds RiotShieldPart to the character. With Auto Slot
-	-- on, that is done as soon as the shield is equipped (once: only while RiotShieldPart is not there yet).
+	-- on, that is done once for each shield the player gets (see "Riot shield" below).
 	local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
 	local function remote(name)
 		return Remotes and Remotes:FindFirstChild(name)
@@ -9704,37 +9740,120 @@ guarded("Utilities", function()
 		end
 	end
 
-	-- Riot shield: on the arm as soon as it is equipped (what a click while holding it does).
-	-- ShieldController (decompiled) connects a click listener when the shield enters the character; each click
-	-- fires ShieldEquipped and the server adds RiotShieldPart. Here the same request is sent in the very event
-	-- the shield arrives in the hand (no wait: the equip and this request reach the server in that order), and
-	-- only ONCE per equip: after that the shield is the player's again until it is put away and equipped again.
-	-- If the server's shield never shows up (the equip reached it late) and the player didn't click meanwhile,
-	-- the request is repeated one time.
-	local function watchShield(character)
-		CW.track("autoShield", character.ChildAdded:Connect(function(child)
-			if not CW.Settings.AUTO_SLOT_ENABLED or not child:IsA("Tool") or child.Name ~= "Riot Shield" then return end
+	-- Riot shield: on the arm by itself, once for each shield the player gets.
+	-- ShieldController (decompiled) puts it on when the player clicks while holding it: each click fires
+	-- ShieldEquipped and the server adds RiotShieldPart to the character. A shield can sit in the Backpack with
+	-- no slot (Hidden in Auto Slot), where the player can't pick it, so when a shield arrives it is equipped here,
+	-- the same request is sent right away (the equip and the request reach the server in that order), and the
+	-- hand goes back to what it held. Each shield gets this once: equipping it later does nothing more. Once the
+	-- player takes the shield off the arm, no shield goes on by itself until the next spawn. Shields the player
+	-- already has when this starts are left as they are, so running CycleWare again never undoes a choice.
+	do
+		local seenShields = setmetatable({}, { __mode = "k" }) -- every shield that was in the inventory once
+		local takenOffBy -- the character whose player took the shield off the arm
+		local CLICKS = { [Enum.UserInputType.MouseButton1] = true, [Enum.UserInputType.Touch] = true }
+
+		local function isShield(child)
+			return child:IsA("Tool") and child.Name == "Riot Shield"
+		end
+		-- Auto Slot lays the bar out when a tool comes or goes, and a pickup swap moves guns: both settle first.
+		local function inventoryBusy()
+			return arrangeQueued or rebuildingOld or swapping or awaitingCharacter ~= nil
+		end
+		local function waitUntil(seconds, done)
+			local deadline = os.clock() + seconds
+			while not done() and os.clock() < deadline do task.wait() end
+			return done()
+		end
+
+		local function putOnArm(shield)
 			local shieldEquipped = remote("ShieldEquipped")
-			if not shieldEquipped or character:FindFirstChild("RiotShieldPart") then return end
+			if not shieldEquipped or not shield:WaitForChild("Handle", 3) then return end
+			local character, humanoid, backpack
+			local ready = waitUntil(5, function()
+				character = LocalPlayer.Character
+				humanoid = character and character:FindFirstChildOfClass("Humanoid")
+				backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+				return humanoid ~= nil and humanoid.Health > 0 and not inventoryBusy()
+			end)
+			if not ready or not CW.Settings.AUTO_SLOT_ENABLED or takenOffBy == character then return end
+			if character:FindFirstChild("RiotShieldPart") then return end -- one is on the arm already
+			if shield.Parent ~= character and shield.Parent ~= backpack then return end -- not the player's any more
+
+			local previous = shield.Parent ~= character and character:FindFirstChildOfClass("Tool") or nil
+			if shield.Parent ~= character then pcall(function() humanoid:EquipTool(shield) end) end
+			if shield.Parent ~= character then
+				CW.Warn("The riot shield could not be equipped to go on your arm. Equip it and click instead.")
+				return
+			end
 			pcall(function() shieldEquipped:FireServer() end)
 
+			-- A click meanwhile sends the game's own request; another one from here would take the shield off.
 			local clicked = false
 			local clickConnection = UserInputService.InputBegan:Connect(function(input, processed)
-				if not processed and (input.UserInputType == Enum.UserInputType.MouseButton1
-					or input.UserInputType == Enum.UserInputType.Touch or input.KeyCode == Enum.KeyCode.ButtonR2) then
+				if not processed and (CLICKS[input.UserInputType] or input.KeyCode == Enum.KeyCode.ButtonR2) then
 					clicked = true
 				end
 			end)
-			task.delay(1, function()
-				clickConnection:Disconnect()
-				if not clicked and child.Parent == character and not character:FindFirstChild("RiotShieldPart") then
-					pcall(function() shieldEquipped:FireServer() end)
+			local function onArm() return character:FindFirstChild("RiotShieldPart") ~= nil end
+			-- If the server's shield doesn't show up (the equip reached it late), the request is sent once more.
+			if not waitUntil(1, onArm) and not clicked and shield.Parent == character then
+				pcall(function() shieldEquipped:FireServer() end)
+				waitUntil(1.5, onArm)
+			end
+			clickConnection:Disconnect()
+			if not onArm() then
+				CW.Warn("The riot shield did not go on your arm. Equip it and click to put it on.")
+			end
+
+			-- The hand goes back to what it held, unless the player took something else meanwhile.
+			waitUntil(1, function() return not inventoryBusy() end)
+			if shield.Parent ~= character or humanoid.Health <= 0 then return end
+			if previous and previous.Parent == LocalPlayer:FindFirstChildOfClass("Backpack") then
+				pcall(function() humanoid:EquipTool(previous) end)
+			else
+				pcall(function() humanoid:UnequipTools() end)
+			end
+		end
+
+		local function noteShield(child)
+			if not isShield(child) or seenShields[child] then return end
+			seenShields[child] = true -- Auto Slot takes tools out and puts them back: that is not a new shield
+			if CW.Settings.AUTO_SLOT_ENABLED then task.spawn(putOnArm, child) end
+		end
+		local function watchShieldCharacter(character)
+			for _, child in ipairs(character:GetChildren()) do noteShield(child) end
+			CW.track("autoShield", character.ChildAdded:Connect(noteShield))
+			CW.track("autoShieldOff", character.ChildRemoved:Connect(function(child)
+				if child.Name ~= "RiotShieldPart" then return end
+				-- A broken shield (no health left) or a dying character is not the player taking it off.
+				local humanoid = character:FindFirstChildOfClass("Humanoid")
+				if humanoid and humanoid.Health > 0 and (tonumber(child:GetAttribute("Health")) or 1) > 0 then
+					takenOffBy = character
 				end
-			end)
+			end))
+		end
+		local function watchShieldBackpack(backpack)
+			-- A new Backpack (a spawn) can arrive with its tools already in it.
+			for _, child in ipairs(backpack:GetChildren()) do noteShield(child) end
+			CW.track("autoShieldBackpack", backpack.ChildAdded:Connect(noteShield))
+		end
+
+		for _, holder in ipairs({ LocalPlayer:FindFirstChildOfClass("Backpack") or false, LocalPlayer.Character or false }) do
+			if holder then
+				for _, child in ipairs(holder:GetChildren()) do
+					if isShield(child) then seenShields[child] = true end
+				end
+			end
+		end
+		local currentBackpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+		if currentBackpack then watchShieldBackpack(currentBackpack) end
+		if LocalPlayer.Character then watchShieldCharacter(LocalPlayer.Character) end
+		CW.track("autoShieldNewBackpack", LocalPlayer.ChildAdded:Connect(function(child)
+			if child:IsA("Backpack") then watchShieldBackpack(child) end
 		end))
+		CW.track("autoShieldCharacter", LocalPlayer.CharacterAdded:Connect(watchShieldCharacter))
 	end
-	if LocalPlayer.Character then watchShield(LocalPlayer.Character) end
-	CW.track("autoShieldCharacter", LocalPlayer.CharacterAdded:Connect(watchShield))
 
 	-- Every tool of the game, grouped: guns, melee, the other tools, snacks. The EBR is in the Guns folder but
 	-- has no ToolProperties (not in use), so it is left out.
@@ -9823,7 +9942,7 @@ guarded("Utilities", function()
 				Extra = { Key = HIDDEN_KEY, Text = "Hidden", Badge = "H",
 					Placeholder = "Drop a tool here to hide it from the inventory" },
 				Hint = "Drag a tool onto a slot (several can share one: the first you have wins), or onto Hidden. "
-					.. "Drag it out to clear it, or right-click. The riot shield goes on your arm as soon as you equip it.",
+					.. "Drag it out to clear it, or right-click. A riot shield goes on your arm by itself once, when you get it.",
 				Callback = function(newLayout)
 					layouts[variantKey] = newLayout
 					saveLayout(variantKey, newLayout)
@@ -9909,7 +10028,7 @@ guarded("Settings", function()
 		local current = CWUI.GetTheme()
 		local resets = {} -- how each control goes back to the default look
 
-		local Colors = SettingsTab:AddSubSection("Colors", true)
+		local Colors = SettingsTab:AddSubSection("Colors", false)
 		local pickers = {}
 		for _, entry in ipairs({
 			{ "Highlight Color", "Accent" }, { "Tab Selector Color", "Selector" }, { "Text Color", "Text" },
@@ -10162,22 +10281,30 @@ guarded("Settings", function()
 				Callback = function(on) look.ParallaxHoverOnly = on applyParallax() end,
 			})
 
+			-- Runs after `look` is the default theme again, so the parallax comes from it.
 			table.insert(resets, function()
 				table.clear(layers)
-				selected = nil
-				strength = PARALLAX_DEFAULT
+				local decoded, defaultLayers = pcall(HttpService.JSONDecode, HttpService, DEFAULT_LAYERS)
+				for _, layer in ipairs(decoded and type(defaultLayers) == "table" and defaultLayers or {}) do
+					table.insert(layers, layer)
+				end
+				selected = #layers > 0 and 1 or nil
+				strength = tonumber(look.ParallaxStrength) or PARALLAX_DEFAULT
 				applyParallax()
-				parallaxToggle:Set(false, true)
+				parallaxToggle:Set(look.Parallax == true, true)
 				strengthSlider:Set(strength * 100, true)
-				hoverToggle:Set(false, true)
+				hoverToggle:Set(look.ParallaxHoverOnly == true, true)
 				refresh()
-				CW.Settings.UI_LAYERS = ""
+				CW.Settings.UI_LAYERS = DEFAULT_LAYERS
 			end)
 		end
 
+		-- Back to the default look (DEFAULT_THEME and DEFAULT_LAYERS), the one a first start opens with.
 		resetInterface = function()
 			table.clear(look)
+			for key, value in pairs(DEFAULT_THEME) do look[key] = value end
 			CWUI.ResetTheme()
+			CWUI.SetTheme(savedThemeChanges())
 			local defaults = CWUI.GetTheme()
 			for _, reset in ipairs(resets) do reset(defaults) end
 			scheduleSave()
